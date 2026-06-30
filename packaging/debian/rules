@@ -1,0 +1,21 @@
+#!/usr/bin/make -f
+# Liu Debian build (Launchpad PPA source build). dh + CMake; OpenGL on Linux.
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+%:
+	dh $@ --buildsystem=cmake
+
+override_dh_auto_configure:
+	dh_auto_configure -- -DCMAKE_BUILD_TYPE=Release -DUSE_METAL=OFF
+
+# CMake installs the binaries (Liu, liu-notify, liu-history) to /usr/bin. The
+# assets tree is NOT a CMake install target, so stage it under /usr/share/liu
+# (the font resolver's FHS fallback added in src/core/config.c), plus the
+# desktop entry, icon and terminfo.
+override_dh_auto_install:
+	dh_auto_install
+	install -d debian/liu/usr/share/liu/assets
+	cp -a assets/. debian/liu/usr/share/liu/assets/
+	install -Dm644 packaging/debian/liu.desktop debian/liu/usr/share/applications/liu.desktop
+	if [ -f assets/appicon.png ]; then install -Dm644 assets/appicon.png debian/liu/usr/share/pixmaps/liu.png; fi
+	if [ -f Liu.terminfo ]; then install -Dm644 Liu.terminfo debian/liu/usr/share/liu/Liu.terminfo; fi

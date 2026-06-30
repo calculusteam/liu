@@ -1,0 +1,153 @@
+name: Publish to stores
+
+# Phase 3: push each new release to the package stores. Runs after the Release
+# workflow succeeds (or manually). Every job is gated on its account secret via
+# the `gate` job's outputs, so the workflow no-ops cleanly until you add the
+# secret + create the account. Checksums/versions are taken from
+# https://liu.software/manifest.json by scripts/update-manifests.sh.
+#
+# Required accounts / secrets (add under Settings → Secrets and variables):
+#   HOMEBREW_TAP_TOKEN  PAT with push to calculusteam/homebrew-liu (the brew tap)
+#   AUR_SSH_KEY         private SSH key registered on your AUR account
+#   COPR_API_TOKEN      ~/.config/copr token body (Fedora COPR)
+#   LAUNCHPAD_GPG_KEY   ASCII-armored private GPG key uploaded to Launchpad
+#   LAUNCHPAD_PPA       e.g. ppa:calculusteam/liu   (as a variable, not secret)
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    # Only proceed if the Release run that triggered us succeeded.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    outputs:
+      version:   ${{ steps.v.outputs.version }}
+      has_brew:   ${{ steps.s.outputs.has_brew }}
+      has_aur:    ${{ steps.s.outputs.has_aur }}
+      has_copr:   ${{ steps.s.outputs.has_copr }}
+      has_ppa:    ${{ steps.s.outputs.has_ppa }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: echo "version=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
+      - id: s
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+          COPR_API_TOKEN: ${{ secrets.COPR_API_TOKEN }}
+          LAUNCHPAD_GPG_KEY: ${{ secrets.LAUNCHPAD_GPG_KEY }}
+        run: |
+          b() { [[ -n "$1" ]] && echo true || echo false; }
+          {
+            echo "has_brew=$(b "$HOMEBREW_TAP_TOKEN")"
+            echo "has_aur=$(b "$AUR_SSH_KEY")"
+            echo "has_copr=$(b "$COPR_API_TOKEN")"
+            echo "has_ppa=$(b "$LAUNCHPAD_GPG_KEY")"
+          } >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  homebrew:
+    needs: gate
+    if: ${{ needs.gate.outputs.has_brew == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fill cask from manifest
+        run: MANIFEST_URL=https://liu.software/manifest.json ./scripts/update-manifests.sh
+      - name: Push cask to the tap
+        env:
+          TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VER: ${{ needs.gate.outputs.version }}
+        run: |
+          git clone "https://x-access-token:${TOKEN}@github.com/calculusteam/homebrew-liu.git" tap
+          mkdir -p tap/Casks
+          cp packaging/homebrew/Casks/liu.rb tap/Casks/liu.rb
+          cd tap
+          git config user.name "liu-release-bot"
+          git config user.email "hello@liu.software"
+          git add Casks/liu.rb
+          git commit -m "liu ${VER}" || { echo "no change"; exit 0; }
+          git push
+
+  # ---------------------------------------------------------------------------
+  aur:
+    needs: gate
+    if: ${{ needs.gate.outputs.has_aur == 'true' }}
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fill PKGBUILD from manifest + regenerate .SRCINFO
+        run: |
+          pacman -Sy --noconfirm git openssh python
+          # makepkg refuses to run as root; do the printsrcinfo as a normal user.
+          useradd -m builder && chown -R builder .
+          su builder -c "MANIFEST_URL=https://liu.software/manifest.json ./scripts/update-manifests.sh"
+      - name: Push to AUR
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+          VER: ${{ needs.gate.outputs.version }}
+        run: |
+          install -d -m700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur && chmod 600 ~/.ssh/aur
+          printf 'Host aur.archlinux.org\n  IdentityFile ~/.ssh/aur\n  StrictHostKeyChecking accept-new\n' > ~/.ssh/config
+          git clone ssh://aur@aur.archlinux.org/liu-bin.git aur
+          cp packaging/aur/liu-bin/PKGBUILD packaging/aur/liu-bin/.SRCINFO aur/
+          cd aur
+          git config user.name "liu-release-bot"
+          git config user.email "hello@liu.software"
+          git add PKGBUILD .SRCINFO
+          git commit -m "liu-bin ${VER}" || { echo "no change"; exit 0; }
+          git push
+
+  # ---------------------------------------------------------------------------
+  copr:
+    needs: gate
+    if: ${{ needs.gate.outputs.has_copr == 'true' }}
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: copr build (source build from the spec)
+        env:
+          COPR_API_TOKEN: ${{ secrets.COPR_API_TOKEN }}
+          VER: ${{ needs.gate.outputs.version }}
+        run: |
+          dnf install -y copr-cli rpm-build python3 >/dev/null
+          ./scripts/update-manifests.sh || true   # bumps Version: in the spec
+          install -d ~/.config
+          printf '%s\n' "$COPR_API_TOKEN" > ~/.config/copr
+          # Trigger a COPR build from the committed spec (SCM method points COPR
+          # at this repo + packaging/rpm/liu.spec — configure the project once).
+          copr-cli build-package calculusteam/liu --name liu || \
+            echo "configure the COPR project's SCM package 'liu' once, then this triggers builds."
+
+  # ---------------------------------------------------------------------------
+  ppa:
+    needs: gate
+    if: ${{ needs.gate.outputs.has_ppa == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Build + dput the source package
+        env:
+          LAUNCHPAD_GPG_KEY: ${{ secrets.LAUNCHPAD_GPG_KEY }}
+          PPA: ${{ vars.LAUNCHPAD_PPA }}
+          VER: ${{ needs.gate.outputs.version }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y devscripts debhelper dput-ng gnupg
+          echo "$LAUNCHPAD_GPG_KEY" | gpg --batch --import
+          # Lay the debian/ tree next to the source and build a signed source pkg.
+          cp -r packaging/debian debian
+          ./scripts/update-manifests.sh || true   # refreshes debian/changelog
+          debuild -S -sa -d
+          dput "${PPA:-ppa:calculusteam/liu}" ../liu_${VER}-1_source.changes

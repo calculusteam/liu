@@ -1,0 +1,29 @@
+Source: liu
+Section: utils
+Priority: optional
+Maintainer: calculus.team <hello@liu.software>
+Build-Depends: debhelper-compat (= 13),
+               cmake (>= 3.20),
+               nasm,
+               pkg-config,
+               libssh2-1-dev,
+               libssl-dev,
+               zlib1g-dev,
+               libx11-dev,
+               libgl1-mesa-dev
+Standards-Version: 4.6.2
+Homepage: https://liu.software
+Vcs-Browser: https://github.com/gerizekali/liu
+Vcs-Git: https://github.com/gerizekali/liu.git
+Rules-Requires-Root: no
+
+Package: liu
+Architecture: amd64 arm64
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Recommends: libnotify-bin, fonts-noto-core
+Description: Native terminal for AI-assisted coding workflows
+ Liu is a native terminal built around AI-assisted ("vibe") coding workflows:
+ transcript viewing and session resume across installed AI CLIs, AI-driven
+ theme generation, an in-terminal file browser with a Markdown viewer, split
+ panes, and prompt translate-on-tab. OpenGL/X11 renderer on Linux. No
+ Electron, no JavaScript VM.

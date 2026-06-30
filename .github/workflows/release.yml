@@ -1,0 +1,314 @@
+name: Release
+
+# Cut a release the easy way:
+#   1. bump VERSION
+#   2. merge/push to main
+#
+# The workflow creates the matching v<VERSION> tag itself, then builds from that
+# exact tag so artifact filenames stay clean (no +shorthash dev suffix). Manual
+# tag pushes still work, and are guarded against VERSION mismatches.
+#
+# Builds every platform/arch (macOS arm64+x86_64 DMG, Linux x86_64+arm64
+# tar.gz), Ed25519-signs the update artifacts, merges ONE multi-arch
+# appcast.json, writes a manifest.json (sha256 of every file, incl. DMG, for the
+# store packaging), publishes the downloads + feed to liu.software (S3/R2-
+# compatible object store), and mirrors everything to a GitHub Release for
+# notes/source. (Windows is not a target — macOS is primary, Linux secondary.)
+#
+# macOS builds are AD-HOC signed (no Apple Developer ID yet) — Gatekeeper shows
+# a first-open prompt; the website + Homebrew cask document the workaround.
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+    paths:
+      - VERSION
+      - .github/workflows/release.yml
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # create the GitHub Release
+
+jobs:
+  # ---------------------------------------------------------------------------
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+      release_ref: ${{ steps.v.outputs.release_ref }}
+      should_release: ${{ steps.v.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Guard/create release tag + export version
+        id: v
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < VERSION)"
+          if [[ ! "${version}" =~ ^[0-9]+(\.[0-9]+){0,2}(-[A-Za-z0-9.]+)?$ ]]; then
+            echo "::error::VERSION '${version}' is not a valid release token."
+            exit 1
+          fi
+          tag="v${version}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            if [[ "${GITHUB_REF_NAME}" != "${tag}" ]]; then
+              echo "::error::tag ${GITHUB_REF_NAME} != ${tag} (VERSION file). Bump VERSION or retag."
+              exit 1
+            fi
+            echo "release_ref=${tag}" >> "$GITHUB_OUTPUT"
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git fetch --force --tags origin
+          head_sha="$(git rev-parse HEAD)"
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            tag_sha="$(git rev-list -n1 "${tag}")"
+            if [[ "${tag_sha}" != "${head_sha}" ]]; then
+              echo "::notice::${tag} already exists at ${tag_sha}; HEAD is ${head_sha}. Bump VERSION to cut a new release."
+              echo "release_ref=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::notice::${tag} already points at HEAD; rebuilding/publishing that release."
+          else
+            git config user.name "liu-release-bot"
+            git config user.email "hello@liu.software"
+            git tag -a "${tag}" -m "Liu ${version}"
+            git push origin "${tag}"
+          fi
+
+          echo "release_ref=${tag}" >> "$GITHUB_OUTPUT"
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  build-macos:
+    needs: meta
+    if: ${{ needs.meta.outputs.should_release == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-14, arch: arm64 }    # Apple Silicon
+          - { runner: macos-13, arch: x86_64 }   # Intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.meta.outputs.release_ref }}   # exact tag -> clean filenames
+      - name: Build + package (DMG + update zip, ad-hoc signed)
+        run: ./scripts/package_macos_dmg.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-macos-${{ matrix.arch }}
+          path: |
+            build/package/Liu-*-${{ matrix.arch }}.dmg
+            build/package/Liu-*-${{ matrix.arch }}.zip
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  build-linux:
+    needs: meta
+    if: ${{ needs.meta.outputs.should_release == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04,     cpu: x86_64 }
+          - { runner: ubuntu-24.04-arm, cpu: arm64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.meta.outputs.release_ref }}
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake nasm pkg-config \
+            libssh2-1-dev libssl-dev zlib1g-dev libx11-dev libgl1-mesa-dev
+      - name: Build + package tarball (OpenGL/X11)
+        run: ./scripts/package_linux_tarball.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-linux-${{ matrix.cpu }}
+          path: build/package/liu-*-linux-${{ matrix.cpu }}.tar.gz
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  publish:
+    needs: [meta, build-macos, build-linux]
+    if: ${{ needs.meta.outputs.should_release == 'true' }}
+    runs-on: ubuntu-latest   # distro openssl 3.x can Ed25519-sign; has aws/gh
+    env:
+      VER: ${{ needs.meta.outputs.version }}
+      TAG: ${{ needs.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.meta.outputs.release_ref }}
+
+      - name: Collect every build artifact into build/package/
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pkg-*
+          merge-multiple: true
+          path: build/package
+
+      - name: List collected artifacts
+        run: ls -la build/package
+
+      # Fail early if CDN credentials are incomplete. A GitHub-only release would
+      # leave the live appcast/download links stale, which is worse than no
+      # release for the auto-updater.
+      - name: Detect publish credentials
+        id: creds
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+        run: |
+          missing=()
+          [[ -n "${AWS_ACCESS_KEY_ID}" ]]     || missing+=(AWS_ACCESS_KEY_ID)
+          [[ -n "${AWS_SECRET_ACCESS_KEY}" ]] || missing+=(AWS_SECRET_ACCESS_KEY)
+          [[ -n "${AWS_ENDPOINT_URL}" ]]      || missing+=(AWS_ENDPOINT_URL)
+          [[ -n "${AWS_S3_BUCKET}" ]]         || missing+=(AWS_S3_BUCKET)
+          if [[ "${#missing[@]}" -eq 0 ]]; then
+            echo "has_s3=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_s3=false" >> "$GITHUB_OUTPUT"
+            printf '::error::missing CDN publish secret(s): %s. Refusing to create a GitHub-only release because liu.software/appcast.json would not be updated.\n' "${missing[*]}"
+            exit 1
+          fi
+
+      # --- sign the UPDATE artifacts (the feed/install.sh consumers) ----------
+      # The private key is materialized ONLY here (the build jobs ran untrusted
+      # third-party tooling), used, then shredded.
+      - name: Materialize Ed25519 signing key
+        env:
+          ED25519_PRIVATE_KEY: ${{ secrets.ED25519_PRIVATE_KEY }}
+        run: |
+          [[ -n "${ED25519_PRIVATE_KEY}" ]] || { echo "::error::ED25519_PRIVATE_KEY secret is not set."; exit 1; }
+          umask 077
+          printf '%s\n' "${ED25519_PRIVATE_KEY}" > "${RUNNER_TEMP}/ed25519.key"
+
+      - name: Verify embedded public key matches the signing key
+        run: python3 scripts/check_pubkey.py "${RUNNER_TEMP}/ed25519.key" src/core/update_pubkey.h
+
+      - name: Ed25519-sign update artifacts (macOS zip, Linux tarball)
+        run: |
+          set -e
+          for f in \
+            "build/package/Liu-${VER}-arm64.zip" \
+            "build/package/Liu-${VER}-x86_64.zip" \
+            "build/package/liu-${VER}-linux-x86_64.tar.gz" \
+            "build/package/liu-${VER}-linux-arm64.tar.gz"; do
+            [[ -f "$f" ]] && ./scripts/sign_ed25519.sh "$f" "${RUNNER_TEMP}/ed25519.key"
+          done
+
+      - name: Shred the signing key
+        if: always()
+        run: rm -f "${RUNNER_TEMP}/ed25519.key"
+
+      # --- multi-arch appcast (feed) -----------------------------------------
+      # macOS tokens stay BARE (arm64/x86_64) — the in-app updater matches the
+      # bare token. Linux is linux- prefixed for install.sh.
+      - name: Regenerate the multi-arch update feed (preserve history)
+        run: |
+          set -e
+          FEED="build/package/appcast.json"
+          URL="https://liu.software/appcast.json"
+          # Preserve prior version history by merging into the live feed. Do NOT
+          # silently truncate it on a blip: distinguish 404 (no prior feed yet —
+          # legitimately start fresh) from a fetched-but-unparseable body (an HTML
+          # error/rate-limit page would crash gen_feed AND drop history) and a
+          # transient/server error (retry, then fail the release rather than
+          # publish a feed missing every past version).
+          code="$(curl -sSL --retry 3 --retry-delay 2 -o "${FEED}" -w '%{http_code}' "${URL}" || echo 000)"
+          code="${code: -3}"   # --retry can emit one code per attempt; keep the final one
+          if [[ "${code}" == "200" ]]; then
+            python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "${FEED}" \
+              || { echo "::error::${URL} returned 200 but is not valid JSON — refusing to clobber feed history"; exit 1; }
+            echo "merging into existing feed (HTTP 200)"
+          elif [[ "${code}" == "404" ]]; then
+            echo "no prior feed at ${URL} (HTTP 404) — starting a fresh feed"
+            rm -f "${FEED}"
+          else
+            echo "::error::could not fetch prior appcast.json (HTTP ${code}) — refusing to publish a feed that would drop version history; re-run the release"; exit 1
+          fi
+          ART=()
+          [[ -f "build/package/Liu-${VER}-arm64.zip" ]]            && ART+=(--artifact "arm64=build/package/Liu-${VER}-arm64.zip")
+          [[ -f "build/package/Liu-${VER}-x86_64.zip" ]]           && ART+=(--artifact "x86_64=build/package/Liu-${VER}-x86_64.zip")
+          [[ -f "build/package/liu-${VER}-linux-x86_64.tar.gz" ]]  && ART+=(--artifact "linux-x86_64=build/package/liu-${VER}-linux-x86_64.tar.gz")
+          [[ -f "build/package/liu-${VER}-linux-arm64.tar.gz" ]]   && ART+=(--artifact "linux-arm64=build/package/liu-${VER}-linux-arm64.tar.gz")
+          python3 scripts/gen_feed.py --feed "${FEED}" --version "${VER}" \
+            --build "$(git rev-parse --short HEAD)" \
+            --notes-url "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}" \
+            --min-os 11.0 \
+            --base-url "https://liu.software/downloads/v${VER}" \
+            "${ART[@]}"
+
+      # --- manifest.json: sha256 of EVERY file (incl. DMG/EXE) for the stores -
+      - name: Write release manifest (all artifacts)
+        run: |
+          set -e
+          M=()
+          [[ -f "build/package/Liu-${VER}-arm64.dmg" ]]           && M+=(--artifact "dmg:arm64=build/package/Liu-${VER}-arm64.dmg")
+          [[ -f "build/package/Liu-${VER}-x86_64.dmg" ]]          && M+=(--artifact "dmg:x86_64=build/package/Liu-${VER}-x86_64.dmg")
+          [[ -f "build/package/Liu-${VER}-arm64.zip" ]]           && M+=(--artifact "zip:arm64=build/package/Liu-${VER}-arm64.zip")
+          [[ -f "build/package/Liu-${VER}-x86_64.zip" ]]          && M+=(--artifact "zip:x86_64=build/package/Liu-${VER}-x86_64.zip")
+          [[ -f "build/package/liu-${VER}-linux-x86_64.tar.gz" ]] && M+=(--artifact "tarball:linux-x86_64=build/package/liu-${VER}-linux-x86_64.tar.gz")
+          [[ -f "build/package/liu-${VER}-linux-arm64.tar.gz" ]]  && M+=(--artifact "tarball:linux-arm64=build/package/liu-${VER}-linux-arm64.tar.gz")
+          python3 scripts/gen_manifest.py --out build/package/manifest.json \
+            --version "${VER}" --base-url "https://liu.software/downloads/v${VER}" "${M[@]}"
+          cat build/package/manifest.json
+
+      # --- publish downloads + feed to liu.software (S3/R2) -------------------
+      # Gated on creds: until the bucket exists the release still lands on
+      # GitHub. Versioned downloads are immutable; the feed/install.sh/manifest
+      # at the bucket root carry a short cache so new releases surface fast.
+      - name: Publish to liu.software (S3/R2)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
+          BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+        run: |
+          set -e
+          ep=(--endpoint-url "${AWS_ENDPOINT_URL}")
+          aws s3 cp build/package/ "s3://${BUCKET}/downloads/v${VER}/" --recursive \
+            --exclude '*' --include 'Liu-*' --include 'liu-*' \
+            --cache-control 'public, max-age=31536000, immutable' "${ep[@]}"
+          aws s3 cp build/package/appcast.json "s3://${BUCKET}/appcast.json" \
+            --content-type application/json --cache-control 'public, max-age=300' "${ep[@]}"
+          aws s3 cp build/package/manifest.json "s3://${BUCKET}/manifest.json" \
+            --content-type application/json --cache-control 'public, max-age=300' "${ep[@]}"
+          aws s3 cp scripts/install.sh "s3://${BUCKET}/install.sh" \
+            --content-type 'text/x-shellscript' --cache-control 'public, max-age=300' "${ep[@]}"
+
+      # --- GitHub Release (notes + source/download mirror) -------------------
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd build/package
+          files=()
+          for f in Liu-* liu-* appcast.json manifest.json; do [[ -f "$f" ]] && files+=("$f"); done
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" "${files[@]}" --clobber
+            gh release edit "${TAG}" --title "Liu ${VER}"
+          else
+            gh release create "${TAG}" "${files[@]}" --title "Liu ${VER}" --generate-notes
+          fi

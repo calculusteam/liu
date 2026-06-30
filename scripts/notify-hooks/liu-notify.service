@@ -1,0 +1,35 @@
+[Unit]
+Description=liu-notify voice notification daemon
+Documentation=https://github.com/liu/liu
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/liu-notify daemon
+Restart=on-failure
+RestartSec=10s
+
+# Security hardening — single-user, no network needed.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%t/liu-notify.sock %t/liu-notify.pid
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+[Install]
+WantedBy=default.target

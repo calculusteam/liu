@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Liu
+GenericName=Terminal
+Comment=AI-assisted terminal
+Exec=Liu
+Icon=liu
+Terminal=false
+Categories=System;TerminalEmulator;
+StartupNotify=true
