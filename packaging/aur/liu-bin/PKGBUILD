@@ -1,0 +1,57 @@
+# Maintainer: calculus.team <hello@liu.software>
+# pkgver + sha256sums are rewritten on release by scripts/update-manifests.sh
+# from liu.software/manifest.json; regenerate .SRCINFO with `makepkg --printsrcinfo`.
+pkgname=liu-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Native terminal built for AI-assisted coding workflows (prebuilt)"
+arch=('x86_64' 'aarch64')
+url="https://liu.software"
+license=('MIT')
+depends=('libssh2' 'openssl' 'zlib' 'libx11' 'libgl')
+optdepends=('libnotify: desktop notifications'
+            'espeak-ng: spoken notifications')
+provides=('liu')
+conflicts=('liu')
+options=('!strip')
+source_x86_64=("liu-${pkgver}-linux-x86_64.tar.gz::https://liu.software/downloads/v${pkgver}/liu-${pkgver}-linux-x86_64.tar.gz")
+source_aarch64=("liu-${pkgver}-linux-arm64.tar.gz::https://liu.software/downloads/v${pkgver}/liu-${pkgver}-linux-arm64.tar.gz")
+sha256sums_x86_64=('0000000000000000000000000000000000000000000000000000000000000000')
+sha256sums_aarch64=('0000000000000000000000000000000000000000000000000000000000000000')
+
+package() {
+    # The tarball is a flat liu-linux-<cpu>/ tree (Liu + helpers + assets/ as
+    # siblings). Install under /opt/liu so the exe-relative font lookup
+    # (<exe_dir>/../assets/fonts) resolves with zero env vars, mirroring
+    # scripts/install.sh's /opt/liu layout.
+    local src
+    src="$(find "$srcdir" -maxdepth 2 -type f -name Liu -printf '%h\n' | head -1)"
+    install -d "$pkgdir/opt/liu/bin"
+    install -Dm755 "$src/Liu" "$pkgdir/opt/liu/bin/Liu"
+    for h in liu-notify liu-history agenthistory; do
+        [ -f "$src/$h" ] && install -Dm755 "$src/$h" "$pkgdir/opt/liu/bin/$h"
+    done
+    cp -a "$src/assets" "$pkgdir/opt/liu/assets"
+
+    # PATH symlink
+    install -d "$pkgdir/usr/bin"
+    ln -s /opt/liu/bin/Liu "$pkgdir/usr/bin/liu"
+
+    # Desktop entry + icon
+    if [ -f "$src/liu.png" ]; then
+        install -Dm644 "$src/liu.png" "$pkgdir/usr/share/pixmaps/liu.png"
+    fi
+    install -d "$pkgdir/usr/share/applications"
+    cat > "$pkgdir/usr/share/applications/liu.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Liu
+GenericName=Terminal
+Comment=AI-assisted terminal
+Exec=/opt/liu/bin/Liu
+Icon=liu
+Terminal=false
+Categories=System;TerminalEmulator;
+StartupNotify=true
+EOF
+}

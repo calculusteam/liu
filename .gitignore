@@ -1,0 +1,102 @@
+build/
+build-*/
+build_*/
+build-review/
+build-codex/
+cmake-build-*/
+.cache/
+.claude/
+CLAUDE.md
+test_colors.c
+third_party/macos-deps/
+*.o
+*.a
+*.dylib
+*.so
+*.dll
+*.exe
+Liu
+compile_commands.json
+.DS_Store
+*.db
+.liu/
+*.swp
+*.swo
+*.log
+*.tmp
+*.bak
+*.orig
+
+# Local AI-assistant / tooling scratch (not for the public tree)
+.codex/
+.commandcode/
+.playwright-mcp/
+.continues-handoff.md
+.cursor/
+.windsurf/
+
+# Auto-update Ed25519 PRIVATE key — never commit (public key lives in src/core/update_pubkey.h)
+liu_update_ed25519.key
+*.ed25519.key
+
+# Secrets / local credentials. Commit only explicit examples.
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+*.p8
+*.p12
+*.cer
+*.crt
+*.csr
+*.mobileprovision
+*.provisionprofile
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+*.priv
+*secret*
+*secrets*
+*credential*
+*credentials*
+
+# Python / package-manager generated files.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+node_modules/
+dist/
+coverage/
+
+# Dev test tree — kept local, NOT published to the public repo (CMake guards on
+# its existence so clones without it still configure cleanly).
+/tests/
+
+# Local AI-assistant skill symlinks (point at ../.agents/) and their target —
+# never publish; they are dead links anywhere but this machine.
+/skills/
+.agents/
+skills-lock.json
+
+# Stray editor config and an orphan root npm lockfile.
+.vscode/
+/package-lock.json
+
+# Marketing site (vite) — kept local, deployed separately; not part of the
+# product repo. The C build/DMG/release do not depend on it.
+/website/
+
+# Internal research / audit reports — not part of the product codebase.
+/bug-research-report.md
+/report-liu.md
+/translate.md
+/reports/
+/docs/
+
+# Local removal archives (binary zips, not part of the repo)
+/archive/
