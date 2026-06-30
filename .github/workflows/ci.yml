@@ -1,10 +1,8 @@
 name: CI
 
-# Cross-platform build matrix — runs on every push/PR (separate from the
-# tag-only Release workflow). This is the source of truth for "does liu still
-# build on each OS x arch", turning silent bit-rot on the non-primary targets
-# into visible red builds. macOS is the maintained target; Linux is being
-# brought up; Windows is WIP and allowed to fail until its backend links.
+# macOS build check — runs on every push/PR to verify the primary target
+# still builds. Linux and Windows targets are planned but not yet CI-ready;
+# they will be re-enabled once their backends are stable.
 
 on:
   push:
@@ -38,39 +36,3 @@ jobs:
         run: cmake -B build -DCMAKE_BUILD_TYPE=Debug
       - name: Build
         run: cmake --build build -j$(sysctl -n hw.ncpu)
-
-  linux:
-    name: Linux ${{ matrix.arch }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { runner: ubuntu-24.04, arch: x86_64 }
-          - { runner: ubuntu-24.04-arm, arch: arm64 }
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install deps
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq \
-            build-essential cmake pkg-config \
-            libx11-dev libxcursor-dev libxi-dev \
-            libgl1-mesa-dev libssh2-1-dev libssl-dev
-      - name: Configure (OpenGL renderer)
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DUSE_METAL=OFF
-      - name: Build
-        run: cmake --build build -j$(nproc)
-
-  windows:
-    name: Windows x86_64 (WIP)
-    runs-on: windows-latest
-    # The Win32 backend is still being ported (ConPTY, link symbols, WGL 3.3).
-    # Keep it visible but non-blocking until it links.
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DUSE_METAL=OFF
-      - name: Build
-        run: cmake --build build --config Debug

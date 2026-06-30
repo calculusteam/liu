@@ -19,14 +19,18 @@ name: Release
 # a first-open prompt; the website + Homebrew cask document the workaround.
 
 on:
-  push:
-    branches:
-      - main
-    tags:
-      - "v*"
-    paths:
-      - VERSION
-      - .github/workflows/release.yml
+  # Disabled automatic triggers until CDN secrets (AWS/R2, Ed25519) are
+  # configured. Run manually from Actions → Release → Run workflow, or
+  # re-enable the push triggers below once secrets are set.
+  #
+  # push:
+  #   branches:
+  #     - main
+  #   tags:
+  #     - "v*"
+  #   paths:
+  #     - VERSION
+  #     - .github/workflows/release.yml
   workflow_dispatch: {}
 
 permissions:
