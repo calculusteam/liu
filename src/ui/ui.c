@@ -12186,10 +12186,11 @@ static bool chat_tool_inline_image_ok(ChatTool tool) {
  * the foreground. Gate each terminal on its own session's foreground process
  * (session_fg_process has a 0.6 s TTL cache, so this is cheap per frame). */
 static void term_gate_inline_images(Session *s, Terminal *t) {
+    /* TODO: Inline image rendering temporarily disabled for development.
+     * Re-enable after implementing proper image display pipeline. */
+    (void)s;
     if (!t) return;
-    t->inline_image_detect =
-        (s && session_type(s) == SESSION_LOCAL &&
-         chat_tool_inline_image_ok(chat_tool_for_process_basename(session_fg_process(s))));
+    t->inline_image_detect = false;
 }
 
 bool app_poll_sessions(AppState *app) {
