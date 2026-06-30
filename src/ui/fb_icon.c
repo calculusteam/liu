@@ -14,10 +14,12 @@
 
 #define RGB(r, g, b) ((Color){ (r)/255.0f, (g)/255.0f, (b)/255.0f, 1.0f })
 
-/* Commonly reused colours */
-static const Color C_FOLDER   = { 0.32f, 0.63f, 0.93f, 1.0f };   /* #519FED */
-static const Color C_ACCENT   = { 0.82f, 0.82f, 0.85f, 1.0f };
-static const Color C_MUTED    = { 0.58f, 0.60f, 0.64f, 1.0f };
+/* Commonly reused colours — must be macros (not static const) because C11
+   does not consider const-qualified structs as compile-time constants in
+   aggregate initialisers. */
+#define C_FOLDER   ((Color){ 0.32f, 0.63f, 0.93f, 1.0f })  /* #519FED */
+#define C_ACCENT   ((Color){ 0.82f, 0.82f, 0.85f, 1.0f })
+#define C_MUTED    ((Color){ 0.58f, 0.60f, 0.64f, 1.0f })
 
 /* Brand-ish palette */
 #define C_C          RGB( 92, 107, 192)   /* #5C6BC0 */
