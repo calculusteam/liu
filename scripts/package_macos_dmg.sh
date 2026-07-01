@@ -206,64 +206,13 @@ ln -s /Applications "${STAGE_DIR}/Applications"
 DMG_NAME="${APP_NAME}-${VERSION}-${ARCH}.dmg"
 DMG_PATH="${OUTPUT_DIR}/${DMG_NAME}"
 
-# Styled installer window. The art (assets/dmg/background.tiff, a HiDPI 1x/2x
-# pair) plus the icon layout give the "drag Liu to Applications" window its
-# branded look. We use dmgbuild — which writes the .DS_Store (background +
-# window + icon positions) directly — rather than Finder/AppleScript: the
-# AppleScript `background picture` property is broken on recent macOS
-# (Tahoe / 26.x), where icon positions apply but the background is silently
-# dropped. Geometry lives in scripts/dmg_build_settings.py and must match the
-# 640x400 canvas the art is drawn at (see scripts/dmg_render_background.sh).
-BG_TIFF="${ROOT_DIR}/assets/dmg/background.tiff"
-VOL_ICON="${APP_DIR}/Contents/Resources/Liu.icns"   # reuse the app's icns (may be absent)
-DMG_SETTINGS="${ROOT_DIR}/scripts/dmg_build_settings.py"
-
-# resolve_dmgbuild → echo a dmgbuild executable path, or non-zero (no output)
-# to mean "fall back to a plain DMG". Honors $DMGBUILD_BIN, then a PATH
-# dmgbuild, then a cached build/.dmgvenv, otherwise creates that venv on first
-# use (needs python3 + network). Set DMG_PLAIN=1 to skip styling entirely.
-resolve_dmgbuild() {
-    if [[ -n "${DMGBUILD_BIN:-}" && -x "${DMGBUILD_BIN}" ]]; then echo "${DMGBUILD_BIN}"; return 0; fi
-    if command -v dmgbuild >/dev/null 2>&1; then command -v dmgbuild; return 0; fi
-    local venv="${BUILD_DIR}/.dmgvenv"
-    if [[ -x "${venv}/bin/dmgbuild" ]]; then echo "${venv}/bin/dmgbuild"; return 0; fi
-    command -v python3 >/dev/null 2>&1 || return 1
-    python3 -m venv "${venv}" >/dev/null 2>&1 || return 1
-    "${venv}/bin/pip" install -q --upgrade pip dmgbuild >/dev/null 2>&1 || return 1
-    [[ -x "${venv}/bin/dmgbuild" ]] && { echo "${venv}/bin/dmgbuild"; return 0; }
-    return 1
-}
-
-# make_styled_dmg <volname> <app.app> <out.dmg> → 0 on success, non-zero to fall back.
-make_styled_dmg() {
-    local volname="$1" app="$2" out="$3" db
-    [[ -f "${BG_TIFF}" ]]      || { echo "note: ${BG_TIFF} missing — plain DMG." >&2; return 1; }
-    [[ -f "${DMG_SETTINGS}" ]] || { echo "note: ${DMG_SETTINGS} missing — plain DMG." >&2; return 1; }
-    db="$(resolve_dmgbuild)"   || { echo "note: dmgbuild unavailable (pip install dmgbuild) — plain DMG." >&2; return 1; }
-    # Stale mounts of this volume name wedge dmgbuild: it assumes /Volumes/<vol>,
-    # so if the volume is already mounted (forcing a "<vol> 1" mountpoint) the
-    # Applications symlink fails with ENOENT. Detach every match first.
-    for m in "/Volumes/${volname}" "/Volumes/${volname} "*; do
-        [[ -d "${m}" ]] && hdiutil detach "${m}" -force >/dev/null 2>&1
-    done
-    rm -f "${out}"
-    APP_PATH="${app}" BG="${BG_TIFF}" VOLICON="${VOL_ICON}" \
-        "${db}" -s "${DMG_SETTINGS}" "${volname}" "${out}" >/dev/null || return 1
-    [[ -f "${out}" ]]
-}
-
 if [[ "${PACKAGE_DMG:-1}" != "0" ]]; then
-    if [[ "${DMG_PLAIN:-0}" != "1" ]] && make_styled_dmg "${APP_NAME}" "${APP_DIR}" "${DMG_PATH}"; then
-        : # styled DMG written to ${DMG_PATH}
-    else
-        echo "warning: styled DMG layout unavailable — writing a plain DMG." >&2
-        hdiutil create \
-            -volname "${APP_NAME}" \
-            -srcfolder "${STAGE_DIR}" \
-            -ov \
-            -format UDZO \
-            "${DMG_PATH}" >/dev/null
-    fi
+    hdiutil create \
+        -volname "${APP_NAME}" \
+        -srcfolder "${STAGE_DIR}" \
+        -ov \
+        -format UDZO \
+        "${DMG_PATH}" >/dev/null
 fi
 
 # Final line(s) of stdout are the integration handle for release.sh / CI.
