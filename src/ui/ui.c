@@ -4771,12 +4771,7 @@ f32 app_get_group_chip_width(const AppState *app, i32 gi) {
     if (is_renaming) {
         snprintf(glabel, sizeof(glabel), "%s", app->chip_rename_buf);
     } else if (app->tab_groups[gi].collapsed) {
-        /* Count tabs in group */
-        i32 grp_tab_count = 0;
-        for (i32 i = 0; i < app->tab_count; i++) {
-            if (app->tabs[i].group_index == gi) grp_tab_count++;
-        }
-        snprintf(glabel, sizeof(glabel), "%s %d", app->tab_groups[gi].name, grp_tab_count);
+        snprintf(glabel, sizeof(glabel), "%s", app->tab_groups[gi].name);
     } else {
         snprintf(glabel, sizeof(glabel), "%s", app->tab_groups[gi].name);
     }
@@ -5446,7 +5441,7 @@ static void render_toolbar(AppState *app) {
         if (is_renaming)
             snprintf(glabel, sizeof(glabel), "%s", app->chip_rename_buf);
         else if (grp->collapsed)
-            snprintf(glabel, sizeof(glabel), "%s %d", grp->name, grp_tab_count);
+            snprintf(glabel, sizeof(glabel), "%s", grp->name);
         else
             snprintf(glabel, sizeof(glabel), "%s", grp->name);
         f32 glbl_x = g_dot_x + g_dot_sz + 8.0f * dpi;   /* breathing room dot→label */
