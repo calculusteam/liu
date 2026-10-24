@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+Name=Liu
+GenericName=Terminal
+Comment=A terminal for AI coding agents
+Exec=liu
+Icon=liu
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;ssh;agent;
+StartupNotify=true
+StartupWMClass=liu
+Actions=new-window;
+
+[Desktop Action new-window]
+Name=New Window
+Exec=liu

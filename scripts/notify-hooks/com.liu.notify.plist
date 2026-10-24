@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.liu.notify</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/liu-notify</string>
+        <string>daemon</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Auto-restart if it dies, but back off so a crash loop doesn't
+         flood the system. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Run as the user; no elevated privileges. -->
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>/dev/null</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/liu-notify.err.log</string>
+</dict>
+</plist>

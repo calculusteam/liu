@@ -1,0 +1,41 @@
+Liu backport of libssh2 commit 092b28293b (sftp: reject bad readdir name counts and clear stuck dir state, #2280) to the 1.11.1 release tarball.
+Not in Homebrew's set and not applicable to 1.11.1 as-is (upstream master renamed
+ssh2_* / SSH2_* / ssh2_NB_state_*); this is the same change in 1.11.1's names
+(_libssh2_*, LIBSSH2_*, libssh2_NB_state_*). A SSH_FXP_NAME whose name count exceeds the packet body left names_left non-zero while every parse failed without freeing the packet: a stuck readdir loop and a leak until the handle closed.
+
+--- a/src/sftp.c
++++ b/src/sftp.c
+@@ -1944,6 +1944,18 @@
+                 LIBSSH2_FREE(session, handle->u.dir.names_packet);
+ 
+ end:
++            /* Parse failure with names_left still > 0 would otherwise stick
++             * forever: each later call re-enters this branch and fails again
++             * without ever freeing names_packet. */
++            if((ssize_t)filename_len < 0) {
++                if(handle->u.dir.names_packet) {
++                    LIBSSH2_FREE(session, handle->u.dir.names_packet);
++                    handle->u.dir.names_packet = NULL;
++                }
++                handle->u.dir.names_left = 0;
++                handle->u.dir.names_packet_len = 0;
++                handle->u.dir.next_name = NULL;
++            }
+             _libssh2_debug((session, LIBSSH2_TRACE_SFTP,
+                            "libssh2_sftp_readdir_ex() return %lu",
+                            (unsigned long)filename_len));
+@@ -2032,6 +2044,14 @@
+         LIBSSH2_FREE(session, data);
+         return 0;
+     }
++    /* Each name needs at least two u32 length fields (8 bytes). Cap the
++     * server-supplied count so names_left cannot outlive the packet body. */
++    if(data_len < 9 || num_names > (data_len - 9) / 8) {
++        LIBSSH2_FREE(session, data);
++        return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
++                              "SFTP Protocol Error: invalid readdir name "
++                              "count");
++    }
+ 
+     handle->u.dir.names_left = num_names;
+     handle->u.dir.names_packet = data;

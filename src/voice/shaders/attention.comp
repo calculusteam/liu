@@ -1,0 +1,126 @@
+/* Multi-head attention, tiled over queries with an online softmax.
+ *
+ * One workgroup owns QB queries of one head and walks the keys in KB steps,
+ * carrying a running (max, sum, output) per query so no full score row is
+ * ever materialized. That is what keeps each K and V row read once per
+ * workgroup instead of once per query — the difference between an encoder
+ * that is memory-bound and one that is not.
+ *
+ * Scalar, unlike the Metal version's simdgroup matrices: cooperative-matrix
+ * support is not universal across the drivers this backend targets. */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "whisper_common.glsl"
+
+#define QB 16
+#define KB 32
+#define HD_MAX 64
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer Qbuf { float data[]; } Qb;
+layout(std430, binding = 1) readonly  buffer Kbuf { float data[]; } Kb;
+layout(std430, binding = 2) readonly  buffer Vbuf { float data[]; } Vb;
+layout(std430, binding = 3) writeonly buffer Obuf { float data[]; } Ob;
+
+layout(push_constant) uniform Push {
+    int n_q; int n_kv; int n_head; int head_dim;
+    int n_state; int causal; int causal_offset; float scale;
+} p;
+
+shared float Qs[QB * HD_MAX];
+shared float Sf[QB * KB];
+shared float Ot[QB * HD_MAX];
+shared float m_run[QB];
+shared float l_run[QB];
+shared float corr[QB];
+
+void main() {
+    const int tid = int(gl_LocalInvocationIndex);
+    const int h   = int(gl_WorkGroupID.y);
+    const int q0  = int(gl_WorkGroupID.x) * QB;
+    const int hd  = p.head_dim;
+    const int ns  = p.n_state;
+
+    /* Stage Q once: it is read for every key of every tile. */
+    for (int idx = tid; idx < QB * hd; idx += 256) {
+        const int r = idx / hd;
+        const int c = idx % hd;
+        const int i = q0 + r;
+        Qs[idx] = (i < p.n_q) ? Qb.data[i * ns + h * hd + c] : 0.0;
+        Ot[idx] = 0.0;
+    }
+    if (tid < QB) { m_run[tid] = -1.0 / 0.0; l_run[tid] = 0.0; }
+    barrier();
+
+    for (int j0 = 0; j0 < p.n_kv; j0 += KB) {
+        /* ---- scores ---------------------------------------------------- */
+        for (int idx = tid; idx < QB * KB; idx += 256) {
+            const int r = idx / KB;
+            const int c = idx % KB;
+            const int i = q0 + r;
+            const int j = j0 + c;
+
+            bool live = (j < p.n_kv) && (i < p.n_q);
+            if (live && p.causal != 0 && j > p.causal_offset + i) live = false;
+
+            float s = -1.0 / 0.0;
+            if (live) {
+                float acc = 0.0;
+                const int kb = j * ns + h * hd;
+                for (int d = 0; d < hd; d++) acc += Qs[r * hd + d] * Kb.data[kb + d];
+                s = acc * p.scale;
+            }
+            Sf[idx] = s;
+        }
+        barrier();
+
+        /* ---- online softmax, one invocation per query row -------------- */
+        if (tid < QB) {
+            const int row = tid;
+            float tile_max = -1.0 / 0.0;
+            for (int c = 0; c < KB; c++) tile_max = max(tile_max, Sf[row * KB + c]);
+
+            const float m_old = m_run[row];
+            const float m_new = max(m_old, tile_max);
+            const bool  has_m = !isinf(m_new) || m_new > 0.0;
+            /* Guarded: the first tile (and a fully masked one) leaves m_old at
+             * -inf, where exp(-inf - -inf) is NaN rather than 0. */
+            const float c_old = (!isinf(m_old) && has_m) ? exp(m_old - m_new) : 0.0;
+
+            float sum = 0.0;
+            for (int c = 0; c < KB; c++) {
+                const float pe = has_m ? exp(Sf[row * KB + c] - m_new) : 0.0;
+                Sf[row * KB + c] = pe;
+                sum += pe;
+            }
+            m_run[row] = m_new;
+            l_run[row] = l_run[row] * c_old + sum;
+            corr[row]  = c_old;
+        }
+        barrier();
+
+        /* ---- O = O*corr + P.V ------------------------------------------ */
+        for (int idx = tid; idx < QB * hd; idx += 256) {
+            const int r = idx / hd;
+            const int d = idx % hd;
+            float acc = 0.0;
+            for (int c = 0; c < KB; c++) {
+                const int j = j0 + c;
+                if (j >= p.n_kv) break;
+                acc += Sf[r * KB + c] * Vb.data[j * ns + h * hd + d];
+            }
+            Ot[idx] = Ot[idx] * corr[r] + acc;
+        }
+        barrier();
+    }
+
+    for (int idx = tid; idx < QB * hd; idx += 256) {
+        const int r = idx / hd;
+        const int d = idx % hd;
+        const int i = q0 + r;
+        if (i >= p.n_q) continue;
+        const float l = l_run[r];
+        Ob.data[i * ns + h * hd + d] = (l > 0.0) ? Ot[idx] / l : 0.0;
+    }
+}

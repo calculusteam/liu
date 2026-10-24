@@ -1,0 +1,20 @@
+/* Copy n_tokens rows of K or V into a cache at row n_past. */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "whisper_common.glsl"
+
+layout(local_size_x = 64, local_size_y = 4) in;
+
+layout(std430, binding = 0) readonly  buffer Sbuf_t { float data[]; } Sbuf;
+layout(std430, binding = 1) writeonly buffer Dbuf_t { float data[]; } Dbuf;
+
+layout(push_constant) uniform Push {
+    int n_state; int n_tokens; int n_past; int dtype;
+} p;
+
+void main() {
+    const int c = int(gl_GlobalInvocationID.x);
+    const int t = int(gl_GlobalInvocationID.y);
+    if (t >= p.n_tokens || c >= p.n_state) return;
+    Dbuf.data[(p.n_past + t) * p.n_state + c] = Sbuf.data[t * p.n_state + c];
+}

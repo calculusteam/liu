@@ -1,0 +1,32 @@
+Liu backport of libssh2 commit cdbda3cd8d (sftp: free response buffer on sftp_read() protocol-error paths, #2537) to the 1.11.1 release tarball.
+Not in Homebrew's set and not applicable to 1.11.1 as-is (upstream master renamed
+ssh2_* / SSH2_* / ssh2_NB_state_*); this is the same change in 1.11.1's names
+(_libssh2_*, LIBSSH2_*, libssh2_NB_state_*). Three protocol-error returns in the SSH_FXP_DATA arm dropped the response buffer; a server could trigger any of them on every read.
+
+--- a/src/sftp.c
++++ b/src/sftp.c
+@@ -1732,19 +1732,23 @@
+                        https://tools.ietf.org/html/draft-ietf-secsh-filexfer-02
+                        #section-6.4
+                      */
++                    LIBSSH2_FREE(session, data);
+                     return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
+                                           "Read Packet At Unexpected Offset");
+                 }
+ 
+                 rc32 = _libssh2_ntohu32(data + 5);
+-                if(rc32 > (data_len - 9))
++                if(rc32 > (data_len - 9)) {
++                    LIBSSH2_FREE(session, data);
+                     return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
+                                           "SFTP Protocol badness");
++                }
+ 
+                 if(rc32 > chunk->len) {
+                     /* A chunk larger than we requested was returned to us.
+                        This is a protocol violation and we don't know how to
+                        deal with it. Bail out! */
++                    LIBSSH2_FREE(session, data);
+                     return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
+                                           "FXP_READ response too big");
+                 }

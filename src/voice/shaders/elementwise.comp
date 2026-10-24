@@ -1,0 +1,22 @@
+/* x += y, or GELU in place. One shader with a mode switch rather than two
+ * pipelines: both are a single pass over the same buffer and the branch is
+ * uniform across the whole dispatch. */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "whisper_common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Xbuf { float data[]; } X;
+layout(std430, binding = 1) readonly buffer Ybuf { float data[]; } Y;
+
+layout(push_constant) uniform Push {
+    int n; int mode; int pad0; int pad1;   /* mode 0 = add, 1 = gelu */
+} p;
+
+void main() {
+    const int i = int(gl_GlobalInvocationID.x);
+    if (i >= p.n) return;
+    if (p.mode == 0) X.data[i] += Y.data[i];
+    else             X.data[i] = wmGelu(X.data[i]);
+}

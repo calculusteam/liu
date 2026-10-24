@@ -1,0 +1,31 @@
+/* Token embedding lookup + learned positional embedding. The table stays
+ * quantized: it is 51866 x 1280 and a decode step needs a handful of rows. */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "whisper_common.glsl"
+
+layout(local_size_x = 64, local_size_y = 4) in;
+
+layout(std430, binding = 0) readonly  buffer Wbuf_t { uint  data[]; } Wbuf;
+layout(std430, binding = 1) readonly  buffer Ibuf_t { int   data[]; } Ids;
+layout(std430, binding = 2) readonly  buffer Pbuf_t { float data[]; } Pbuf;
+layout(std430, binding = 3) writeonly buffer Obuf_t { float data[]; } Obuf;
+
+#include "whisper_dequant.glsl"
+
+layout(push_constant) uniform Push {
+    int n_state; int n_tokens; int n_past; int dtype;
+} p;
+
+void main() {
+    const int c = int(gl_GlobalInvocationID.x);
+    const int t = int(gl_GlobalInvocationID.y);
+    if (t >= p.n_tokens || c >= p.n_state) return;
+
+    const int bb = wqBlockBytes(p.dtype);
+    const int nblk = p.n_state / 32;
+    const uint row = uint(Ids.data[t] * nblk) * uint(bb);
+
+    const float e = wqOne(row + uint((c / 32) * bb), p.dtype, c % 32);
+    Obuf.data[t * p.n_state + c] = e + Pbuf.data[(p.n_past + t) * p.n_state + c];
+}

@@ -1,0 +1,83 @@
+name: CI
+
+# Run build jobs on each supported operating system and architecture for every
+# push and pull request. Windows is excluded because the Win32 backend does
+# not yet link.
+
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["v*"]
+    # Release-bot manifest commits are data-only — skip the build matrix.
+    paths-ignore:
+      - "packaging/manifest/**"
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+
+  # Build Liu, liu-notify, and liu-history in Debug with ASan/UBSan and in
+  # Release with optimization, LTO, FORTIFY, and NDEBUG. These configurations
+  # exercise different compiler flags; this workflow verifies that both builds
+  # succeed.
+  macos:
+    name: macOS ${{ matrix.arch }} ${{ matrix.profile }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-14, arch: arm64, profile: Debug, sanitize: "ON" }    # Apple Silicon (Metal)
+          - { runner: macos-14, arch: arm64, profile: Release, sanitize: "OFF" }
+          - { runner: macos-15-intel, arch: x86_64, profile: Debug, sanitize: "ON" }  # Intel x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Ensure selected Xcode Metal toolchain
+        run: |
+          if ! xcrun -sdk macosx metal --version; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun -sdk macosx metal --version
+          xcrun -sdk macosx --find metallib
+      - name: Configure
+        run: >
+          cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.profile }}
+          -DLIU_SANITIZE=${{ matrix.sanitize }}
+      - name: Build
+        run: cmake --build build -j"$(sysctl -n hw.ncpu)"
+
+  # Both build types, because they are not the same compile: Release turns on
+  # -O3 -flto, _FORTIFY_SOURCE=2 and the per-arch tuning flag (-mtune=generic
+  # on x86-64, -march=armv8-a+simd on arm64), none of which a Debug build
+  # exercises. A Debug-only matrix would let an arm64 Release regression ship.
+  linux:
+    name: Linux ${{ matrix.arch }} ${{ matrix.build_type }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: x86_64, build_type: Debug }
+          - { runner: ubuntu-24.04, arch: x86_64, build_type: Release }
+          - { runner: ubuntu-24.04-arm, arch: arm64, build_type: Debug }
+          - { runner: ubuntu-24.04-arm, arch: arm64, build_type: Release }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential cmake ninja-build pkg-config \
+            libx11-dev libxcursor-dev libxi-dev libxrandr-dev \
+            libfontconfig1-dev libfreetype-dev libharfbuzz-dev libdbus-1-dev \
+            libgl1-mesa-dev libssh2-1-dev libssl-dev
+      # Ninja, as in the release build: under make, GCC's LTO step on
+      # x86_64 fails through the jobserver.
+      - name: Configure (OpenGL renderer)
+        run: >
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DUSE_METAL=OFF
+      - name: Build
+        run: cmake --build build -j"$(nproc)"

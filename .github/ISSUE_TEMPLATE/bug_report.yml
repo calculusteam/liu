@@ -1,0 +1,53 @@
+name: Bug report
+description: Something in Liu does not work the way it should
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what Liu did instead. A screenshot or a short recording helps for anything visual.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open a new tab
+        2. Run ...
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Liu version
+      description: The output of `/Applications/Liu.app/Contents/MacOS/Liu --version`, or the line in Settings › About.
+      placeholder: Liu 0.1.0 (8a7ce347) arm64
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version and Mac
+      placeholder: macOS 15.5, MacBook Pro M3
+    validations:
+      required: true
+  - type: input
+    id: program
+    attributes:
+      label: Program in the pane, if it matters
+      description: The shell, agent CLI or TUI that was running, with its version.
+      placeholder: claude 2.1.0 in zsh 5.9
+  - type: textarea
+    id: crash
+    attributes:
+      label: Crash report
+      description: If Liu crashed, the newest file in `~/.config/Liu/crasherrors/`. It holds the version, the macOS version and a backtrace; read it before you attach it.
+      render: text
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Anything else
+      description: For notification or agent-history problems, what Settings › Diagnostics reports.

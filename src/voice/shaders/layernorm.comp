@@ -1,0 +1,50 @@
+/* LayerNorm with affine, out-of-place: every Whisper sub-block normalizes a
+ * COPY of x, transforms it, and adds the result back to the untouched x.
+ * One workgroup per token. */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "whisper_common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) writeonly buffer Obuf_t { float data[]; } Obuf;
+layout(std430, binding = 1) readonly  buffer Ibuf_t { float data[]; } Ibuf;
+layout(std430, binding = 2) readonly  buffer Gbuf_t { float data[]; } Gbuf;
+layout(std430, binding = 3) readonly  buffer Bbuf_t { float data[]; } Bbuf;
+
+layout(push_constant) uniform Push {
+    int n_state; int n_tokens; int pad0; int pad1;
+} p;
+
+shared float red[256];
+
+void main() {
+    const int tid = int(gl_LocalInvocationIndex);
+    const int row = int(gl_WorkGroupID.x);
+    if (row >= p.n_tokens) return;
+
+    const int base = row * p.n_state;
+
+    float s = 0.0;
+    for (int i = tid; i < p.n_state; i += 256) s += Ibuf.data[base + i];
+    red[tid] = s;
+    barrier();
+    for (int k = 128; k > 0; k >>= 1) { if (tid < k) red[tid] += red[tid + k]; barrier(); }
+    const float mean = red[0] / float(p.n_state);
+    barrier();
+
+    float v = 0.0;
+    for (int i = tid; i < p.n_state; i += 256) {
+        const float d = Ibuf.data[base + i] - mean;
+        v += d * d;
+    }
+    red[tid] = v;
+    barrier();
+    for (int k = 128; k > 0; k >>= 1) { if (tid < k) red[tid] += red[tid + k]; barrier(); }
+    const float inv = inversesqrt(red[0] / float(p.n_state) + 1e-5);
+    barrier();
+
+    for (int i = tid; i < p.n_state; i += 256) {
+        Obuf.data[base + i] = (Ibuf.data[base + i] - mean) * inv * Gbuf.data[i] + Bbuf.data[i];
+    }
+}
