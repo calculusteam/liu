@@ -1,0 +1,92 @@
+/* C[M,N] = A[M,K] . B[N,K]^T + bias[N], with B dequantized in the kernel.
+ *
+ * 64x64 output tile, 16x16 invocations, four-by-four outputs each. The K tile
+ * is 16 rather than 32 so both shared tiles fit inside the 16 KB of shared
+ * memory Vulkan guarantees on every implementation — a larger tile would run
+ * on a desktop driver and fail to create the pipeline on a modest one. */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "whisper_common.glsl"
+
+#define BM 64
+#define BN 64
+#define BK 16
+#define TM 4
+#define TN 4
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly  buffer Abuf_t { float data[]; } Abuf;
+layout(std430, binding = 1) readonly  buffer Wbuf_t { uint  data[]; } Wbuf;
+layout(std430, binding = 2) readonly  buffer Bbuf_t { float data[]; } Bbuf;
+layout(std430, binding = 3) writeonly buffer Cbuf_t { float data[]; } Cbuf;
+
+#include "whisper_dequant.glsl"
+
+layout(push_constant) uniform Push {
+    int M; int N; int K; int dtype; int has_bias; int pad0; int pad1; int pad2;
+} p;
+
+shared float As[BM * BK];
+shared float Bs[BN * BK];
+
+void main() {
+    const int m0 = int(gl_WorkGroupID.y) * BM;
+    const int n0 = int(gl_WorkGroupID.x) * BN;
+    const int tid = int(gl_LocalInvocationIndex);
+
+    const int tm = int(gl_LocalInvocationID.y) * TM;   /* this thread's rows */
+    const int tn = int(gl_LocalInvocationID.x) * TN;   /* and columns        */
+
+    float acc[TM][TN];
+    for (int i = 0; i < TM; i++)
+        for (int j = 0; j < TN; j++) acc[i][j] = 0.0;
+
+    const int nk = (p.K + BK - 1) / BK;
+
+    for (int kt = 0; kt < nk; kt++) {
+        const int k0 = kt * BK;
+
+        /* Stage A: rows past M are zeroed so a ragged last tile stays clean. */
+        for (int idx = tid; idx < BM * BK; idx += 256) {
+            const int mm = idx / BK;
+            const int kk = idx % BK;
+            const int m = m0 + mm;
+            const int k = k0 + kk;
+            As[idx] = (m < p.M && k < p.K) ? Abuf.data[m * p.K + k] : 0.0;
+        }
+        /* Stage B: dequantized on the way in. */
+        for (int idx = tid; idx < BN * BK; idx += 256) {
+            const int nn = idx / BK;
+            const int kk = idx % BK;
+            const int n = n0 + nn;
+            const int k = k0 + kk;
+            if (n < p.N && k < p.K) {
+                Bs[idx] = wqOne(wqRowBlock(n, k, p.K, p.dtype), p.dtype, k % 32);
+            } else {
+                Bs[idx] = 0.0;
+            }
+        }
+        barrier();
+
+        for (int kk = 0; kk < BK; kk++) {
+            float av[TM], bv[TN];
+            for (int i = 0; i < TM; i++) av[i] = As[(tm + i) * BK + kk];
+            for (int j = 0; j < TN; j++) bv[j] = Bs[(tn + j) * BK + kk];
+            for (int i = 0; i < TM; i++)
+                for (int j = 0; j < TN; j++) acc[i][j] += av[i] * bv[j];
+        }
+        barrier();
+    }
+
+    for (int i = 0; i < TM; i++) {
+        const int m = m0 + tm + i;
+        if (m >= p.M) continue;
+        for (int j = 0; j < TN; j++) {
+            const int n = n0 + tn + j;
+            if (n >= p.N) continue;
+            Cbuf.data[m * p.N + n] = acc[i][j] +
+                (p.has_bias != 0 ? Bbuf.data[n] : 0.0);
+        }
+    }
+}

@@ -1,0 +1,51 @@
+/* Same product for a handful of rows. The tiled GEMM would spend 63 of its 64
+ * m-lanes on padding during token-by-token decoding, and the tied LM head
+ * (M = 1, N = 51866) is the most-dispatched matmul in a transcript. */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "whisper_common.glsl"
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly  buffer Abuf_t { float data[]; } Abuf;
+layout(std430, binding = 1) readonly  buffer Wbuf_t { uint  data[]; } Wbuf;
+layout(std430, binding = 2) readonly  buffer Bbuf_t { float data[]; } Bbuf;
+layout(std430, binding = 3) writeonly buffer Cbuf_t { float data[]; } Cbuf;
+
+#include "whisper_dequant.glsl"
+
+layout(push_constant) uniform Push {
+    int M; int N; int K; int dtype; int has_bias; int pad0; int pad1; int pad2;
+} p;
+
+shared float red[64];
+
+void main() {
+    const int n = int(gl_WorkGroupID.x);
+    if (n >= p.N) return;
+    const int tid = int(gl_LocalInvocationIndex);
+
+    const int bb = wqBlockBytes(p.dtype);
+    const int nblk = p.K / 32;
+
+    for (int m = 0; m < p.M; m++) {
+        float acc = 0.0;
+        /* Two blocks per pass so 64 invocations cover the 32-element block
+         * granularity without idling half of them. */
+        for (int b = tid / 32; b < nblk; b += 2) {
+            const int e = tid % 32;
+            const uint blk = uint(n * nblk + b) * uint(bb);
+            acc += Abuf.data[m * p.K + b * 32 + e] * wqOne(blk, p.dtype, e);
+        }
+        red[tid] = acc;
+        barrier();
+        for (int s = 32; s > 0; s >>= 1) {
+            if (tid < s) red[tid] += red[tid + s];
+            barrier();
+        }
+        if (tid == 0) {
+            Cbuf.data[m * p.N + n] = red[0] + (p.has_bias != 0 ? Bbuf.data[n] : 0.0);
+        }
+        barrier();
+    }
+}

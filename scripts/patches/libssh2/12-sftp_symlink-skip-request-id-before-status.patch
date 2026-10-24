@@ -1,0 +1,43 @@
+Liu follow-up to 01-CVE-2025-15661.patch (not an upstream commit; the result is
+what libssh2 master's sftp_symlink() looks like today).
+
+The backported fix for CVE-2025-15661 parses the SFTP reply with a bounds-checked
+reader, but skips the 4-byte request id only on the NAME (readlink/realpath)
+path. On the STATUS path it then reads the id as if it were the status code, so a
+successful libssh2_sftp_symlink_ex(LIBSSH2_SFTP_SYMLINK) -- the server answers
+STATUS, code 0 -- is reported as -31 (LIBSSH2_ERROR_SFTP_PROTOCOL) although the
+link was created, and a real error code is misread the same way. Measured against
+a loopback sshd: pristine 1.11.1 returns 0, 1.11.1 + the eleven backports
+returns -31 for the same call; with this patch it returns 0 again. Upstream
+master skips the id once, before the type is dispatched, which is what this does.
+
+--- a/src/sftp.c
++++ b/src/sftp.c
+@@ -3904,6 +3904,13 @@
+         LIBSSH2_FREE(session, data);
+         return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
+                               "SFTP Protocol Error (type)");
++    }
++
++    /* advance past id */
++    if(_libssh2_get_u32(&buf, &tmp_u32)) {
++        LIBSSH2_FREE(session, data);
++        return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
++                              "SFTP Protocol Error (id)");
+     }
+ 
+     if(packet_type == SSH_FXP_STATUS) {
+@@ -3925,13 +3932,6 @@
+         }
+     }
+ 
+-    /* advance past id */
+-    if(_libssh2_get_u32(&buf, &tmp_u32)) {
+-        LIBSSH2_FREE(session, data);
+-        return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
+-                              "SFTP Protocol Error (id)");
+-    }
+-
+     /* look for at least one link */
+     if(_libssh2_get_u32(&buf, &tmp_u32) || tmp_u32 < 1) {
+         LIBSSH2_FREE(session, data);

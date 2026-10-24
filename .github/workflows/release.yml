@@ -1,0 +1,118 @@
+name: Release packages (Linux)
+
+# Build Linux release packages in ubuntu:22.04 for both architectures. This
+# workflow does not sign or publish artifacts. scripts/release.sh builds the
+# macOS app, collects these packages, signs and verifies the release
+# artifacts, and publishes the release.
+#
+# The workflow runs for a v<VERSION> tag pushed by ref name or when manually
+# dispatched on that tag. A push to main does not trigger it. Linux packages
+# are uploaded as pkg-linux-<arch> artifacts for release.sh to collect.
+#
+# This workflow has no signing secrets, and its token is read-only.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The packager names files from `git describe --exact-match`: built from any
+  # ref but the release tag, every file would carry a +<hash> suffix and
+  # release.sh would not find it.
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: The ref is the release tag v<VERSION>
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < VERSION)"
+          if [[ ! "${version}" =~ ^[0-9]+(\.[0-9]+){0,2}(-[A-Za-z0-9.]+)?$ ]]; then
+            echo "::error::VERSION '${version}' is not a valid release token."
+            exit 1
+          fi
+          if [[ "${GITHUB_REF_TYPE}" != "tag" || "${GITHUB_REF_NAME}" != "v${version}" ]]; then
+            echo "::error::run this on the tag v${version} (this run is on the ${GITHUB_REF_TYPE} ${GITHUB_REF_NAME})."
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Linux is built inside ubuntu:22.04 on both architectures, not on the
+  # runner's own 24.04: a binary records the newest glibc symbol version it was
+  # linked against, and one linked on 24.04 needs GLIBC_2.38 and will not start
+  # on Ubuntu 22.04 or Debian 12. Built on 22.04 (glibc 2.35, OpenSSL 3.0,
+  # libssh2 1.10) it runs on Ubuntu 22.04+, Debian 12+ and Fedora 36+, and
+  # scripts/check_linux_binaries.sh fails the job if a binary asks for more.
+  # One build per arch; package_linux.sh makes the tarball from it and the
+  # .deb, the .rpm and the AppImage from the tarball.
+  build-linux:
+    needs: tag
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: x86_64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    container: ubuntu:22.04
+    steps:
+      # Before the checkout: without git in the container actions/checkout
+      # fetches a snapshot with no history and no tag, and the packager
+      # (`git describe --exact-match`) would name every file <version>+<hash>.
+      - name: Install build and packaging tools
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            build-essential cmake ninja-build pkg-config git ca-certificates curl python3 file \
+            libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev \
+            libfontconfig1-dev libfreetype-dev libharfbuzz-dev libdbus-1-dev \
+            libgl1-mesa-dev libssh2-1-dev libssl-dev ncurses-bin \
+            dpkg-dev rpm squashfs-tools patchelf desktop-file-utils
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+
+      # The workspace belongs to the runner's user and the container runs as
+      # root: git refuses a repository another user owns unless it is listed as
+      # a safe directory.
+      - name: Trust the checkout
+        run: git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+
+      # Ninja, not make: GCC 11's link-time optimisation runs a make of its own
+      # for the LTRANS jobs, and under GNU make it inherits a MAKEFLAGS naming
+      # the parent's jobserver without the descriptors — "write jobserver: Bad
+      # file descriptor" and no Liu (seen building x86_64 on 22.04). Ninja
+      # exports no MAKEFLAGS.
+      - name: Build (Release, OpenGL, no test driver)
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DUSE_METAL=OFF -DLIU_DEV_HOOKS=OFF
+          cmake --build build -j"$(nproc)" --target Liu liu-notify liu-history
+
+      - name: glibc floor and linked features
+        run: scripts/check_linux_binaries.sh --glibc-floor 2.35 build/Liu build/liu-notify build/liu-history
+
+      # The AppImage runtime is downloaded by scripts/package_linux.sh and
+      # pinned by release and SHA-256.
+      - name: Package (tarball, .deb, .rpm, AppImage)
+        env:
+          BUILD_DIR: build
+        run: scripts/package_linux.sh --formats tarball,deb,rpm,appimage
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pkg-linux-${{ matrix.arch }}
+          path: |
+            build/package/liu-*-linux-${{ matrix.arch }}.tar.gz
+            build/package/liu_*.deb
+            build/package/liu-*.rpm
+            build/package/Liu-*.AppImage
+          if-no-files-found: error

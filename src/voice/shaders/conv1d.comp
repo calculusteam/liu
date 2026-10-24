@@ -1,0 +1,38 @@
+/* conv1d, kernel 3, padding 1, optional GELU. Channel-major in and out:
+ * in[ic*t_in + t], out[oc*t_out + t]. One invocation per output element; the
+ * weight row is shared by every invocation with the same output channel and
+ * comes out of the cache. */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "whisper_common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer Ibuf_t { float data[]; } Ibuf;
+layout(std430, binding = 1) readonly  buffer Wbuf_t { float data[]; } W;
+layout(std430, binding = 2) readonly  buffer Bbuf_t { float data[]; } Bbuf;
+layout(std430, binding = 3) writeonly buffer Obuf_t { float data[]; } Obuf;
+
+layout(push_constant) uniform Push {
+    int in_ch; int out_ch; int t_in; int t_out; int stride; int apply_gelu;
+    int pad0; int pad1;
+} p;
+
+void main() {
+    const int oc = int(gl_WorkGroupID.y);
+    const int t  = int(gl_GlobalInvocationID.x);
+    if (oc >= p.out_ch || t >= p.t_out) return;
+
+    const int wrow = oc * p.in_ch * 3;
+    float acc = Bbuf.data[oc];
+    const int c = t * p.stride;
+
+    for (int ic = 0; ic < p.in_ch; ic++) {
+        const int xb = ic * p.t_in;
+        const int kb = wrow + ic * 3;
+        if (c - 1 >= 0)     acc += W.data[kb + 0] * Ibuf.data[xb + c - 1];
+        if (c     < p.t_in) acc += W.data[kb + 1] * Ibuf.data[xb + c];
+        if (c + 1 < p.t_in) acc += W.data[kb + 2] * Ibuf.data[xb + c + 1];
+    }
+    Obuf.data[oc * p.t_out + t] = (p.apply_gelu != 0) ? wmGelu(acc) : acc;
+}

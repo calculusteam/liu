@@ -1,0 +1,26 @@
+# Liu's terminfo entry.
+#
+# Everything xterm-256color says (use=), plus what Liu does beyond it: styled
+# and coloured underlines, the cursor's shape, the clipboard write, bracketed
+# paste, focus reports, synchronized output, the title, 24-bit colour (tmux's
+# Tc and Su flags). The entry is resolved when it is compiled, so the compiled
+# file needs no other.
+#
+# A pane's TERM is xterm-256color unless the user sets "term": "xterm-liu" in
+# ~/.config/Liu/config.json. The compiled entry ships beside the app and a
+# pane finds it through TERMINFO; another machine does not have it, which is
+# why it is not the default (ssh to a host without the entry would break
+# every full-screen program there).
+#
+# By hand: tic -x -o <dir> liu.terminfo
+xterm-liu|Liu terminal emulator,
+	Tc, XT, Su, hs,
+	Smulx=\E[4:%p1%dm,
+	Setulc=\E[58:2::%p1%{65536}%/%d:%p1%{256}%/%{255}%&%d:%p1%{255}%&%dm,
+	Ss=\E[%p1%d q, Se=\E[0 q,
+	Ms=\E]52;%p1%s;%p2%s\007,
+	BE=\E[?2004h, BD=\E[?2004l, PS=\E[200~, PE=\E[201~,
+	fe=\E[?1004h, fd=\E[?1004l, kxIN=\E[I, kxOUT=\E[O,
+	Sync=\E[?2026%?%p1%{1}%-%tl%eh%;,
+	tsl=\E]2;, fsl=^G, dsl=\E]2;\007,
+	use=xterm-256color,

@@ -1,0 +1,24 @@
+/* conv2's output is channel-major [n_state][n_tokens]; the transformer wants
+ * token-major. Folding the positional embedding into the same pass saves a
+ * full round trip over the tensor. */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "whisper_common.glsl"
+
+layout(local_size_x = 32, local_size_y = 8) in;
+
+layout(std430, binding = 0) readonly  buffer Ibuf_t { float data[]; } Ibuf;
+layout(std430, binding = 1) readonly  buffer Pbuf_t { float data[]; } Pbuf;
+layout(std430, binding = 2) writeonly buffer Obuf_t { float data[]; } Obuf;
+
+layout(push_constant) uniform Push {
+    int n_state; int n_tokens; int pad0; int pad1;
+} p;
+
+void main() {
+    const int t = int(gl_GlobalInvocationID.x);
+    const int c = int(gl_GlobalInvocationID.y);
+    if (t >= p.n_tokens || c >= p.n_state) return;
+    Obuf.data[t * p.n_state + c] =
+        Ibuf.data[c * p.n_tokens + t] + Pbuf.data[t * p.n_state + c];
+}

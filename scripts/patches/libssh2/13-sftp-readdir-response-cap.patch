@@ -1,0 +1,73 @@
+Liu backport of libssh2 commit e3379a5c973665f58c7752d8b9535e89514d7a1b (sftp.c: cap readdir response size and fix window adjust overflow, #2133) to the 1.11.1 release tarball.
+Not in Homebrew's set and not applicable to 1.11.1 as-is (upstream master renamed
+ssh2_* / SSH2_* / ssh2_NB_state_*); this is the same change in 1.11.1's names
+(_libssh2_*, LIBSSH2_*, libssh2_NB_state_*). A malicious SFTP server could answer READDIR with a packet length up to ~4 GB and make the client allocate it; the window adjustment doubled that length in 32 bits and wrapped to zero.
+
+--- a/src/sftp.c
++++ b/src/sftp.c
+@@ -98,6 +98,11 @@
+    some kind of server problem. */
+ #define LIBSSH2_SFTP_PACKET_MAXLEN  (256 * 1024)
+ 
++/* Readdir responses are allowed to exceed LIBSSH2_SFTP_PACKET_MAXLEN, but must
++   still have a reasonable upper bound to prevent a malicious server from
++   causing unbounded memory allocation (up to ~4 GB for a uint32_t). */
++#define LIBSSH2_SFTP_READDIR_MAXLEN (16 * 1024 * 1024)
++
+ static int sftp_packet_ask(LIBSSH2_SFTP *sftp, unsigned char packet_type,
+                            uint32_t request_id, unsigned char **data,
+                            size_t *data_len);
+@@ -321,16 +326,27 @@
+ 
+             /* make sure we don't proceed if the packet size is unreasonably
+                large */
+-            if(sftp->partial_len > LIBSSH2_SFTP_PACKET_MAXLEN &&
+-               /* exception: response to SSH_FXP_READDIR request */
+-               !(sftp->readdir_state != libssh2_NB_state_idle &&
+-                 sftp->readdir_request_id == request_id &&
+-                 packet_type == SSH_FXP_NAME)) {
+-                libssh2_channel_flush(channel);
+-                sftp->packet_header_len = 0;
+-                return _libssh2_error(session,
++            if(sftp->partial_len > LIBSSH2_SFTP_PACKET_MAXLEN) {
++                /* exception: response to SSH_FXP_READDIR request gets a
++                   higher (but still bounded) limit */
++                if(sftp->readdir_state != libssh2_NB_state_idle &&
++                   sftp->readdir_request_id == request_id &&
++                   packet_type == SSH_FXP_NAME) {
++                    if(sftp->partial_len > LIBSSH2_SFTP_READDIR_MAXLEN) {
++                        libssh2_channel_flush(channel);
++                        sftp->packet_header_len = 0;
++                        return _libssh2_error(session,
+                                       LIBSSH2_ERROR_CHANNEL_PACKET_EXCEEDED,
+-                                      "SFTP packet too large");
++                                      "SFTP readdir packet too large");
++                    }
++                }
++                else {
++                    libssh2_channel_flush(channel);
++                    sftp->packet_header_len = 0;
++                    return _libssh2_error(session,
++                                          LIBSSH2_ERROR_CHANNEL_PACKET_EXCEEDED,
++                                          "SFTP packet too large");
++                }
+             }
+ 
+             if(sftp->partial_len < 5)
+@@ -355,10 +371,13 @@
+             recv_window = libssh2_channel_window_read_ex(channel, NULL, NULL);
+ 
+             if(sftp->partial_len > recv_window) {
+-                /* ask for twice the data amount we need at once */
++                /* ask for twice the data amount we need at once, but
++                   cap to UINT32_MAX to prevent integer overflow when
++                   partial_len > 2^31 */
++                uint32_t adjust = (sftp->partial_len > UINT32_MAX / 2) ?
++                    UINT32_MAX : sftp->partial_len * 2;
+                 rc = _libssh2_channel_receive_window_adjust(channel,
+-                                                            sftp->partial_len
+-                                                            * 2,
++                                                            adjust,
+                                                             1, NULL);
+                 /* store the state so that we continue with the correct
+                    operation at next invoke */

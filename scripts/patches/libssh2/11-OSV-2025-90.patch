@@ -1,0 +1,25 @@
+From 631e2f82a32ef016299ebb1af66efeae0161f68e Mon Sep 17 00:00:00 2001
+From: Michael Buckley <michael@buckleyisms.com>
+Date: Fri, 19 Dec 2025 15:41:45 -0800
+Subject: [PATCH] Fix a NULL dereference of kex->exchange_keys during key
+ exchange. (#1763)
+
+Credit:
+Aldo Ristori
+---
+ src/kex.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/kex.c b/src/kex.c
+index 32774b0517f418bc23620883c8d296f0db8b8496..2e114a859ef394be3f338bd1eb065face3fca28b 100644
+--- a/src/kex.c
++++ b/src/kex.c
+@@ -4151,7 +4151,7 @@ _libssh2_kex_exchange(LIBSSH2_SESSION * session, int reexchange,
+         key_state->state = libssh2_NB_state_sent2;
+     }
+ 
+-    if(rc == 0 && session->kex) {
++    if(rc == 0 && session->kex && session->kex->exchange_keys) {
+         if(key_state->state == libssh2_NB_state_sent2) {
+             retcode = session->kex->exchange_keys(session,
+                                                   &key_state->key_state_low);

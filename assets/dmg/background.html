@@ -1,0 +1,86 @@
+<!doctype html>
+<!--
+  Liu — DMG installer window background (design source).
+
+  Logical canvas is 640x400 points (the Finder window content size set by
+  scripts/dmg_build_settings.py). Rendered to background.png (1x) and
+  background@2x.png (2x) by scripts/dmg_render_background.sh via native WebKit;
+  tiffutil folds both into a HiDPI background.tiff at package time.
+
+  The background is the site's: one frame of the violet haze its pages are
+  drawn on, quantised to six tones by an 8x8 ordered dither, under the same
+  still film grain (website/src/components/MotionBackground.vue). Both layers
+  are images made by scripts/dmg_render_field.py — field.png has ONE PIXEL PER
+  DITHER CELL and is scaled up pixelated, so a cell is 4 points at 1x and 8
+  pixels at 2x as it is on the site; grain.png is the site's 200px tile.
+
+  Icon labels are baked into the art (white, with a soft drop shadow). Finder
+  ignores .DS_Store textColor* keys on modern macOS, so we can't rely on
+  Finder-drawn labels for readability on this dark canvas.
+  Label positions match the icon centers in scripts/dmg_build_settings.py
+  (icon_locations: appname at x=160, "Applications" at x=480, both at y=198;
+  icon_size=112 → icon bottom y=254; labels sit ~36pt below the icon center).
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 640px; height: 400px; overflow: hidden;
+    background: #0A0A0B;                              /* --page-bg (ink-950) */
+    font-family: -apple-system, 'SF Pro Text', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .canvas { position: relative; width: 640px; height: 400px; }
+
+  .field, .grain { position: absolute; left: 0; top: 0; width: 640px; height: 400px; }
+  .field { display: block; image-rendering: pixelated; }
+  /* Still on purpose, and at the tile's own 200px, as on the site. */
+  .grain { background: url(grain.png) 0 0 / 200px 200px; }
+
+  .arrow { position: absolute; left: 0; top: 0; width: 640px; height: 400px; }
+</style>
+</head>
+<body>
+  <div class="canvas">
+
+    <img class="field" src="field.png" alt="">
+    <div class="grain"></div>
+
+    <svg class="arrow" viewBox="0 0 640 400" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <linearGradient id="ag" gradientUnits="userSpaceOnUse" x1="250" y1="198" x2="399" y2="198">
+          <stop offset="0" stop-color="#A85BD8"/>
+          <stop offset="1" stop-color="#D894F8"/>
+        </linearGradient>
+        <filter id="labelShadow" x="-20%" y="-40%" width="140%" height="180%">
+          <feGaussianBlur in="SourceAlpha" stdDeviation="1.2"/>
+          <feOffset dx="0" dy="1" result="off"/>
+          <feFlood flood-color="#000000" flood-opacity="0.85"/>
+          <feComposite in2="off" operator="in"/>
+          <feMerge>
+            <feMergeNode/>
+            <feMergeNode in="SourceGraphic"/>
+          </feMerge>
+        </filter>
+      </defs>
+      <g stroke="url(#ag)" fill="none" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" opacity="0.95">
+        <path d="M 250,200 C 285,196 325,202 384,198" />
+        <path d="M 252,198 C 290,201 330,195 382,199" stroke-width="2" opacity="0.8" />
+        <path d="M 368,188 C 374,191 382,194 397,198" />
+        <path d="M 369,210 C 375,206 383,202 397,198" />
+        <path d="M 366,190 C 372,193 378,195 395,198" stroke-width="2" opacity="0.8" />
+        <path d="M 367,208 C 373,205 379,201 395,198" stroke-width="2" opacity="0.8" />
+      </g>
+      <g font-size="14" font-weight="500"
+         text-anchor="middle"
+         fill="#FFFFFF"
+         filter="url(#labelShadow)">
+        <text x="160" y="290">Liu.app</text>
+        <text x="480" y="290">Applications</text>
+      </g>
+    </svg>
+  </div>
+</body>
+</html>

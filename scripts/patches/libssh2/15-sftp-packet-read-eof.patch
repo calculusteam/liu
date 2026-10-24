@@ -1,0 +1,39 @@
+Liu backport of libssh2 commit 9438f90ae0 (sftp: fix handling unexpected EOF in sftp_packet_read(), GHSA-2q3j-q544-xxp7, #2581) to the 1.11.1 release tarball.
+Not in Homebrew's set and not applicable to 1.11.1 as-is (upstream master renamed
+ssh2_* / SSH2_* / ssh2_NB_state_*); this is the same change in 1.11.1's names
+(_libssh2_*, LIBSSH2_*, libssh2_NB_state_*). If the server stopped serving the promised bytes, sftp_packet_read() looped on a zero-length channel read forever.
+
+--- a/src/sftp.c
++++ b/src/sftp.c
+@@ -312,6 +312,12 @@
+                 return (int)rc;
+             else if(rc < 0)
+                 return _libssh2_error(session, (int)rc, "channel read");
++            else if(rc == 0) {
++                sftp->packet_header_len = 0;
++                return _libssh2_error(session, LIBSSH2_ERROR_SOCKET_RECV,
++                                      "Unexpected channel EOF while reading "
++                                      "SFTP packet header");
++            }
+ 
+             sftp->packet_header_len += rc;
+ 
+@@ -406,11 +412,15 @@
+                 sftp->packet_state = libssh2_NB_state_sent1;
+                 return (int)rc;
+             }
+-            else if(rc < 0) {
++            else if(rc <= 0) {
+                 LIBSSH2_FREE(session, packet);
+                 sftp->partial_packet = NULL;
+-                return _libssh2_error(session, (int)rc,
+-                                      "Error waiting for SFTP packet");
++                if(rc < 0)
++                    return _libssh2_error(session, (int)rc,
++                                          "Error waiting for SFTP packet");
++                return _libssh2_error(session, LIBSSH2_ERROR_SOCKET_RECV,
++                                      "Unexpected channel EOF while reading "
++                                      "SFTP packet body");
+             }
+             sftp->partial_received += rc;
+         }
