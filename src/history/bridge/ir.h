@@ -104,6 +104,17 @@ typedef struct {
      * re-serializes it must keep the marker rather than pretend it is whole. */
     bool tool_output_truncated;
 
+    /* What a file-editing call changed, on its TOOL_RESULT, when the source
+     * recorded it: unified-diff hunks ("@@ -a,b +c,d @@" and their lines,
+     * numbered in the file as it was), or tool_file_created for a call that
+     * made the file. NULL and false when the source keeps no such record; a
+     * diff over the size policy is not kept at all rather than kept cut. */
+    const char *tool_patch;
+    bool        tool_file_created;
+    /* The source marked this TOOL_RESULT as the call failing (Anthropic's
+     * `is_error`). False when it did not, or keeps no such mark. */
+    bool        tool_failed;
+
     /* Verbatim source record, when the source parser could cheaply keep it
      * and a same-tool target could use it. NULL otherwise — never required. */
     const char *raw_payload;
@@ -213,6 +224,12 @@ bool bridge_push_tool_call(BridgeHistory *h, i64 ts_ms, const char *name,
                            const char *call_id, const char *input_json);
 bool bridge_push_tool_result(BridgeHistory *h, i64 ts_ms, const char *name,
                              const char *call_id, const char *output);
+
+/* Attach a recorded file change to the TOOL_RESULT at `index` (see
+ * BridgeEvent.tool_patch). False when `index` is not a tool result or the
+ * patch is over BRIDGE_TOOL_OUTPUT_MAX, which leaves the event as it was. */
+bool bridge_history_set_file_change(BridgeHistory *h, usize index,
+                                    const char *patch, bool created);
 
 /* Close the history: resolves orphan tool records, fills in the derived
  * fidelity flags. Call once, after the last push, before handing `h` to a

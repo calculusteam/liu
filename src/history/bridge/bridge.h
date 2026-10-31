@@ -41,9 +41,10 @@
  * names have to mean something to a user, not just to the adapter. */
 typedef enum {
     BRIDGE_IMPORT_UNSUPPORTED = 0,
-    /* The agent exposes an API for seeding a thread's model-visible history
-     * (codex `thread/inject_items`). Nothing is guessed and nothing is
-     * written by hand — the agent itself persists the result. */
+    /* The agent imports the session itself through its own API (codex's
+     * session import, or `thread/inject_items` where that is missing).
+     * Nothing is written into its store by hand — the agent persists the
+     * result. */
     BRIDGE_IMPORT_NATIVE_HISTORY,
     /* The agent ships a documented import command over its own export format
      * (opencode `export` / `import`). We produce that format; the agent
@@ -121,6 +122,14 @@ struct BridgeTarget {
      * agent then refuses. Called by bridge_migrate; a false answer turns the
      * whole migration into a failure and no session is launched. */
     bool (*validate_import)(const BridgeImportResult *result);
+
+    /* For a writer or an importer: the launch command a briefing goes with
+     * when the installed version is outside the range the target was checked
+     * against (`%s` receives the shell-quoted instruction), so the session
+     * opens with it as the first message. NULL: the agent has no verified way
+     * to take an opening message, so the briefing is written and the user is
+     * told where. */
+    const char *handoff_launch;
 };
 
 /* Look up an adapter. NULL when the tool has none at all. */
@@ -213,6 +222,10 @@ typedef struct BridgeProc BridgeProc;
 
 /* Spawn `argv` with pipes on stdin and stdout. NULL on failure. */
 BridgeProc *bridge_proc_start(const char *const argv[]);
+/* Same, with each "NAME=value" of the NULL-terminated `env_set` replacing or
+ * adding that variable in the child's environment. NULL when an entry has no
+ * name. */
+BridgeProc *bridge_proc_start_env(const char *const argv[], const char *const env_set[]);
 
 /* Write `data` to the child's stdin, keeping it open. False on a broken pipe. */
 bool bridge_proc_send(BridgeProc *p, const char *data, usize len);

@@ -216,6 +216,14 @@ static inline bool toast_stack_dismiss(ToastStack *s, i32 i, f64 now) {
 }
 
 /* The staying notice under a point, by the rects they were last drawn in. */
+/* Sends away the notice still up about `about` (0 names none). */
+static inline bool toast_stack_dismiss_about(ToastStack *s, u64 about, f64 now) {
+    if (!s || !about) return false;
+    for (i32 i = 0; i < s->n; i++)
+        if (s->e[i].about == about && s->e[i].closing_at <= 0.0) return toast_stack_dismiss(s, i, now);
+    return false;
+}
+
 static inline i32 toast_stack_hit(const ToastStack *s, f32 x, f32 y) {
     for (i32 i = 0; i < s->n; i++) {
         const ToastEntry *e = &s->e[i];

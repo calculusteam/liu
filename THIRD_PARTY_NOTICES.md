@@ -91,8 +91,9 @@ error pointer and a NULL-safe `cJSON_GetErrorPtr`).
     THE SOFTWARE.
 
 ### stb_truetype 1.26 and stb_image 2.30
-https://github.com/nothings/stb — public domain or MIT License, at the user's choice. Liu's copy of
-stb_truetype is edited (bounded CFF reader; the edits are marked `Liu:`).
+https://github.com/nothings/stb — public domain or MIT License, at the user's choice. Liu's copies of
+stb_truetype (a bounded CFF reader) and stb_image (a PNG data buffer that grows with the bytes read)
+are edited; the edits are marked `Liu:`.
 
     ALTERNATIVE A - MIT License
     Copyright (c) 2017 Sean Barrett
@@ -672,8 +673,8 @@ the project's licensing notes follow.
 
 ## Trademarks
 
-The names and logos of the AI coding tools Liu works with — among them Claude, Codex, GitHub Copilot, Cursor,
-Gemini, Cline, OpenCode, Amazon Q, Aider, Windsurf, Droid, Kiro, Crush, OpenClaw and Hermes — are trademarks of their respective owners. Liu shows
+The names and logos of the AI coding tools Liu works with — among them Claude, Codex, ChatGPT, GitHub Copilot, Cursor,
+Gemini, Cline, OpenCode, Amazon Q, Windsurf, Droid, Kiro, Crush, OpenClaw and Hermes — are trademarks of their respective owners. Liu shows
 them only to identify those tools and is not affiliated with or endorsed by their owners.
 
 ## Apache License 2.0

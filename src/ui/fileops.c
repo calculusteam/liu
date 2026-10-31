@@ -13,11 +13,13 @@
 #include <string.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <dirent.h>
 #include <errno.h>
 #include <time.h>
 #include <unistd.h>
 #include <limits.h>
+#include <sys/param.h>
 #ifdef __linux__
 #include <sys/syscall.h>
 extern long syscall(long, ...);
@@ -379,23 +381,32 @@ static bool sftp_download_to_local(Session *src_session, LIBSSH2_SFTP *src_sftp,
     return ok;
 }
 
-static bool sftp_upload_from_local(Session *dst_session, LIBSSH2_SFTP *dst_sftp,
-                                   const char *local_path, const char *remote_path) {
-    /* Read only regular files and links to regular files. Opening with
-     * `O_NONBLOCK` lets the code reject a FIFO without waiting for a writer
-     * while the session I/O scope is held; otherwise the SSH pane and later
-     * transfers could remain blocked. */
-    struct stat st;
-    if (stat(local_path, &st) != 0 || !S_ISREG(st.st_mode)) return false;
+/* Send the regular file open at `fd` (taken) to `remote_path`. `label` names
+ * it in the progress line. */
+static bool sftp_upload_opened(Session *dst_session, LIBSSH2_SFTP *dst_sftp, int fd,
+                               const char *label, const char *remote_path) {
     session_sftp_scope_begin(dst_session);
-    bool ok = sftp_upload(dst_sftp, local_path, remote_path) == 0;
+    bool ok = sftp_upload_fd(dst_sftp, fd, label, remote_path) == 0;
     session_sftp_scope_end(dst_session);
     return ok;
 }
 
-/* Recursive walkers run on the paste worker's 512 KiB stack. Two path buffers
- * per frame can use about 4.6 KiB; the depth limit of 64 keeps the largest
- * walk below about 295 KiB and bounds stack use.
+static bool sftp_upload_from_local(Session *dst_session, LIBSSH2_SFTP *dst_sftp,
+                                   const char *local_path, const char *remote_path) {
+    /* Read only regular files and links to regular files, and send the file
+     * that was opened and checked. Opening with `O_NONBLOCK` rejects a FIFO
+     * without waiting for a writer while the session I/O scope is held;
+     * otherwise the SSH pane and later transfers could remain blocked. */
+    struct stat st;
+    int fd = fileops_open_regular(AT_FDCWD, local_path, true, &st);
+    if (fd < 0) return false;
+    return sftp_upload_opened(dst_session, dst_sftp, fd, local_path, remote_path);
+}
+
+/* Recursive walkers run on the paste worker's stack (FB_PASTE_WORKER_STACK,
+ * filebrowser.h). Two path buffers make a frame of about 6.5 KiB; the depth
+ * limit of 64 keeps the deepest walk near 430 KiB before the file copy and
+ * libssh2 below it.
  *
  * Local entry types are checked with `lstat`. SFTP stat follows symbolic
  * links, so recursive walks do not traverse links found inside the tree. Links
@@ -801,73 +812,141 @@ static LocalCopyEnd sftp_download_walk(Session *src_session, LIBSSH2_SFTP *src_s
 
 /* --- Recursive local → SFTP ------------------------------------------- */
 
-/* Whether `path` resolves to a place inside `root` (both resolved): a link in
- * a folder being uploaded is followed only to a file that is in that folder. */
-static bool fileops_resolves_inside(const char *path, const char *root) {
-    if (!root || !root[0]) return false;
-    char real[PATH_MAX];
-    if (!realpath(path, real)) return false;
-    usize rl = strlen(root);
-    if (rl == 1 && root[0] == '/') return true;
-    return strncmp(real, root, rl) == 0 && (real[rl] == '/' || real[rl] == '\0');
+/* The path of the file open at `fd`, as the kernel names it now. A check made
+ * on it is a check on the file that will be read, whatever its name pointed
+ * at a moment before. */
+static bool fileops_fd_path(int fd, char *out, usize cap) {
+    if (!out || cap == 0) return false;
+    out[0] = '\0';
+#if defined(__APPLE__)
+    char got[MAXPATHLEN];
+    if (fcntl(fd, F_GETPATH, got) == -1) return false;
+    usize n = strnlen(got, sizeof got);
+    if (n == 0 || n >= cap || got[0] != '/') return false;
+    memcpy(out, got, n + 1);
+    return true;
+#elif defined(__linux__)
+    char link[64];
+    snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(link, out, cap - 1);
+    if (n <= 0 || (usize)n >= cap - 1) { out[0] = '\0'; return false; }
+    out[n] = '\0';
+    return out[0] == '/';
+#else
+    (void)fd;
+    return false;
+#endif
 }
 
-static bool sftp_upload_walk(Session *dst_session, LIBSSH2_SFTP *dst_sftp,
-                             const char *local_path, const char *remote_path,
-                             const char *root, i32 depth);
-static bool sftp_upload_recursive(Session *dst_session, LIBSSH2_SFTP *dst_sftp,
-                                  const char *local_path, const char *remote_path) {
-    char root[PATH_MAX];
-    if (!realpath(local_path, root)) root[0] = '\0';     /* then no link inside is followed */
-    return sftp_upload_walk(dst_session, dst_sftp, local_path, remote_path, root, 0);
+/* Whether `path` is `root` or inside it; both are kernel names of open files. */
+static bool fileops_path_inside(const char *path, const char *root) {
+    if (!root || !root[0] || !path || !path[0]) return false;
+    usize rl = strlen(root);
+    if (rl == 1 && root[0] == '/') return true;
+    return strncmp(path, root, rl) == 0 && (path[rl] == '/' || path[rl] == '\0');
 }
-static bool sftp_upload_walk(Session *dst_session, LIBSSH2_SFTP *dst_sftp,
-                             const char *local_path, const char *remote_path,
-                             const char *root, i32 depth) {
-    if (depth > FILEOPS_MAX_DEPTH) return false;
-    struct stat st;
-    if (lstat(local_path, &st) != 0) return false;
-    if (!S_ISDIR(st.st_mode)) {
-        /* Inside a folder, what is not a file is left behind, as the local
-         * copy leaves it (a FIFO, a socket, a device, a link to one) — and so
-         * is a link to a file OUTSIDE the folder the user picked: this is the
-         * copy that leaves the machine, and a tree from somewhere else (a
-         * cloned repository) can hold `img/a.png -> ../../.ssh/id_ed25519`.
-         * A link to a file inside the folder is copied as that file. */
-        if (depth > 0) {
-            struct stat tst;
-            if (stat(local_path, &tst) != 0 || !S_ISREG(tst.st_mode)) return true;
-            if (S_ISLNK(st.st_mode) && !fileops_resolves_inside(local_path, root)) {
-                atomic_fetch_add(&g_fileops_skipped, 1);
-                return true;
-            }
-        }
-        return sftp_upload_from_local(dst_session, dst_sftp, local_path, remote_path);
-    }
+
+/* Upload the directory open at `fd` (taken) to `remote_path`.
+ *
+ * Every entry is named relative to the held descriptor, as the local copy
+ * does, so the entry that was examined is the entry that is read: a folder is
+ * entered only as the folder fstatat saw (never through a link), a file is
+ * opened without following a link, and a link is followed only to a regular
+ * file — judged inside or outside the picked folder (`root`) by the kernel's
+ * name for the file that was OPENED. This is the copy that leaves the
+ * machine, and a tree from somewhere else (a cloned repository) can hold
+ * `img/a.png -> ../../.ssh/id_ed25519`, or have it swapped in while the walk
+ * runs; such a link, and anything that is not a file or folder, is left
+ * behind and counted. `label` is the local path, for the progress line only. */
+static LocalCopyEnd sftp_upload_dir(Session *dst_session, LIBSSH2_SFTP *dst_sftp, int fd,
+                                    const char *label, const char *remote_path,
+                                    const char *root, i32 depth) {
+    if (depth > FILEOPS_MAX_DEPTH) { close(fd); return LOCAL_COPY_FAILED; }
 
     session_sftp_scope_begin(dst_session);
     { int mrc; SFTP_CALL(mrc, libssh2_sftp_mkdir(dst_sftp, remote_path,
         LIBSSH2_SFTP_S_IRWXU | LIBSSH2_SFTP_S_IRGRP | LIBSSH2_SFTP_S_IXGRP)); (void)mrc; }
     session_sftp_scope_end(dst_session);
 
-    DIR *d = opendir(local_path);
-    if (!d) return false;
-    bool ok = true;
+    DIR *d = fdopendir(fd);
+    if (!d) { close(fd); return LOCAL_COPY_FAILED; }
+    int sfd = dirfd(d);
+    LocalCopyEnd end = LOCAL_COPY_OK;
     struct dirent *de;
     while ((de = readdir(d))) {
         if (de->d_name[0] == '.' &&
             (de->d_name[1] == '\0' ||
              (de->d_name[1] == '.' && de->d_name[2] == '\0'))) continue;
         char lc[FB_MAX_PATH * 2], rc[FB_MAX_PATH * 2];
-        if (!fileops_join(lc, sizeof(lc), local_path, de->d_name) ||
+        if (!fileops_join(lc, sizeof(lc), label, de->d_name) ||
             !fileops_join(rc, sizeof(rc), remote_path, de->d_name)) {
-            ok = false;
+            end = LOCAL_COPY_FAILED;
             break;
         }
-        if (!sftp_upload_walk(dst_session, dst_sftp, lc, rc, root, depth + 1)) { ok = false; break; }
+        struct stat cst;
+        if (fstatat(sfd, de->d_name, &cst, AT_SYMLINK_NOFOLLOW) != 0) { end = LOCAL_COPY_FAILED; break; }
+
+        if (S_ISDIR(cst.st_mode)) {
+            int cfd = openat(sfd, de->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            struct stat ost;
+            if (cfd < 0 || fstat(cfd, &ost) != 0 ||
+                ost.st_dev != cst.st_dev || ost.st_ino != cst.st_ino) {
+                if (cfd >= 0) close(cfd);
+                end = LOCAL_COPY_FAILED;
+                break;
+            }
+            LocalCopyEnd child = sftp_upload_dir(dst_session, dst_sftp, cfd, lc, rc, root, depth + 1);
+            if (child == LOCAL_COPY_FAILED) { end = LOCAL_COPY_FAILED; break; }
+            if (child == LOCAL_COPY_LEFT_BEHIND) end = LOCAL_COPY_LEFT_BEHIND;
+            continue;
+        }
+
+        bool is_link = S_ISLNK(cst.st_mode);
+        if (!S_ISREG(cst.st_mode) && !is_link) {
+            atomic_fetch_add(&g_fileops_skipped, 1);     /* FIFO, socket, device */
+            end = LOCAL_COPY_LEFT_BEHIND;
+            continue;
+        }
+        struct stat fst;
+        int ffd = fileops_open_regular(sfd, de->d_name, is_link, &fst);
+        if (ffd < 0) {
+            if (is_link) {               /* to a folder, to nothing, to itself */
+                atomic_fetch_add(&g_fileops_skipped, 1);
+                end = LOCAL_COPY_LEFT_BEHIND;
+                continue;
+            }
+            end = LOCAL_COPY_FAILED;
+            break;
+        }
+        if (is_link) {
+            char where[PATH_MAX];
+            if (!fileops_fd_path(ffd, where, sizeof where) || !fileops_path_inside(where, root)) {
+                close(ffd);
+                atomic_fetch_add(&g_fileops_skipped, 1);
+                end = LOCAL_COPY_LEFT_BEHIND;
+                continue;
+            }
+        }
+        if (!sftp_upload_opened(dst_session, dst_sftp, ffd, lc, rc)) { end = LOCAL_COPY_FAILED; break; }
     }
-    closedir(d);
-    return ok;
+    closedir(d);                         /* closes fd */
+    return end;
+}
+
+/* Upload the folder at `local_path` — through a link when the picked item is
+ * one: that link IS the request, as in the local copy. Links met inside the
+ * tree follow sftp_upload_dir's rule. */
+static LocalCopyEnd sftp_upload_recursive(Session *dst_session, LIBSSH2_SFTP *dst_sftp,
+                                          const char *local_path, const char *remote_path) {
+    int fd = open(local_path, O_RDONLY | O_DIRECTORY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno != ENOTDIR) return LOCAL_COPY_FAILED;
+        return sftp_upload_from_local(dst_session, dst_sftp, local_path, remote_path)
+            ? LOCAL_COPY_OK : LOCAL_COPY_FAILED;
+    }
+    char root[PATH_MAX];
+    if (!fileops_fd_path(fd, root, sizeof root)) root[0] = '\0';   /* then no link inside is followed */
+    return sftp_upload_dir(dst_session, dst_sftp, fd, local_path, remote_path, root, 0);
 }
 
 /* --- Recursive SFTP delete (used by cut-paste cleanup) ---------------- */
@@ -1120,7 +1199,8 @@ static bool paste_item(FileBrowser *dst_fb, const FileClipboardItem *item, bool 
          * existing file if the transfer fails. */
         if (sftp_path_exists(dst_session, dst_sftp, dst_path)) { if (err) *err = EEXIST; return false; }
         if (item->is_dir) {
-            ok = sftp_upload_recursive(dst_session, dst_sftp, item->path, dst_path);
+            how = sftp_upload_recursive(dst_session, dst_sftp, item->path, dst_path);
+            ok = how == LOCAL_COPY_OK;
             if (ok && is_cut) {
                 /* Remove local tree after successful upload (in-process; never
                  * shell out — item->path is an attacker-influenced filename). */
@@ -1187,9 +1267,10 @@ static bool paste_item(FileBrowser *dst_fb, const FileClipboardItem *item, bool 
                  * an upload that fails makes the item FAILED: "links not
                  * followed" is never the answer for a folder that was
                  * not uploaded. */
-                if (how != LOCAL_COPY_FAILED &&
-                    !sftp_upload_recursive(dst_session, dst_sftp, tmp_local, dst_path))
-                    how = LOCAL_COPY_FAILED;
+                if (how != LOCAL_COPY_FAILED) {
+                    LocalCopyEnd up = sftp_upload_recursive(dst_session, dst_sftp, tmp_local, dst_path);
+                    if (up > how) how = up;
+                }
                 ok = how == LOCAL_COPY_OK;
                 remove_local_recursive(tmp_local); /* best-effort temp cleanup */
             } else {

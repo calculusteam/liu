@@ -64,6 +64,14 @@ static const IconRule ICON_EXACT[] = {
     /* Splits (and "Split: …"): side by side, and the one stacked */
     { "Split Horizontal",       ICON_COLUMNS },
     { "Split Vertical",         ICON_ROWS },
+    /* Panes: the way the keyboard goes, and the zoom's mark on the tab */
+    { "Focus Pane Left",        ICON_ARROW_LEFT },
+    { "Focus Pane Right",       ICON_ARROW_RIGHT },
+    { "Focus Pane Above",       ICON_UP },
+    { "Focus Pane Below",       ICON_DOWN },
+    { "Next Pane",              ICON_CHEVRON_RIGHT },
+    { "Previous Pane",          ICON_CHEVRON_LEFT },
+    { "Toggle Pane Zoom",       ICON_MAXIMIZE },
     /* The sidebar, the explorer and what opens beside a terminal */
     { "Toggle Sidebar",         ICON_SIDEBAR },
     { "Customize Sidebar",      ICON_SLIDERS },
@@ -111,6 +119,11 @@ static const IconRule ICON_EXACT[] = {
     { "Filter Graph by Folder", ICON_GRAPH },
     /* Agents: the sidebar's Agents section, the recall chip, the voice card */
     { "Agent History",          ICON_BOT },
+    { "Delegate to Codex",      ICON_BOT },
+    { "Delegate to Claude Code", ICON_BOT },
+    { "Delegate to Gemini",     ICON_BOT },
+    { "Delegate to OpenCode",   ICON_BOT },
+    { "Agent Team",             ICON_BOT },
     { "Toggle Prompt Recall",   ICON_PROMPT },
     { "Voice Input",            ICON_MIC },
     { "Toggle Translate",       ICON_LANGUAGES },

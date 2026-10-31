@@ -18,6 +18,8 @@
  *             ~/.omp/agent/extensions/liu-notify.ts  (extensions their agent
  *             folders auto-load; Pi fires on agent_settled, omp on the main
  *             session's session_stop)
+ *   devin     ~/.config/devin/config.json  hooks (claude_hooks.c's format)
+ *   qoder     ~/.qoder/settings.json  hooks (claude_hooks.c's format)
  *   antigravity  ~/.gemini/config/hooks.json  "liu-notify" named hook on the
  *             `Stop` event (execution-loop terminated); a shared JSON Liu
  *             merges into. No --hook: the payload has no event-name field, so
@@ -51,7 +53,7 @@
 typedef ClaudeHookResult AgentHookResult;
 
 /* The agent ids this module can wire up (matches core/agent_detect ids). */
-#define AGENT_HOOK_SUPPORTED { "claude", "grok", "codex", "opencode", "antigravity", "pi", "omp" }
+#define AGENT_HOOK_SUPPORTED { "claude", "grok", "codex", "opencode", "antigravity", "pi", "omp", "devin", "qoder" }
 
 /* True if `agent_id` is one this module knows how to install. */
 bool agent_hook_supported(const char *agent_id);

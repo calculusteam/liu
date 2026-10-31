@@ -229,6 +229,32 @@ Session *session_create_local_with_env(i32 cols, i32 rows,
                                        const LocalEnvVar *env, i32 env_count,
                                        const char *cwd);
 
+/* A local shell, as session_create_local_with_env(…, cwd), that runs
+ * `first_command` (one line, no control characters) before its first prompt
+ * and goes on as the pane's shell when the command ends: an agent a restored
+ * pane was running, started on its session again. Nothing is typed into the
+ * pane: a zsh with Liu's integration runs the command from its first prompt,
+ * any other shell is started as `shell -l -i -c '<command>; exec shell -l'`. */
+Session *session_create_local_first(i32 cols, i32 rows, const char *cwd,
+                                    const char *first_command);
+
+/* The agent-control socket every new local pane is told about in
+ * LIU_AGENT_SOCK ("" or NULL = none). Main thread, like the setters above. */
+void session_local_set_agent_sock(const char *path);
+
+/* The folder of Liu's helper commands (liu-notify, liu-history, liu-agent)
+ * that every local pane's PATH starts with; NULL when it could not be made
+ * safe to use. Main thread. */
+const char *session_helper_bin_dir(void);
+
+/* The serial (session_instance_id) of the local pane whose shell process is
+ * `pid`; false when `pid` is no pane's shell. Any thread. */
+bool session_local_pane_of_shell(i32 pid, u64 *serial);
+
+/* Called with a local pane's serial when its session is destroyed, on
+ * whichever thread destroys it (NULL = nobody). Set once, at startup. */
+void session_local_set_pane_gone_hook(void (*fn)(u64 serial));
+
 /* Create a local PTY that runs `command` (instead of an interactive shell)
  * via the user's login shell: `shell -l -c "exec <command>"`. The login shell
  * gives the child the user's full PATH (so node/npm resolve even under a

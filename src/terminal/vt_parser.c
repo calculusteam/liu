@@ -3913,6 +3913,9 @@ void terminal_feed(Terminal *t, const u8 *data, usize len) {
             } else if (b == 0x0E || b == 0x0F) {
                 /* SO / SI: printable bytes go through G1 / G0 from here. */
                 t->charset_gl = (b == 0x0E) ? 1 : 0;
+            } else if (b == 0x7F) {
+                /* DEL is ignored. As a character it would join a cluster left
+                 * open by a ZWJ and put a control byte inside a cell. */
             } else if (b >= 0x20) {
                 /* Printable character — handle UTF-8 */
                 u32 codepoint;

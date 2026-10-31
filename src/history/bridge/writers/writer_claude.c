@@ -32,8 +32,16 @@
  * session that silently forgot its beginning. So every line here records the
  * uuid of the line before it, and the first line records null.
  *
+ * Text the model is to read but the user did not say — the note that the
+ * conversation was imported, a source's injected context — is an `isMeta`
+ * user line: Claude sends it to the model and does not draw it. A source's
+ * summary of dropped history is Claude's own compact summary line. Tool calls
+ * are written as Claude's own tools with Claude's arguments (tool_args.h), and
+ * each result on a line of its own, an edit's with the `toolUseResult` Claude
+ * draws its diff from.
+ *
  * Deliberately NOT written: `thinking` blocks (another model's private
- * channel), `isMeta` lines, `file-history-snapshot` / `file-history-delta`
+ * channel), `file-history-snapshot` / `file-history-delta`
  * (they reference backup blobs that do not exist for an imported session, and
  * a dangling reference is worse than an absent one), and any of the
  * permission / mode records — an imported session must start under whatever
@@ -41,8 +49,11 @@
  */
 #include "history/bridge/writers.h"
 #include "history/bridge/jsonw.h"
+#include "history/bridge/tool_args.h"
 #include "history/bridge/tool_map.h"
 #include "history/util.h"
+
+#include "cJSON.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,6 +72,22 @@ static void iso8601(char *out, usize cap, i64 ms) {
              tmv.tm_hour, tmv.tm_min, tmv.tm_sec, (int)(ms % 1000));
 }
 
+bool bridge_claude_project_slug(const char *cwd, char *out, usize cap) {
+    if (!cwd || cwd[0] != '/' || !out || cap == 0) return false;
+    /* Claude's own rule (hist_slugify_claude): every byte that is not
+     * [A-Za-z0-9] becomes '-'. Turning only '/' into '-' would put a
+     * session for "/w/My App.v2" in a directory Claude never looks in for
+     * that cwd, and `claude --resume` could not find it. */
+    char trimmed[BRIDGE_PATH_CAP];
+    usize n = strlen(cwd);
+    if (n + 1 >= sizeof trimmed) return false;
+    memcpy(trimmed, cwd, n + 1);
+    /* A trailing slash is the same directory (and would be a trailing dash,
+     * splitting one project into two). */
+    while (n > 1 && trimmed[n - 1] == '/') trimmed[--n] = '\0';
+    return hist_slugify_claude(out, cap, trimmed);
+}
+
 bool bridge_claude_project_dir(const char *cwd, char *out, usize cap) {
     if (!cwd || cwd[0] != '/' || !out || cap == 0) return false;
     char root[BRIDGE_PATH_CAP];
@@ -75,20 +102,8 @@ bool bridge_claude_project_dir(const char *cwd, char *out, usize cap) {
         return false;
     }
 
-    /* Claude's own rule (hist_slugify_claude): every byte that is not
-     * [A-Za-z0-9] becomes '-'. Turning only '/' into '-' would put a
-     * session for "/w/My App.v2" in a directory Claude never looks in for
-     * that cwd, and `claude --resume` could not find it. */
     char slug[BRIDGE_PATH_CAP];
-    char trimmed[BRIDGE_PATH_CAP];
-    usize n = strlen(cwd);
-    if (n + 1 >= sizeof trimmed) return false;
-    memcpy(trimmed, cwd, n + 1);
-    /* A trailing slash is the same directory (and would be a trailing dash,
-     * splitting one project into two). */
-    while (n > 1 && trimmed[n - 1] == '/') trimmed[--n] = '\0';
-    if (!hist_slugify_claude(slug, sizeof slug, trimmed)) return false;
-
+    if (!bridge_claude_project_slug(cwd, slug, sizeof slug)) return false;
     int w = snprintf(out, cap, "%s/%s", root, slug);
     return w > 0 && (usize)w < cap;
 }
@@ -115,8 +130,70 @@ static void claude_envelope(JsonW *w, const BridgeHistory *h, const char *sid,
     jsonw_str(w, "timestamp", iso);
 }
 
+/* Claude requires a tool_use id to start with "toolu_" and its tool_result to
+ * repeat it exactly; the IR's id is reused, prefixed when it is not already. */
+static void claude_tool_id(char *out, usize cap, const char *id) {
+    if (!id || !id[0]) id = "liu";
+    if (strncmp(id, "toolu_", 6) == 0) snprintf(out, cap, "%.150s", id);
+    else snprintf(out, cap, "toolu_%.140s", id);
+}
+
+/* The call a result at `ri` answers, searched back over the run before it. */
+static const BridgeEvent *claude_call_of(const BridgeHistory *h, usize ri, usize *ci) {
+    const BridgeEvent *r = &h->events[ri];
+    if (!r->tool_call_id) return NULL;
+    usize stop = ri > 4096 ? ri - 4096 : 0;
+    for (usize k = ri; k-- > stop;) {
+        const BridgeEvent *c = &h->events[k];
+        if (c->type == BRIDGE_EVENT_TOOL_CALL && c->tool_call_id &&
+            strcmp(c->tool_call_id, r->tool_call_id) == 0) {
+            *ci = k;
+            return c;
+        }
+    }
+    return NULL;
+}
+
+/* `toolUseResult` for a file change the source recorded: the hunks Claude
+ * draws an edit's diff from, or the content of a file the call created. */
+static void claude_tool_use_result(JsonW *w, const BridgeHistory *h, usize ri) {
+    const BridgeEvent *r = &h->events[ri];
+    if (!r->tool_patch && !r->tool_file_created) return;
+    usize ci = 0;
+    const BridgeEvent *c = claude_call_of(h, ri, &ci);
+    if (!c) return;
+    BridgeCallFacts f;
+    bridge_call_facts(c, r, &f);
+    cJSON *tur = f.path ? cJSON_CreateObject() : NULL;
+    if (tur && r->tool_file_created) {
+        cJSON_AddStringToObject(tur, "type", "create");
+        cJSON_AddStringToObject(tur, "filePath", f.path);
+        cJSON_AddStringToObject(tur, "content", f.content ? f.content : "");
+        cJSON_AddItemToObject(tur, "structuredPatch", cJSON_CreateArray());
+    } else if (tur) {
+        cJSON *hunks = bridge_patch_structured(r->tool_patch);
+        if (!hunks) { cJSON_Delete(tur); tur = NULL; }
+        else {
+            cJSON_AddStringToObject(tur, "filePath", f.path);
+            cJSON_AddStringToObject(tur, "oldString", f.n_edits ? f.edits[0].old_text : "");
+            cJSON_AddStringToObject(tur, "newString", f.n_edits ? f.edits[0].new_text : "");
+            /* Claude draws the diff only when the key is there; the file as
+             * it was is not known here. */
+            cJSON_AddNullToObject(tur, "originalFile");
+            cJSON_AddItemToObject(tur, "structuredPatch", hunks);
+            cJSON_AddBoolToObject(tur, "userModified", false);
+            cJSON_AddBoolToObject(tur, "replaceAll", false);
+        }
+    }
+    char *s = tur ? cJSON_PrintUnformatted(tur) : NULL;
+    if (s) jsonw_raw_or_str(w, "toolUseResult", s);
+    free(s);
+    cJSON_Delete(tur);
+    bridge_call_facts_free(&f);
+}
+
 bool bridge_write_claude_session(const BridgeHistory *h, const char *session_id,
-                                 const char *path, u32 *out_warnings) {
+                                 const char *path, bool provenance, u32 *out_warnings) {
     if (!h || !session_id || !path) return false;
 
     JsonW w;
@@ -126,10 +203,11 @@ bool bridge_write_claude_session(const BridgeHistory *h, const char *session_id,
     u32  warnings = 0;
     i64  now = bridge_now_ms();
 
-    /* Header turn. Claude's resume shows the conversation from its first user
-     * message, so the provenance note has to BE a user message — there is no
-     * system channel in this format that survives a resume. */
-    {
+    /* Header turn: an isMeta user line, read by the model and not drawn. A
+     * transcript written for another agent's own importer carries none: that
+     * agent marks the import itself, and the note would name the wrong
+     * agent. */
+    if (provenance) {
         char uuid[64];
         if (!bridge_new_uuid(uuid, sizeof uuid)) { jsonw_close(&w, true); return false; }
         char note[900];
@@ -144,6 +222,7 @@ bool bridge_write_claude_session(const BridgeHistory *h, const char *session_id,
         jsonw_obj_begin(&w, NULL);
         claude_envelope(&w, h, session_id, "user", uuid, NULL,
                         h->event_count ? h->events[0].timestamp_ms : now);
+        jsonw_bool(&w, "isMeta", true);
         jsonw_obj_begin(&w, "message");
         jsonw_str(&w, "role", "user");
         jsonw_str(&w, "content", note);
@@ -171,13 +250,19 @@ bool bridge_write_claude_session(const BridgeHistory *h, const char *session_id,
             if (!bridge_new_uuid(uuid, sizeof uuid)) break;
             jsonw_obj_begin(&w, NULL);
             claude_envelope(&w, h, session_id, "user", uuid, prev, e->timestamp_ms);
+            /* Context is not the user speaking: sent, not drawn. A summary is
+             * drawn the way Claude draws its own. */
+            if (e->type == BRIDGE_EVENT_CONTEXT) jsonw_bool(&w, "isMeta", true);
+            if (e->type == BRIDGE_EVENT_COMPACTION) {
+                jsonw_bool(&w, "isCompactSummary", true);
+                jsonw_bool(&w, "isVisibleInTranscriptOnly", true);
+            }
             jsonw_obj_begin(&w, "message");
             jsonw_str(&w, "role", "user");
             if (e->type == BRIDGE_EVENT_USER) {
                 jsonw_str(&w, "content", e->text);
             } else {
-                /* Context and compaction are not the user speaking. There is
-                 * no channel for that here, so they are labelled inline. */
+                /* Labelled for the model, which reads it as a user turn. */
                 usize n = strlen(e->text) + 64;
                 char *buf = malloc(n);
                 if (buf) {
@@ -211,9 +296,12 @@ bool bridge_write_claude_session(const BridgeHistory *h, const char *session_id,
             jsonw_str(&w, "id", uuid);
             jsonw_str(&w, "type", "message");
             jsonw_str(&w, "role", "assistant");
+            /* Claude restores the model of the last answer, and names one it
+             * does not know in a notice; another agent's model is written as
+             * Claude's own placeholder for an answer no model of its gave. */
             jsonw_str(&w, "model",
-                      h->source_model && h->source_model[0] ? h->source_model
-                                                            : "liu-bridge-import");
+                      h->source_tool == CHAT_TOOL_CLAUDE && h->source_model &&
+                              h->source_model[0] ? h->source_model : "<synthetic>");
             jsonw_arr_begin(&w, "content");
             while (j < h->event_count) {
                 const BridgeEvent *b = &h->events[j];
@@ -227,28 +315,29 @@ bool bridge_write_claude_session(const BridgeHistory *h, const char *session_id,
                     }
                     j++;
                 } else if (b->type == BRIDGE_EVENT_TOOL_CALL) {
-                    const char *name = bridge_tool_name_for(CHAT_TOOL_CLAUDE, b->tool_kind);
-                    if (!name) name = b->tool_name;
-                    if (name && name[0]) {
+                    BridgeCallFacts f;
+                    bridge_call_facts(b, bridge_result_for(h, j), &f);
+                    char name[128];
+                    cJSON *args = NULL;
+                    char *args_json = NULL;
+                    if (bridge_call_in_vocab(BRIDGE_VOCAB_CLAUDE, &f, name, sizeof name, &args))
+                        args_json = cJSON_PrintUnformatted(args);
+                    cJSON_Delete(args);
+                    bridge_call_facts_free(&f);
+                    if (name[0] && args_json) {
                         jsonw_obj_begin(&w, NULL);
                         jsonw_str(&w, "type", "tool_use");
-                        /* Claude requires tool_use ids to start with "toolu_"
-                         * and match their tool_result's tool_use_id exactly.
-                         * The IR's own id is reused with that prefix so the
-                         * pairing below cannot drift. */
                         char tid[160];
-                        snprintf(tid, sizeof tid, "toolu_%.140s",
-                                 b->tool_call_id ? b->tool_call_id : "liu");
+                        claude_tool_id(tid, sizeof tid, b->tool_call_id);
                         jsonw_str(&w, "id", tid);
                         jsonw_str(&w, "name", name);
-                        jsonw_raw_or_str(&w, "input",
-                                         b->tool_input && b->tool_input[0]
-                                             ? b->tool_input : "{}");
+                        jsonw_raw_or_str(&w, "input", args_json);
                         jsonw_obj_end(&w);
                         any = true;
                     } else {
                         warnings++;
                     }
+                    free(args_json);
                     j++;
                 } else {
                     break;
@@ -277,34 +366,31 @@ bool bridge_write_claude_session(const BridgeHistory *h, const char *session_id,
             continue;
         }
 
-        /* ---- tool results: one user line carrying the blocks ------------ */
+        /* ---- a tool result: a user line of its own, as Claude writes one,
+         * so the record of what the call did rides beside it ------------- */
         if (e->type == BRIDGE_EVENT_TOOL_RESULT) {
-            usize j = i;
             char uuid[64];
             if (!bridge_new_uuid(uuid, sizeof uuid)) break;
             jsonw_obj_begin(&w, NULL);
             claude_envelope(&w, h, session_id, "user", uuid, prev, e->timestamp_ms);
+            claude_tool_use_result(&w, h, i);
             jsonw_obj_begin(&w, "message");
             jsonw_str(&w, "role", "user");
             jsonw_arr_begin(&w, "content");
-            while (j < h->event_count && h->events[j].type == BRIDGE_EVENT_TOOL_RESULT) {
-                const BridgeEvent *b = &h->events[j];
-                char tid[160];
-                snprintf(tid, sizeof tid, "toolu_%.140s",
-                         b->tool_call_id ? b->tool_call_id : "liu");
-                jsonw_obj_begin(&w, NULL);
-                jsonw_str(&w, "type", "tool_result");
-                jsonw_str(&w, "tool_use_id", tid);
-                jsonw_str(&w, "content", b->tool_output ? b->tool_output : "");
-                jsonw_obj_end(&w);
-                j++;
-            }
+            char tid[160];
+            claude_tool_id(tid, sizeof tid, e->tool_call_id);
+            jsonw_obj_begin(&w, NULL);
+            jsonw_str(&w, "type", "tool_result");
+            jsonw_str(&w, "tool_use_id", tid);
+            jsonw_str(&w, "content", e->tool_output ? e->tool_output : "");
+            if (e->tool_failed) jsonw_bool(&w, "is_error", true);
+            jsonw_obj_end(&w);
             jsonw_arr_end(&w);
             jsonw_obj_end(&w);
             jsonw_obj_end(&w);
             jsonw_raw_newline(&w);
             hist_copy_bounded(prev, sizeof prev, uuid);
-            i = j;
+            i++;
             continue;
         }
 

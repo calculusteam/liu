@@ -13,11 +13,85 @@
 
 #include "cJSON.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 typedef struct {
     bool saw_meta;
 } ClaudeCtx;
+
+/* Bounded text builder for claude_file_change. */
+typedef struct { char *p; usize len, cap; bool over; } PatchText;
+
+static void patch_put(PatchText *t, const char *s, usize n) {
+    if (t->over) return;
+    if (t->len + n + 1 > BRIDGE_TOOL_OUTPUT_MAX) { t->over = true; return; }
+    if (t->len + n + 1 > t->cap) {
+        usize ncap = t->cap ? t->cap * 2 : 1024;
+        while (ncap < t->len + n + 1) ncap *= 2;
+        char *q = realloc(t->p, ncap);
+        if (!q) { t->over = true; return; }
+        t->p = q;
+        t->cap = ncap;
+    }
+    memcpy(t->p + t->len, s, n);
+    t->len += n;
+    t->p[t->len] = '\0';
+}
+
+/* Claude Code records what an Edit, MultiEdit or Write did beside the result
+ * line: `toolUseResult.structuredPatch`, hunks numbered in the file as it
+ * was, and `type: "create"` for a file the call made. Turned into unified-diff
+ * text for the result's event (BridgeEvent.tool_patch); nothing when the line
+ * holds no such record or the text would pass the size policy. */
+static void claude_file_change(BridgeHistory *h, cJSON *root, usize first) {
+    cJSON *tur = cJSON_GetObjectItemCaseSensitive(root, "toolUseResult");
+    if (!cJSON_IsObject(tur)) return;
+    usize result = h->event_count;
+    for (usize i = first; i < h->event_count; i++) {
+        if (h->events[i].type != BRIDGE_EVENT_TOOL_RESULT) continue;
+        if (result != h->event_count) return;   /* two results: whose patch? */
+        result = i;
+    }
+    if (result == h->event_count) return;
+
+    const char *kind = hist_cjson_str(tur, "type");
+    if (kind && strcmp(kind, "create") == 0) {
+        bridge_history_set_file_change(h, result, NULL, true);
+        return;
+    }
+    cJSON *hunks = cJSON_GetObjectItemCaseSensitive(tur, "structuredPatch");
+    if (!cJSON_IsArray(hunks) || cJSON_GetArraySize(hunks) == 0) return;
+
+    PatchText t = {0};
+    cJSON *hk = NULL;
+    cJSON_ArrayForEach(hk, hunks) {
+        i64 os = 0, ol = 0, ns = 0, nl = 0;
+        cJSON *lines = cJSON_GetObjectItemCaseSensitive(hk, "lines");
+        if (!hist_cjson_i64(hk, "oldStart", &os) || !hist_cjson_i64(hk, "oldLines", &ol) ||
+            !hist_cjson_i64(hk, "newStart", &ns) || !hist_cjson_i64(hk, "newLines", &nl) ||
+            !cJSON_IsArray(lines) || os < 0 || ol < 0 || ns < 0 || nl < 0) {
+            t.over = true;
+            break;
+        }
+        char head[96];
+        int hn = snprintf(head, sizeof head, "@@ -%lld,%lld +%lld,%lld @@\n",
+                          (long long)os, (long long)ol, (long long)ns, (long long)nl);
+        patch_put(&t, head, (usize)hn);
+        cJSON *ln = NULL;
+        cJSON_ArrayForEach(ln, lines) {
+            if (!cJSON_IsString(ln) || !ln->valuestring) continue;
+            const char *l = ln->valuestring;
+            /* A line whose marker went missing is context, as diff reads it. */
+            if (!(l[0] == ' ' || l[0] == '-' || l[0] == '+' || l[0] == '\\'))
+                patch_put(&t, " ", 1);
+            patch_put(&t, l, strlen(l));
+            patch_put(&t, "\n", 1);
+        }
+    }
+    if (!t.over && t.p) bridge_history_set_file_change(h, result, t.p, false);
+    free(t.p);
+}
 
 static bool claude_line(void *root_cjson, Arena *scratch, BridgeHistory *h,
                         void *user) {
@@ -81,7 +155,9 @@ static bool claude_line(void *root_cjson, Arena *scratch, BridgeHistory *h,
         et = BRIDGE_EVENT_CONTEXT;
     }
 
+    usize first = h->event_count;
     bridge_push_anthropic_content(h, CHAT_TOOL_CLAUDE, content, et, ts);
+    if (is_user) claude_file_change(h, root, first);
     return true;
 }
 

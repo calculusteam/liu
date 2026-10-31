@@ -81,7 +81,47 @@ static bool chmod_regular_nofollow(const char *path, mode_t mode) {
     return ok;
 }
 
-static int run_silent(const char *const argv[]) {
+static i64 keygen_monotonic_ms(void);
+static void keygen_kill_reap(pid_t pid);
+static int keygen_reap_until(pid_t pid, i64 deadline_ms);
+
+/* How long a helper that only READS a key (its fingerprint, whether it is
+ * encrypted) may run. The key list is refreshed on the main loop, so a helper
+ * stuck on its input must not hold it; one past the limit is killed and
+ * counts as failed. Generating a key and changing a passphrase are not
+ * limited (-1). */
+#define KEYGEN_PROBE_LIMIT_MS 5000
+
+/* A regular file at `path`, opened for reading (a link is followed: keys are
+ * often linked in from elsewhere). O_NONBLOCK refuses a FIFO in its place at
+ * once instead of waiting for a writer. NULL for anything else. */
+static FILE *keygen_fopen_regular(const char *path) {
+    if (!path || !path[0]) return NULL;
+    int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return NULL;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) { close(fd); return NULL; }
+    FILE *f = fdopen(fd, "r");
+    if (!f) close(fd);
+    return f;
+}
+
+/* Wait for `pid`: for ever when `limit_ms` < 0, otherwise until the limit,
+ * when it is killed. */
+static int keygen_wait(pid_t pid, i64 limit_ms) {
+    if (limit_ms < 0) {
+        int status = 0;
+        while (waitpid(pid, &status, 0) < 0) {
+            if (errno != EINTR) return -1;
+        }
+        return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    i64 now = keygen_monotonic_ms();
+    if (now < 0) { keygen_kill_reap(pid); return -1; }
+    return keygen_reap_until(pid, now + limit_ms);
+}
+
+static int run_silent(const char *const argv[], i64 limit_ms) {
     if (!argv || !argv[0]) return -1;
     posix_spawn_file_actions_t acts;
     if (posix_spawn_file_actions_init(&acts) != 0) return -1;
@@ -95,11 +135,7 @@ static int run_silent(const char *const argv[]) {
     if (rc == 0) rc = spawn_helper(&pid, argv, &acts);
     posix_spawn_file_actions_destroy(&acts);
     if (rc != 0) return -1;
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0) {
-        if (errno != EINTR) return -1;
-    }
-    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    return keygen_wait(pid, limit_ms);
 }
 
 static int keygen_fd_above_stdio(int fd) {
@@ -117,7 +153,7 @@ static int keygen_fd_above_stdio(int fd) {
     return fd;
 }
 
-static int run_capture(const char *const argv[], char *out, size_t max_out) {
+static int run_capture(const char *const argv[], char *out, size_t max_out, i64 limit_ms) {
     if (!argv || !argv[0] || (out && max_out == 0)) return -1;
     int pipefd[2];
     if (pipe(pipefd) != 0) return -1;
@@ -147,9 +183,29 @@ static int run_capture(const char *const argv[], char *out, size_t max_out) {
     close(pipefd[1]);
     if (rc != 0) { close(pipefd[0]); return -1; }
 
+    i64 deadline = -1;
+    if (limit_ms >= 0) {
+        i64 now = keygen_monotonic_ms();
+        deadline = now < 0 ? 0 : now + limit_ms;
+    }
     size_t total = 0;
     char scratch[512];
     for (;;) {
+        if (deadline >= 0) {
+            i64 now = keygen_monotonic_ms();
+            i64 left = now < 0 ? 0 : deadline - now;
+            struct pollfd pfd = { .fd = pipefd[0], .events = POLLIN };
+            /* In slices, so the limit is read off the clock again. */
+            int pr = left > 0 ? poll(&pfd, 1, left > 250 ? 250 : (int)left) : 0;
+            if (pr < 0 && errno == EINTR) continue;
+            if (pr == 0 && left > 250) continue;
+            if (pr <= 0) {
+                close(pipefd[0]);
+                keygen_kill_reap(pid);
+                if (out) out[0] = '\0';
+                return -1;
+            }
+        }
         ssize_t n = read(pipefd[0], scratch, sizeof scratch);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) break;
@@ -163,11 +219,8 @@ static int run_capture(const char *const argv[], char *out, size_t max_out) {
     if (out) out[total] = '\0';
     close(pipefd[0]);
 
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0) {
-        if (errno != EINTR) return -1;
-    }
-    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    if (deadline < 0) return keygen_wait(pid, -1);
+    return keygen_reap_until(pid, deadline);
 }
 
 static bool write_all(int fd, const void *buf, size_t len) {
@@ -249,7 +302,7 @@ static int run_pty_prompted(const char *const argv[],
                             i32 prompt_count, bool first_optional) {
     if (!argv || !argv[0] || prompt_count < 0 || prompt_count > 8 ||
         (prompt_count > 0 && (!prompts || !replies))) return -1;
-    if (prompt_count == 0) return run_silent(argv);
+    if (prompt_count == 0) return run_silent(argv, -1);
     for (i32 i = 0; i < prompt_count; i++)
         if (!prompts[i]) return -1;
 
@@ -434,7 +487,7 @@ const char *ssh_get_default_dir(char *buf, i32 buf_size) {
 static bool read_file(const char *path, char *buf, size_t buf_size) {
     if (!path || !path[0] || !buf || buf_size == 0) return false;
     buf[0] = '\0';
-    FILE *f = fopen(path, "r");
+    FILE *f = keygen_fopen_regular(path);
     if (!f) return false;
     size_t n = fread(buf, 1, buf_size - 1, f);
     bool complete = !ferror(f);
@@ -500,7 +553,7 @@ static int run_keygen_generate(KeyAlgorithm algo, const char *key_path,
     if (!label) return -1;
     if (algorithm_out && algorithm_out_size > 0)
         snprintf(algorithm_out, algorithm_out_size, "%s", label);
-    if (!has_passphrase) return run_silent(argv);
+    if (!has_passphrase) return run_silent(argv, -1);
 
     const char *prompts[] = {
         "Enter passphrase",
@@ -602,7 +655,7 @@ bool keygen_generate(KeyAlgorithm algo, const char *comment,
     {
         const char *fargv[] = { "ssh-keygen", "-lf", tmp_pub, NULL };
         char line[512] = {0};
-        if (run_capture(fargv, line, sizeof(line)) == 0) {
+        if (run_capture(fargv, line, sizeof(line), KEYGEN_PROBE_LIMIT_MS) == 0) {
             char *sha = strstr(line, "SHA256:");
             if (sha) {
                 char *end = strchr(sha, ' ');
@@ -668,7 +721,7 @@ bool keygen_generate_to_file(KeyAlgorithm algo, const char *comment,
     if (fingerprint_out && fp_size > 0) {
         const char *fargv[] = { "ssh-keygen", "-lf", pub_path, NULL };
         char line[512] = {0};
-        if (run_capture(fargv, line, sizeof(line)) == 0) {
+        if (run_capture(fargv, line, sizeof(line), KEYGEN_PROBE_LIMIT_MS) == 0) {
             char *sha = strstr(line, "SHA256:");
             if (sha) {
                 char *end = strchr(sha, ' ');
@@ -685,7 +738,7 @@ bool keygen_generate_to_file(KeyAlgorithm algo, const char *comment,
 
 /* Check if a private key file is encrypted (passphrase-protected) */
 static bool key_is_encrypted(const char *path) {
-    FILE *f = fopen(path, "r");
+    FILE *f = keygen_fopen_regular(path);
     if (!f) return false;
 
     char buf[2048];
@@ -710,7 +763,7 @@ static bool key_is_encrypted(const char *path) {
         /* For new-format keys, try ssh-keygen -y with empty passphrase.
          * If it fails, the key is encrypted. */
         const char *argv[] = { "ssh-keygen", "-y", "-P", "", "-f", path, NULL };
-        int rc = run_silent(argv);
+        int rc = run_silent(argv, KEYGEN_PROBE_LIMIT_MS);
         return rc != 0;
     }
 
@@ -777,13 +830,8 @@ i32 ssh_scan_keys(const char *ssh_dir, KeyInfo *keys, i32 *count, i32 max) {
         if (pp <= 0 || (usize)pp >= sizeof priv_path) continue;
         if ((usize)pp >= sizeof keys[0].path) continue;
 
-        /* Must be a regular file */
-        struct stat st;
-        if (stat(priv_path, &st) != 0) continue;
-        if (!S_ISREG(st.st_mode)) continue;
-
-        /* Check if it has SSH key header */
-        FILE *f = fopen(priv_path, "r");
+        /* A regular file with an SSH key header. */
+        FILE *f = keygen_fopen_regular(priv_path);
         if (!f) continue;
         char header[128];
         if (!fgets(header, sizeof(header), f)) { fclose(f); continue; }
@@ -802,19 +850,22 @@ i32 ssh_scan_keys(const char *ssh_dir, KeyInfo *keys, i32 *count, i32 max) {
         /* Check for passphrase */
         ki->has_passphrase = key_is_encrypted(priv_path);
 
-        /* Read public key for type detection */
+        /* Read public key for type detection. The fingerprint is asked of
+         * ssh-keygen only for a public key that was read as a regular file:
+         * it would wait on a FIFO in its place. */
         char pub_content[4096];
-        if (read_file(ki->pub_path, pub_content, sizeof(pub_content))) {
+        bool have_pub = read_file(ki->pub_path, pub_content, sizeof(pub_content));
+        if (have_pub) {
             detect_key_type(pub_content, ki->type, sizeof(ki->type), &ki->bits);
         } else {
             snprintf(ki->type, sizeof(ki->type), "unknown");
         }
 
         /* Get fingerprint via argv-based ssh-keygen -lf */
-        {
+        if (have_pub) {
             const char *fargv[] = { "ssh-keygen", "-lf", ki->pub_path, NULL };
             char line[512] = {0};
-            if (run_capture(fargv, line, sizeof(line)) == 0) {
+            if (run_capture(fargv, line, sizeof(line), KEYGEN_PROBE_LIMIT_MS) == 0) {
                 /* Format: "4096 SHA256:xxxx comment (RSA)" */
                 char *sha = strstr(line, "SHA256:");
                 if (sha) {
@@ -856,7 +907,7 @@ bool ssh_delete_key(const char *private_key_path) {
 char *ssh_read_public_key(const char *pub_key_path) {
     if (!pub_key_path || !pub_key_path[0]) return NULL;
 
-    FILE *f = fopen(pub_key_path, "r");
+    FILE *f = keygen_fopen_regular(pub_key_path);
     if (!f) return NULL;
 
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
@@ -891,7 +942,7 @@ bool keygen_add_to_agent(const char *key_path) {
     if (stat(key_path, &st) != 0) return false;
 
     const char *argv[] = { "ssh-add", key_path, NULL };
-    return run_silent(argv) == 0;
+    return run_silent(argv, -1) == 0;
 }
 
 bool keygen_change_passphrase(const char *key_path,
@@ -908,7 +959,7 @@ bool keygen_change_passphrase(const char *key_path,
 bool keygen_is_encrypted(const char *key_path) {
     if (!key_path || !key_path[0]) return false;
     {
-        FILE *hf = fopen(key_path, "r");
+        FILE *hf = keygen_fopen_regular(key_path);
         if (!hf) return false;
         char head[2048];
         size_t hn = fread(head, 1, sizeof head - 1, hf);
@@ -921,7 +972,7 @@ bool keygen_is_encrypted(const char *key_path) {
     }
 
     /* Read the first few lines of the key file and check for encryption markers */
-    FILE *f = fopen(key_path, "r");
+    FILE *f = keygen_fopen_regular(key_path);
     if (!f) return false;
 
     char line[512];
@@ -944,7 +995,7 @@ bool keygen_is_encrypted(const char *key_path) {
      * try a no-passphrase parse as a fallback check */
     if (!encrypted) {
         const char *argv[] = { "ssh-keygen", "-y", "-P", "", "-f", key_path, NULL };
-        if (run_silent(argv) != 0) encrypted = true;
+        if (run_silent(argv, KEYGEN_PROBE_LIMIT_MS) != 0) encrypted = true;
     }
 
     return encrypted;

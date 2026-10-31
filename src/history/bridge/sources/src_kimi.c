@@ -101,7 +101,10 @@ static bool kimi_line(void *root_cjson, Arena *scratch, BridgeHistory *h,
         if (c->user_seen < c->user_ts_count) ts = c->user_ts[c->user_seen];
         c->user_seen++;
         if (ts) c->last_ts = ts;
-        bridge_push_message(h, BRIDGE_EVENT_USER, ts, text);
+        /* A system reminder is text Kimi sends and does not replay: context,
+         * not something the user said. */
+        bool reminder = text && !strncmp(text, "<system-reminder>", 17);
+        bridge_push_message(h, reminder ? BRIDGE_EVENT_CONTEXT : BRIDGE_EVENT_USER, ts, text);
         return true;
     }
 

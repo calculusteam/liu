@@ -9,13 +9,14 @@
 #include "ui/filebrowser.h"
 #include "ui/browser_ui.h"
 #include "ui/sftp_tab.h"
+#include "ui/pane_zoom.h"
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
 
-typedef struct {
-    f32 x, y, w, h;
-} HitPaneRect;
+/* The layout's own rect type, so the zoom (ui/pane_zoom.h) applies here as it
+ * does in the renderer. */
+typedef PaneRect HitPaneRect;
 
 static void hit_split_layout_node(const Tab *tab, i32 node, HitPaneRect r,
                                   f32 dpi, HitPaneRect out[MAX_SPLIT_PANES]) {
@@ -63,6 +64,7 @@ static i32 hit_split_pane_at(const Tab *tab, f32 x, f32 y,
     hit_split_layout_node(tab, tab->split_root,
                           (HitPaneRect){term_x, term_y, term_w, term_h},
                           dpi, rects);
+    pane_zoom_apply(tab, (HitPaneRect){term_x, term_y, term_w, term_h}, rects, false);
     i32 count = tab->split_pane_count;
     if (count < 2) count = 2;
     if (count > MAX_SPLIT_PANES) count = MAX_SPLIT_PANES;
@@ -201,6 +203,7 @@ static bool pane_geom(const struct AppState *app, i32 pane, PaneGeom *out) {
         hit_split_layout_node(atab, atab->split_root,
                               (HitPaneRect){origin_x, origin_y, term_w, term_h},
                               dpi, rects);
+        pane_zoom_apply(atab, (HitPaneRect){origin_x, origin_y, term_w, term_h}, rects, false);
         if (rects[pane].w <= 0.0f || rects[pane].h <= 0.0f) return false;
         origin_x = rects[pane].x;
         origin_y = rects[pane].y;
@@ -283,9 +286,34 @@ FindBarGeom ui_find_bar_geom(const struct AppState *app) {
     return find_bar_layout(bar, dpi, cw, ch);
 }
 
+/* A job tab of tab `ti` (ui/agentctl_card.h): its job tabs start at `x0`,
+ * its pill's right edge, as render_toolbar paints them. */
+static bool tab_job_hit(const struct AppState *app, i32 ti, f32 x, f32 x0, HitResult *r) {
+    if (ti < 0 || ti >= MAX_TABS || app->tab_jobs_n[ti] == 0 || x < x0) return false;
+    i32 n = app->tab_jobs_n[ti];
+    i32 k = agentctl_job_tab_at(x, x0, app->_tab_job_w, n);
+    if (k < 0) k = n - 1;     /* the slot's own inset past the last one */
+    r->type = HIT_TAB_JOB;
+    r->index = ti;
+    r->sub_index = k;
+    return true;
+}
+
 HitResult ui_hit_test(const struct AppState *app, f32 x, f32 y) {
     HitResult r = { .type = HIT_NONE, .index = -1, .sub_index = -1 };
     f32 dpi = app->dpi_scale;
+
+    /* A job tab's hover is drawn over everything under it while it is open
+     * (ui/agentctl_card.h): its rect as last drawn is its own, so a press
+     * there opens the job's chat and never reaches the pane below. */
+    if (app->agentctl_tip_shown && app->agentctl_tip_opening && app->agentctl_tip_alpha > 0.5f &&
+        pc_rect_hit(app->agentctl_tip_drawn.win, x, y)) {
+        r.type = HIT_JOB_TIP;
+        r.index = (i32)app->agentctl_tip_shown;
+        r.rel_x = x - app->agentctl_tip_drawn.win.x;
+        r.rel_y = y - app->agentctl_tip_drawn.win.y;
+        return r;
+    }
 
     /* The Find bar floats over the top of the terminal body: it claims its
      * own rect first, or a press on a toggle would start a selection in the
@@ -419,6 +447,10 @@ HitResult ui_hit_test(const struct AppState *app, f32 x, f32 y) {
          * uniform-width walk. */
         #define TAB_SLOT_W(idx) (tab_w + (((idx) >= 0 && (idx) < app->tab_count) \
                                           ? app->_tab_extra_w[(idx)] : 0.0f))
+        /* The part of the slot a tab's job tabs take, right of its pill
+         * (ui/agentctl_card.h). */
+        #define TAB_JOBS_W(idx) (((idx) >= 0 && (idx) < app->tab_count && (idx) < MAX_TABS) \
+                                 ? app->_tab_jobs_w[(idx)] : 0.0f)
         f32 tab_scroll = app->_tab_scroll_x;
         f32 view_x     = app->_tab_view_x > 0.0f ? app->_tab_view_x : bx;
         f32 view_w     = app->_tab_view_w > 0.0f ? app->_tab_view_w
@@ -473,11 +505,13 @@ HitResult ui_hit_test(const struct AppState *app, f32 x, f32 y) {
                     if (in_strip && x >= cur_x && x < cur_x + slot_w) {
                         /* A group member's pill is inset GROUP_MEMBER_INSET_X_PT
                          * in its slot (render_toolbar), not PILL_INSET_X_PT. */
-                        f32 close_x = ui_tab_close_x(cur_x + GROUP_MEMBER_INSET_X_PT * dpi,
-                                                     slot_w - 2.0f * GROUP_MEMBER_INSET_X_PT * dpi,
+                        f32 inset = GROUP_MEMBER_INSET_X_PT * dpi;
+                        f32 pill_slot = slot_w - TAB_JOBS_W(i);
+                        if (tab_job_hit(app, i, x, cur_x + pill_slot - inset, &r)) return r;
+                        f32 close_x = ui_tab_close_x(cur_x + inset, pill_slot - 2.0f * inset,
                                                      TAB_CLOSE_SIZE_PT * dpi, close_ink_r, dpi);
                         /* Suppress the close zone on narrow tabs (active too) — mirror render. */
-                        bool close_room = slot_w >= TAB_CLOSE_MIN_W_PT * dpi;
+                        bool close_room = pill_slot >= TAB_CLOSE_MIN_W_PT * dpi;
                         if (close_room && x >= close_x) {
                             r.type = HIT_TAB_CLOSE;
                             r.index = i;
@@ -499,11 +533,13 @@ HitResult ui_hit_test(const struct AppState *app, f32 x, f32 y) {
             if (gi >= 0 && gi < MAX_TAB_GROUPS && app->tab_groups[gi].used) continue;
             f32 slot_w = TAB_SLOT_W(i);
             if (in_strip && x >= cur_x && x < cur_x + slot_w) {
-                f32 close_x = ui_tab_close_x(cur_x + PILL_INSET_X_PT * dpi,
-                                             slot_w - 2.0f * PILL_INSET_X_PT * dpi,
+                f32 inset = PILL_INSET_X_PT * dpi;
+                f32 pill_slot = slot_w - TAB_JOBS_W(i);
+                if (tab_job_hit(app, i, x, cur_x + pill_slot - inset, &r)) return r;
+                f32 close_x = ui_tab_close_x(cur_x + inset, pill_slot - 2.0f * inset,
                                              TAB_CLOSE_SIZE_PT * dpi, close_ink_r, dpi);
                 /* Suppress the close zone on narrow tabs (active too) — mirror render. */
-                bool close_room = slot_w >= TAB_CLOSE_MIN_W_PT * dpi;
+                bool close_room = pill_slot >= TAB_CLOSE_MIN_W_PT * dpi;
                 if (close_room && x >= close_x) {
                     r.type = HIT_TAB_CLOSE;
                     r.index = i;
@@ -516,6 +552,7 @@ HitResult ui_hit_test(const struct AppState *app, f32 x, f32 y) {
             cur_x += slot_w + tab_gap;
         }
         #undef TAB_SLOT_W
+        #undef TAB_JOBS_W
 
         /* New tab (+) button — at the pinned position render_toolbar() used
          * (it clamps to the viewport's right edge when the strip overflows). */
@@ -603,6 +640,16 @@ HitResult ui_hit_test(const struct AppState *app, f32 x, f32 y) {
             if (!s->open || s->body_h <= 0.0f || y < s->body_y || y >= s->body_y + s->body_h) continue;
             switch (s->id) {
             case SB_SEC_TABS: {
+                /* A jump pill floats over the rows: it is hit first. */
+                SidebarJump jumps[2];
+                app_side_jumps(app, &L, jumps);
+                i32 jd = sidebar_jump_at(jumps, x, y);
+                if (jd >= 0) {
+                    r.type = HIT_SIDEBAR_JUMP;
+                    r.index = jumps[jd].tabs[0];
+                    r.sub_index = jd;
+                    return r;
+                }
                 SideTabRow rows[MAX_TABS + MAX_TAB_GROUPS + 1];
                 i32 n = app_side_tab_rows(app, rows, (i32)(sizeof rows / sizeof rows[0]));
                 if (n > (i32)(sizeof rows / sizeof rows[0])) n = (i32)(sizeof rows / sizeof rows[0]);
@@ -622,8 +669,20 @@ HitResult ui_hit_test(const struct AppState *app, f32 x, f32 y) {
                     grouped = g >= 0 && g < MAX_TAB_GROUPS && app->tab_groups[g].used &&
                               !app->tab_groups[g].collapsed;
                 }
-                f32 indent = grouped ? 12.0f * dpi : 0.0f;
+                f32 indent = grouped ? SIDE_GROUP_INDENT_PT * dpi : 0.0f;
                 f32 px = inset + indent, pw = sb_w - 2.0f * inset - indent;
+                /* Its job tabs at the row's right end, as render_side_tab_row
+                 * lays them. */
+                i32 nj = row.index < MAX_TABS ? app->tab_jobs_n[row.index] : 0;
+                f32 jw = nj ? app_side_job_w(app, L.row_h) : 0.0f;
+                nj = agentctl_job_slots_fit(nj, nj && app->tab_jobs[row.index][0].chip, pw, jw, 6.0f * 8.0f * dpi);
+                pw -= (f32)nj * jw;
+                if (nj && x >= px + pw) {
+                    i32 k = agentctl_job_tab_at(x, px + pw, jw, nj);
+                    r.type = HIT_TAB_JOB;
+                    r.sub_index = k < 0 ? nj - 1 : k;
+                    return r;
+                }
                 f32 close_sz = app->config.style.tab_close_size * dpi;
                 f32 ink_r = 0.0f;
                 icon_ink_insets(ICON_CLOSE, close_sz * TAB_CLOSE_ICON_RATIO, NULL, &ink_r);
@@ -655,7 +714,7 @@ HitResult ui_hit_test(const struct AppState *app, f32 x, f32 y) {
                  * sidebar's top: rel_y is measured from there so fb's own header
                  * and row math (mirrored from fb_render_sidebar) hold. */
                 f32 rel_y = y - s->body_y;
-                f32 hdr_h = SIDEBAR_HEADER_PT * dpi;   /* matches fb_render_sidebar */
+                f32 hdr_h = fb_list_hdr_h(dpi);
                 /* sub_index 2 marks the explorer's BODY where no row is — under
                  * the last row, or all of it in an empty folder. A right click
                  * there opens the folder's own menu (main.c). */
@@ -664,16 +723,12 @@ HitResult ui_hit_test(const struct AppState *app, f32 x, f32 y) {
                     if (rel_y >= hdr_h) r.sub_index = 2;
                     return r;
                 }
-                /* Use UI scale metrics, not terminal font — sidebar renders at fixed 16*dpi */
-                f32 ch = 16.0f * dpi;
-                f32 entry_h = FB_ENTRY_H(ch, dpi);   /* single source of truth: layout.h */
                 r.rel_y = rel_y;
                 /* sub_index 1 marks the explorer's HEADER row — main.c's up /
                  * refresh / close buttons live there and nowhere else. */
                 if (rel_y < hdr_h) { r.type = HIT_SIDEBAR; r.sub_index = 1; return r; }
-                /* Entry i top (in sidebar-local coords) = hdr_h + i*entry_h - scroll_offset_px */
-                i32 idx = (i32)((rel_y - hdr_h + app->filebrowser.scroll_offset_px) / entry_h);
-                if (idx >= 0 && idx < app->filebrowser.entry_count) {
+                i32 idx = fb_list_entry_at(&app->filebrowser, rel_y, dpi);
+                if (idx >= 0) {
                     r.type = HIT_SIDEBAR_ITEM;
                     r.index = idx;
                 } else {
@@ -735,7 +790,8 @@ HitResult ui_hit_test(const struct AppState *app, f32 x, f32 y) {
     {
         const Tab *atab = (app->tab_count > 0 && app->active_tab >= 0)
                           ? &app->tabs[app->active_tab] : NULL;
-        if (atab && atab->split != SPLIT_NONE) {
+        /* A zoomed tab draws no divider, so it has none to drag. */
+        if (atab && atab->split != SPLIT_NONE && tab_zoomed_pane(atab) < 0) {
             /* Mirror render_terminal's content box EXACTLY — the divider is
              * drawn at a ratio of this rect, so any disagreement moves the
              * grab zone off the painted line. The origin takes no
@@ -822,8 +878,11 @@ HitResult ui_hit_test(const struct AppState *app, f32 x, f32 y) {
     {
         const Tab *atab = (app->tab_count > 0 && app->active_tab >= 0)
                           ? &app->tabs[app->active_tab] : NULL;
+        /* A browser pane a zoom hides is not on screen: its chrome rects are
+         * the last frame's, and its page box would fall back to the whole tab. */
         bool has_browser = atab && atab->browser &&
-            (atab->kind == TAB_BROWSER || atab->browser_pane >= 0);
+            (atab->kind == TAB_BROWSER ||
+             (atab->browser_pane >= 0 && !tab_zoom_hides_pane(atab, atab->browser_pane)));
         if (has_browser) {
             i32 bh = browser_chrome_hit(app, x, y);
             if (bh != BROWSER_HIT_NONE) {
@@ -924,16 +983,14 @@ HitResult ui_hit_test(const struct AppState *app, f32 x, f32 y) {
                 }
 
                 /* List area */
-                f32 hdr_h = SIDEBAR_HEADER_PT * dpi;   /* matches fb_render_sidebar */
-                f32 ch    = 16.0f * dpi;
-                f32 entry_h = FB_ENTRY_H(ch, dpi);   /* single source of truth: layout.h */
+                f32 hdr_h = fb_list_hdr_h(dpi);
                 f32 rel_x = x - ox;
                 f32 rel_y = y - oy;
                 if (rel_y < hdr_h) {
                     r.type = HIT_FBTAB_HEADER;
                 } else {
-                    i32 idx = (i32)((rel_y - hdr_h + atab->fb->scroll_offset_px) / entry_h);
-                    if (idx >= 0 && idx < atab->fb->entry_count) {
+                    i32 idx = fb_list_entry_at(atab->fb, rel_y, dpi);
+                    if (idx >= 0) {
                         r.type = HIT_FBTAB_ITEM;
                         r.index = idx;
                     } else {

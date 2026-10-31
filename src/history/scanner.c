@@ -76,9 +76,9 @@ static int scan_lstat(const char *path, struct stat *st) {
     int rc = lstat(path, st);
     return scan_cancelled() ? -1 : rc;
 }
-static FILE *scan_fopen(const char *path, const char *mode) {
+static FILE *scan_fopen(const char *path) {
     if (scan_cancelled()) return NULL;
-    FILE *f = fopen(path, mode);
+    FILE *f = hist_fopen_regular(path, false);
     if (scan_cancelled()) { if (f) fclose(f); return NULL; }
     return f;
 }
@@ -305,7 +305,7 @@ static const char *arena_session_id(Arena *a, const char *fname, usize base_len)
 #define CWD_PEEK_BYTES (64u * 1024u)
 static const char *peek_record_cwd(Arena *a, const char *path) {
     if (!a || !path) return NULL;
-    FILE *f = scan_fopen(path, "r");
+    FILE *f = scan_fopen(path);
     if (!f) return NULL;
     char *buf = (char *)malloc(CWD_PEEK_BYTES + 1);
     if (!buf) { fclose(f); return NULL; }
@@ -407,7 +407,7 @@ static bool codex_header_is_subagent(const char *line) {
 static const char *peek_codex_cwd(Arena *a, const char *path, bool *subagent) {
     if (subagent) *subagent = false;
     if (!a || !path) return NULL;
-    FILE *f = scan_fopen(path, "r");
+    FILE *f = scan_fopen(path);
     if (!f) return NULL;
     char buf[8192];
     usize n = scan_fread(buf, 1, sizeof(buf) - 1, f);
@@ -443,12 +443,20 @@ static const char *peek_codex_cwd(Arena *a, const char *path, bool *subagent) {
  * chat_scan_with_arena. Main-thread only (palette, transcript, CLI). */
 static Arena g_scan_arena;
 static bool  g_scan_arena_ready;
+static f64   g_scan_arena_borrowed_at;   /* monotonic seconds of the last borrow */
+
+static f64 scan_arena_clock(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (f64)ts.tv_sec + (f64)ts.tv_nsec / 1e9;
+}
 
 Arena chat_scan_arena_create(void) {
     return arena_create(CHAT_SCAN_ARENA_BYTES);
 }
 
 Arena *chat_scan_arena_borrow(void) {
+    g_scan_arena_borrowed_at = scan_arena_clock();
     if (!g_scan_arena_ready) {
         g_scan_arena = arena_create(CHAT_SCAN_ARENA_BYTES);
         if (!g_scan_arena.base) return NULL;
@@ -468,7 +476,7 @@ Arena *chat_scan_arena_borrow(void) {
     return &g_scan_arena;
 }
 
-void chat_scan_with_arena(u32 tools_mask, chat_session_cb cb, void *user) {
+void chat_scan_with_arena(ChatToolMask tools_mask, chat_session_cb cb, void *user) {
     Arena *a = chat_scan_arena_borrow();
     if (!a) return;
     chat_scan(a, tools_mask, cb, user);
@@ -481,6 +489,11 @@ void chat_scan_shutdown(void) {
         g_scan_arena_ready = false;
         mem_budget_set(MEM_HISTORY, 0);
     }
+}
+
+void chat_scan_arena_trim_idle(f64 idle_sec) {
+    if (g_scan_arena_ready && scan_arena_clock() - g_scan_arena_borrowed_at >= idle_sec)
+        chat_scan_shutdown();
 }
 
 static bool fill_meta_from_path(EntryVec *vec, ChatSessionMeta *m, ChatTool tool,
@@ -573,7 +586,8 @@ static bool fill_meta_from_path(EntryVec *vec, ChatSessionMeta *m, ChatTool tool
         bool subagent = false;
         m->cwd = peek_codex_cwd(a, m->path, &subagent);
         if (subagent) return false;        /* not a session of the user's: not listed */
-    } else if (tool == CHAT_TOOL_QWEN || tool == CHAT_TOOL_PI || tool == CHAT_TOOL_OMP) {
+    } else if (tool == CHAT_TOOL_QWEN || tool == CHAT_TOOL_PI || tool == CHAT_TOOL_OMP ||
+               tool == CHAT_TOOL_QODER) {
         /* Same story under `~/.qwen/projects/<slug>/chats`: the record when
          * there is one, the slug comparison otherwise. Pi and Oh My Pi put the
          * folder in the header line (their bucket name is a lossy slug of it:
@@ -939,7 +953,7 @@ static i32 kimi_load_workdirs(KimiWorkDir *tab, i32 cap) {
 
     /* Tiny file (one entry per work dir ever opened). */
     char buf[64 * 1024];
-    FILE *f = scan_fopen(meta_path, "rb");
+    FILE *f = scan_fopen(meta_path);
     if (!f) return 0;
     usize n = scan_fread(buf, 1, sizeof buf - 1, f);
     fclose(f);
@@ -1347,6 +1361,84 @@ static void scan_hermes(EntryVec *out) {
     closedir(d);
 }
 
+/* Devin CLI: `$XDG_DATA_HOME/devin/cli/sessions.db` (default
+ * ~/.local/share/devin/cli/sessions.db). `sessions` has a row per session: its
+ * id (a word pair, what `devin --resume` takes), the folder it ran in
+ * (`working_directory`), a title, and `created_at` / `last_activity_at` in
+ * epoch seconds. A hidden row is not listed. The count is the session's rows
+ * in `message_nodes`; no message is read. */
+static void scan_devin(EntryVec *out) {
+    if (!out || !out->arena) return;
+    char db_path[CHAT_PATH_CAP];
+    if (!hist_xdg_data_path(db_path, sizeof db_path, "devin/cli/sessions.db")) return;
+    struct stat st;
+    if (scan_stat(db_path, &st) != 0 || !S_ISREG(st.st_mode)) return;
+    sqlite3_initialize();
+    sqlite3 *db = NULL;
+    if (scan_sql_open(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        if (db) sqlite3_close(db);
+        return;
+    }
+    static const char sql[] =
+        "SELECT s.id, s.title, s.working_directory, s.created_at, s.last_activity_at, "
+        "(SELECT COUNT(*) FROM message_nodes m WHERE m.session_id = s.id) "
+        "FROM sessions s WHERE COALESCE(s.hidden, 0) = 0 "
+        "ORDER BY s.last_activity_at DESC";
+    sqlite3_stmt *stmt = NULL;
+    if (scan_sql_prepare(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return;
+    }
+    while (scan_sql_step(stmt) == SQLITE_ROW) {
+        const char *id    = (const char *)sqlite3_column_text(stmt, 0);
+        const char *title = (const char *)sqlite3_column_text(stmt, 1);
+        const char *cwd   = (const char *)sqlite3_column_text(stmt, 2);
+        sqlite3_int64 created = sqlite3_column_int64(stmt, 3);
+        sqlite3_int64 active  = sqlite3_column_int64(stmt, 4);
+        sqlite3_int64 msgs    = sqlite3_column_int64(stmt, 5);
+        if (!id || !id[0]) continue;
+        sqlite3_int64 t = active > created ? active : created;
+        /* Seconds; a value past the year 33658 in seconds is milliseconds. */
+        i64 ms = t > 1000000000000LL ? (i64)t : (i64)t * 1000;
+
+        ChatSessionMeta m = {0};
+        m.tool       = CHAT_TOOL_DEVIN;
+        m.path       = arena_dup_str(out->arena, db_path);
+        m.session_id = arena_dup_str(out->arena, id);
+        m.project    = arena_dup_str(out->arena, title && title[0] ? title : "-");
+        m.cwd        = cwd && cwd[0] == '/' ? arena_dup_str(out->arena, cwd) : NULL;
+        m.last_modified_ms = ms;
+        m.size_bytes       = 0;
+        m.event_count      = (u32)(msgs < 0 ? 0 : msgs);
+        if (m.path && m.session_id && m.project) vec_push(out, &m);
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+}
+
+/* Qoder CLI: `$QODER_CONFIG_DIR/projects` (default ~/.qoder/projects), a
+ * folder per project and in it `<session-id>.jsonl` beside a `<session-id>/`
+ * folder of state. The folder a session ran in is the record's own `cwd`
+ * when its lines carry one; the project folder's name is not decoded. */
+static void scan_qoder(EntryVec *out) {
+    char root[CHAT_PATH_CAP];
+    if (!hist_resolve_root(root, sizeof root, "QODER_CONFIG_DIR", "projects", ".qoder/projects"))
+        return;
+    DIR *d = scan_opendir(root);
+    if (!d) return;
+    struct dirent *de;
+    while ((de = scan_readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        char dir[CHAT_PATH_CAP];
+        int w = snprintf(dir, sizeof dir, "%s/%s", root, de->d_name);
+        if (w <= 0 || (usize)w >= sizeof dir) continue;
+        struct stat st;
+        if (scan_lstat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        scan_flat(CHAT_TOOL_QODER, dir, de->d_name, out);
+    }
+    closedir(d);
+}
+
 /* OpenClaw: `$OPENCLAW_STATE_DIR` (default ~/.openclaw)/agents/<agent>/agent/
  * openclaw-agent.sqlite. Sessions are keyed `agent:<agent>:<key>` and belong to
  * an AGENT with a workspace, not to the folder a terminal was in, so a row has
@@ -1428,7 +1520,7 @@ struct ClineExtMap {
  * Both masks must be non-zero for any work to happen. The same extension id
  * can map to several tool enum values (e.g. roo) — those rows just skip when
  * their tool bit is cleared. */
-static void scan_cline_family_filtered(EntryVec *out, u32 tool_mask, u32 host_mask) {
+static void scan_cline_family_filtered(EntryVec *out, ChatToolMask tool_mask, u32 host_mask) {
     if (tool_mask == 0 || host_mask == 0) return;
     static const struct ClineExtMap extensions[] = {
         { "saoudrizwan.claude-dev",     CHAT_TOOL_CLINE },
@@ -1444,7 +1536,7 @@ static void scan_cline_family_filtered(EntryVec *out, u32 tool_mask, u32 host_ma
         char base[CHAT_PATH_CAP];
         if (!vscode_storage_root_for(h, base, sizeof base)) continue;
         for (usize e = 0; e < sizeof extensions / sizeof extensions[0]; e++) {
-            if (!(tool_mask & (1u << extensions[e].tool))) continue;
+            if (!(tool_mask & CHAT_TOOL_BIT(extensions[e].tool))) continue;
             /* Detection step 2: extension actually installed in this IDE?
              * Probes ~/.vscode/extensions/<id>-* and equivalents. Without
              * this, an extension's leftover task data shows up months after
@@ -1492,7 +1584,7 @@ static void scan_cline_family_filtered(EntryVec *out, u32 tool_mask, u32 host_ma
  * their rows apart: a fixed mask would make `--tool=kilo` list Cline and Roo
  * sessions too — the same silent widening the CLI's parse_tools_mask comment
  * describes for an unknown id. */
-static void scan_cline_family(EntryVec *out, u32 tool_mask) {
+static void scan_cline_family(EntryVec *out, ChatToolMask tool_mask) {
     scan_cline_family_filtered(out, tool_mask, 0xFu);
 }
 
@@ -1721,7 +1813,7 @@ static void scan_omp(EntryVec *out) {
  * picker filter these by project like it does Claude's and Codex's. */
 static const char *peek_cline_cli_cwd(Arena *a, const char *meta_path) {
     if (!a || !meta_path) return NULL;
-    FILE *f = scan_fopen(meta_path, "r");
+    FILE *f = scan_fopen(meta_path);
     if (!f) return NULL;
     char buf[8192];
     usize n = scan_fread(buf, 1, sizeof buf - 1, f);
@@ -1808,12 +1900,12 @@ static void scan_cline_cli(EntryVec *out) {
     closedir(d);
 }
 
-bool chat_scan_cancellable(Arena *arena, u32 tools_mask, chat_session_cb cb,
+bool chat_scan_cancellable(Arena *arena, ChatToolMask tools_mask, chat_session_cb cb,
                            void *user, const _Atomic bool *cancel) {
     if (!cb || !arena) return false;
     ScanCancelScope saved_scope = g_scan_scope;
     g_scan_scope = (ScanCancelScope){ .cancel = cancel };
-    if (tools_mask == 0) tools_mask = 0xFFFFFFFFu;
+    if (tools_mask == 0) tools_mask = ~(ChatToolMask)0;
 
     EntryVec v = {0};
     v.arena = arena;
@@ -1821,27 +1913,29 @@ bool chat_scan_cancellable(Arena *arena, u32 tools_mask, chat_session_cb cb,
 #define SCAN_STEP(cond, call) \
     do { if (scan_cancelled()) goto done; \
          if (cond) call; } while (0)
-    SCAN_STEP(tools_mask & (1u << CHAT_TOOL_CLAUDE),      scan_claude(&v));
-    SCAN_STEP(tools_mask & (1u << CHAT_TOOL_CODEX),       scan_codex(&v));
-    SCAN_STEP(tools_mask & (1u << CHAT_TOOL_COPILOT),     scan_copilot(&v));
-    SCAN_STEP(tools_mask & (1u << CHAT_TOOL_ANTIGRAVITY), scan_antigravity(&v));
-    SCAN_STEP(tools_mask & (1u << CHAT_TOOL_AMP),         scan_amp(&v));
-    SCAN_STEP(tools_mask & (1u << CHAT_TOOL_KIRO),        scan_kiro(&v));
-    SCAN_STEP(tools_mask & (1u << CHAT_TOOL_CURSOR),      scan_cursor(&v));
-    SCAN_STEP(tools_mask & (1u << CHAT_TOOL_DROID),       scan_droid(&v));
-    SCAN_STEP(tools_mask & (1u << CHAT_TOOL_OPENCODE),    scan_opencode(&v));
-    SCAN_STEP(tools_mask & (1u << CHAT_TOOL_KIMI),        scan_kimi(&v));
-    SCAN_STEP(tools_mask & (1u << CHAT_TOOL_QWEN),        scan_qwen(&v));
-    SCAN_STEP(tools_mask & (1u << CHAT_TOOL_XAI),         scan_grok(&v));
-    SCAN_STEP(tools_mask & (1u << CHAT_TOOL_COMMANDCODE), scan_commandcode(&v));
-    SCAN_STEP(tools_mask & (1u << CHAT_TOOL_CLINE_CLI),   scan_cline_cli(&v));
-    SCAN_STEP(tools_mask & (1u << CHAT_TOOL_PI),          scan_pi(&v));
-    SCAN_STEP(tools_mask & (1u << CHAT_TOOL_OMP),         scan_omp(&v));
-    SCAN_STEP(tools_mask & (1u << CHAT_TOOL_HERMES),      scan_hermes(&v));
-    SCAN_STEP(tools_mask & (1u << CHAT_TOOL_OPENCLAW),    scan_openclaw(&v));
-    SCAN_STEP(tools_mask & ((1u << CHAT_TOOL_CLINE) |
-                            (1u << CHAT_TOOL_ROO)   |
-                            (1u << CHAT_TOOL_KILO)),      scan_cline_family(&v, tools_mask));
+    SCAN_STEP(tools_mask & CHAT_TOOL_BIT(CHAT_TOOL_CLAUDE),      scan_claude(&v));
+    SCAN_STEP(tools_mask & CHAT_TOOL_BIT(CHAT_TOOL_CODEX),       scan_codex(&v));
+    SCAN_STEP(tools_mask & CHAT_TOOL_BIT(CHAT_TOOL_COPILOT),     scan_copilot(&v));
+    SCAN_STEP(tools_mask & CHAT_TOOL_BIT(CHAT_TOOL_ANTIGRAVITY), scan_antigravity(&v));
+    SCAN_STEP(tools_mask & CHAT_TOOL_BIT(CHAT_TOOL_AMP),         scan_amp(&v));
+    SCAN_STEP(tools_mask & CHAT_TOOL_BIT(CHAT_TOOL_KIRO),        scan_kiro(&v));
+    SCAN_STEP(tools_mask & CHAT_TOOL_BIT(CHAT_TOOL_CURSOR),      scan_cursor(&v));
+    SCAN_STEP(tools_mask & CHAT_TOOL_BIT(CHAT_TOOL_DROID),       scan_droid(&v));
+    SCAN_STEP(tools_mask & CHAT_TOOL_BIT(CHAT_TOOL_OPENCODE),    scan_opencode(&v));
+    SCAN_STEP(tools_mask & CHAT_TOOL_BIT(CHAT_TOOL_KIMI),        scan_kimi(&v));
+    SCAN_STEP(tools_mask & CHAT_TOOL_BIT(CHAT_TOOL_QWEN),        scan_qwen(&v));
+    SCAN_STEP(tools_mask & CHAT_TOOL_BIT(CHAT_TOOL_XAI),         scan_grok(&v));
+    SCAN_STEP(tools_mask & CHAT_TOOL_BIT(CHAT_TOOL_COMMANDCODE), scan_commandcode(&v));
+    SCAN_STEP(tools_mask & CHAT_TOOL_BIT(CHAT_TOOL_CLINE_CLI),   scan_cline_cli(&v));
+    SCAN_STEP(tools_mask & CHAT_TOOL_BIT(CHAT_TOOL_PI),          scan_pi(&v));
+    SCAN_STEP(tools_mask & CHAT_TOOL_BIT(CHAT_TOOL_OMP),         scan_omp(&v));
+    SCAN_STEP(tools_mask & CHAT_TOOL_BIT(CHAT_TOOL_HERMES),      scan_hermes(&v));
+    SCAN_STEP(tools_mask & CHAT_TOOL_BIT(CHAT_TOOL_OPENCLAW),    scan_openclaw(&v));
+    SCAN_STEP(tools_mask & CHAT_TOOL_BIT(CHAT_TOOL_DEVIN),       scan_devin(&v));
+    SCAN_STEP(tools_mask & CHAT_TOOL_BIT(CHAT_TOOL_QODER),       scan_qoder(&v));
+    SCAN_STEP(tools_mask & (CHAT_TOOL_BIT(CHAT_TOOL_CLINE) |
+                            CHAT_TOOL_BIT(CHAT_TOOL_ROO)   |
+                            CHAT_TOOL_BIT(CHAT_TOOL_KILO)),      scan_cline_family(&v, tools_mask));
 #undef SCAN_STEP
 
     if (scan_cancelled()) goto done;
@@ -1863,7 +1957,7 @@ done:
     return false;
 }
 
-void chat_scan(Arena *arena, u32 tools_mask, chat_session_cb cb, void *user) {
+void chat_scan(Arena *arena, ChatToolMask tools_mask, chat_session_cb cb, void *user) {
     chat_scan_cancellable(arena, tools_mask, cb, user, NULL);
 }
 
@@ -2006,6 +2100,8 @@ bool chat_find_session(Arena *arena, const char *needle, ChatSessionMeta *out) {
                 { "/.omp/",                       CHAT_TOOL_OMP         },
                 { "/.hermes/",                    CHAT_TOOL_HERMES      },
                 { "/.openclaw/",                  CHAT_TOOL_OPENCLAW    },
+                { "/devin/cli/",                  CHAT_TOOL_DEVIN       },
+                { "/.qoder/",                     CHAT_TOOL_QODER       },
             };
             out->tool = CHAT_TOOL_UNKNOWN;
             for (usize i = 0; i < sizeof path_hints / sizeof path_hints[0]; i++) {

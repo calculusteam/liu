@@ -381,7 +381,7 @@ static bool slurp_into(Arena *a, const char *path, usize max_bytes,
     *out_buf = NULL;
     if (out_len) *out_len = 0;
 
-    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0) return false;
     struct stat st;
     if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
@@ -442,10 +442,21 @@ bool hist_line_reader_attach(HistLineReader *r, int fd) {
     return true;
 }
 
+FILE *hist_fopen_regular(const char *path, bool nofollow) {
+    if (!path || !path[0]) return NULL;
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK | (nofollow ? O_NOFOLLOW : 0));
+    if (fd < 0) return NULL;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) { close(fd); return NULL; }
+    FILE *f = fdopen(fd, "rb");
+    if (!f) close(fd);
+    return f;
+}
+
 bool hist_line_reader_open(HistLineReader *r, const char *path, bool nofollow) {
     if (r) { memset(r, 0, sizeof *r); r->fd = -1; }
     if (!r || !path) return false;
-    int flags = O_RDONLY | O_CLOEXEC | (nofollow ? O_NOFOLLOW : 0);
+    int flags = O_RDONLY | O_CLOEXEC | O_NONBLOCK | (nofollow ? O_NOFOLLOW : 0);
     int fd = open(path, flags);
     if (fd < 0) return false;
     struct stat st;

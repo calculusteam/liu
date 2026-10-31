@@ -211,6 +211,15 @@ static const AgentSpec g_known_agents[] = {
      * Create Theme and out of the Translate agent backend. */
     { "openclaw", "OpenClaw", "openclaw", { NULL }, false, false },
     { "hermes",   "Hermes",   "hermes",   { NULL }, false, false },
+    /* Listed for their panes the same way, and handed no prompt: their
+     * one-shot modes are not verified here. */
+    { "devin",      "Devin",       "devin",       { NULL }, false, false },
+    { "qoder",      "Qoder",       "qodercli",    { NULL }, false, false },
+    { "letta",      "Letta Code",  "letta",       { NULL }, false, false },
+    { "mastracode", "Mastra Code", "mastracode",  { NULL }, false, false },
+    { "maki",       "Maki",        "maki",        { NULL }, false, false },
+    { "muse",       "Muse Code",   "muse",        { NULL }, false, false },
+    { "prime",      "Prime Agent", "prime-agent", { NULL }, false, false },
 };
 
 static const i32 g_known_agent_count =

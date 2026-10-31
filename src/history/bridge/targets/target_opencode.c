@@ -20,8 +20,11 @@
 #include "history/bridge/targets.h"
 #include "history/bridge/compatibility.h"
 #include "history/bridge/jsonw.h"
+#include "history/bridge/tool_args.h"
 #include "history/bridge/tool_map.h"
 #include "history/util.h"
+
+#include "cJSON.h"
 
 #include "sqlite3.h"
 #include "core/sqlite_harden.h"
@@ -68,6 +71,78 @@ static void oc_write_tokens(JsonW *w, const char *key) {
     jsonw_obj_end(w);
 }
 
+/* The provider a source agent's model belongs to, as OpenCode names one, so
+ * an answer reads "anthropic/claude-…" rather than a made-up provider. */
+static const char *oc_provider(const BridgeHistory *h) {
+    switch (h->source_tool) {
+        case CHAT_TOOL_CLAUDE:   return "anthropic";
+        case CHAT_TOOL_CODEX:    return "openai";
+        case CHAT_TOOL_XAI:      return "xai";
+        case CHAT_TOOL_KIMI:     return "moonshotai";
+        case CHAT_TOOL_ANTIGRAVITY: return "google";
+        case CHAT_TOOL_OPENCODE: return "opencode";
+        default:                 return "liu-bridge";
+    }
+}
+
+/* The call at `index` as OpenCode's own tool: the name into `name`, the
+ * arguments as JSON (malloc'd), the facts in `f` (freed by the caller). */
+static char *oc_call(const BridgeHistory *h, usize index, bool v2, BridgeCallFacts *f,
+                     char *name, usize cap) {
+    bridge_call_facts(&h->events[index], bridge_result_for(h, index), f);
+    cJSON *args = NULL;
+    char *json = NULL;
+    name[0] = '\0';
+    if (bridge_call_in_vocab(v2 ? BRIDGE_VOCAB_OPENCODE_V2 : BRIDGE_VOCAB_OPENCODE_V1, f,
+                             name, cap, &args) && name[0])
+        json = cJSON_PrintUnformatted(args);
+    cJSON_Delete(args);
+    return json;
+}
+
+/* A recorded file change as OpenCode stores one: the whole unified diff with
+ * its Index header, and the lines it adds and removes. NULL when the call
+ * recorded none. */
+static char *oc_file_diff(const BridgeCallFacts *f, u32 *added, u32 *removed) {
+    if (!f->path) return NULL;
+    char *hunks = NULL;
+    if (f->patch) {
+        hunks = strdup(f->patch);
+    } else if (f->created && f->content) {
+        /* A new file: every line added. */
+        usize lines = 0, n = strlen(f->content);
+        for (usize i = 0; i < n; i++) if (f->content[i] == '\n') lines++;
+        if (n && f->content[n - 1] != '\n') lines++;
+        usize cap = n + lines * 2 + 64;
+        hunks = malloc(cap);
+        if (hunks) {
+            usize off = (usize)snprintf(hunks, cap, "@@ -0,0 +1,%zu @@\n", lines);
+            for (const char *p = f->content; *p;) {
+                const char *e = strchr(p, '\n');
+                usize l = e ? (usize)(e - p) : strlen(p);
+                hunks[off++] = '+';
+                memcpy(hunks + off, p, l);
+                off += l;
+                hunks[off++] = '\n';
+                p = e ? e + 1 : p + l;
+            }
+            hunks[off] = '\0';
+        }
+    }
+    if (!hunks) return NULL;
+    const char *at = strstr(hunks, "@@");
+    if (!at) { free(hunks); return NULL; }
+    bridge_patch_counts(at, added, removed);
+    usize cap = strlen(at) + 3 * strlen(f->path) + 160;
+    char *out = malloc(cap);
+    if (out)
+        snprintf(out, cap, "Index: %s\n"
+                 "===================================================================\n"
+                 "--- %s\n+++ %s\n%s", f->path, f->created ? "/dev/null" : f->path, f->path, at);
+    free(hunks);
+    return out;
+}
+
 static void oc_msg_info(JsonW *w, const BridgeHistory *h, const OcMsg *m,
                         const char *sid, const char *parent, i64 ts) {
     jsonw_obj_begin(w, "info");
@@ -82,7 +157,7 @@ static void oc_msg_info(JsonW *w, const BridgeHistory *h, const OcMsg *m,
          * model for the NEXT turn from the user's own config. Naming the
          * source model here is what lets a reader see where the turns came
          * from without it changing anything. */
-        jsonw_str(w, "providerID", "liu-bridge");
+        jsonw_str(w, "providerID", oc_provider(h));
         jsonw_str(w, "modelID",
                   h->source_model && h->source_model[0] ? h->source_model
                                                         : chat_tool_name(h->source_tool));
@@ -106,7 +181,7 @@ static void oc_msg_info(JsonW *w, const BridgeHistory *h, const OcMsg *m,
          * modelID/providerID spelling instead; the two roles genuinely
          * differ, which is why this is not one shared block. */
         jsonw_obj_begin(w, "model");
-        jsonw_str(w, "providerID", "liu-bridge");
+        jsonw_str(w, "providerID", oc_provider(h));
         jsonw_str(w, "modelID",
                   h->source_model && h->source_model[0] ? h->source_model
                                                         : chat_tool_name(h->source_tool));
@@ -192,13 +267,7 @@ static u32 oc_write_v1(JsonW *w, const BridgeHistory *h, const char *sid, const 
     jsonw_str(w, "projectID", "liu-bridge");
     jsonw_str(w, "directory", h->cwd);
     jsonw_str(w, "path", "");
-    {
-        char title[600];
-        snprintf(title, sizeof title, "%s (from %s)",
-                 h->title && h->title[0] ? h->title : "Continued session",
-                 chat_tool_name(h->source_tool));
-        jsonw_str(w, "title", title);
-    }
+    jsonw_str(w, "title", h->title && h->title[0] ? h->title : "Continued session");
     jsonw_str(w, "agent", "build");         /* REQUIRED — see the header */
     jsonw_obj_begin(w, "model");
     jsonw_str(w, "id",
@@ -363,9 +432,10 @@ static u32 oc_write_v1(JsonW *w, const BridgeHistory *h, const char *sid, const 
                  * call is written here and the matching result is folded in
                  * by looking ahead — writing them as two parts would show a
                  * call that never returned. */
-                const char *name = bridge_tool_name_for(CHAT_TOOL_OPENCODE, e->tool_kind);
-                if (!name) name = e->tool_name;
-                if (!name || !name[0]) name = "bash";
+                BridgeCallFacts f;
+                char name[128];
+                char *args = oc_call(h, i, false, &f, name, sizeof name);
+                if (!name[0]) hist_copy_bounded(name, sizeof name, "bash");
 
                 const BridgeEvent *res = oc_pair_result(h, pairs, i);
 
@@ -374,23 +444,33 @@ static u32 oc_write_v1(JsonW *w, const BridgeHistory *h, const char *sid, const 
                 jsonw_str(w, "tool", name);
                 jsonw_str(w, "callID", e->tool_call_id);
                 jsonw_obj_begin(w, "state");
-                jsonw_str(w, "status", res ? "completed" : "error");
+                jsonw_str(w, "status", res && !res->tool_failed ? "completed" : "error");
                 /* REQUIRED to be an object by opencode's importer. */
-                jsonw_obj_or_wrap(w, "input", e->tool_input);
+                jsonw_obj_or_wrap(w, "input", args ? args : e->tool_input);
                 if (res) {
                     jsonw_str(w, "output", res->tool_output ? res->tool_output : "");
+                    if (res->tool_failed)
+                        jsonw_str(w, "error", res->tool_output && res->tool_output[0]
+                                                  ? res->tool_output : "The tool call failed.");
                 } else {
                     jsonw_str(w, "output", "");
                     jsonw_str(w, "error",
                               "No output recorded in the source session.");
                 }
-                {
-                    char t[256];
-                    snprintf(t, sizeof t, "%s (imported)", name);
-                    jsonw_str(w, "title", t);
-                }
+                /* The title OpenCode gives a call: what it acted on. */
+                jsonw_str(w, "title", f.path ? f.path : f.command ? f.command
+                                      : f.pattern ? f.pattern : f.url ? f.url
+                                      : f.query ? f.query : name);
                 jsonw_obj_begin(w, "metadata");
+                {
+                    u32 add = 0, del = 0;
+                    char *diff = oc_file_diff(&f, &add, &del);
+                    if (diff) jsonw_str(w, "diff", diff);
+                    free(diff);
+                }
                 jsonw_obj_end(w);
+                free(args);
+                bridge_call_facts_free(&f);
                 jsonw_obj_begin(w, "time");
                 jsonw_i64(w, "start", e->timestamp_ms > 0 ? e->timestamp_ms : now);
                 jsonw_i64(w, "end",   e->timestamp_ms > 0 ? e->timestamp_ms : now);
@@ -486,10 +566,8 @@ static bool oc_ends_with_assistant(const BridgeHistory *h) {
     return false;
 }
 
-/* The names a 2.0.32 store uses: `shell` (1.x said `bash`) and `subagent`
- * (`task`); read / grep / glob / edit / write / webfetch / websearch kept
- * theirs. A todo tool was not among them, so that kind keeps the source's
- * own spelling instead of a guess. */
+/* An orphan result's tool, by its kind: `shell` (1.x said `bash`) and
+ * `subagent` (`task`) in a 2.x store. */
 static const char *oc2_tool_name(const BridgeEvent *e) {
     if (e->tool_kind == BRIDGE_TOOL_SHELL)    return "shell";
     if (e->tool_kind == BRIDGE_TOOL_SUBAGENT) return "subagent";
@@ -527,7 +605,7 @@ static void oc2_assistant_open(OcV2 *c, i64 ts) {
     jsonw_obj_begin(w, "model");
     jsonw_str(w, "id", c->h->source_model && c->h->source_model[0]
                            ? c->h->source_model : chat_tool_name(c->h->source_tool));
-    jsonw_str(w, "providerID", "liu-bridge");
+    jsonw_str(w, "providerID", oc_provider(c->h));
     jsonw_obj_end(w);
     jsonw_arr_begin(w, "content");
     c->open = true;
@@ -549,20 +627,27 @@ static void oc2_assistant_close(OcV2 *c) {
     c->written++;
 }
 
-static void oc2_user(OcV2 *c, const char *text, i64 ts, bool counted) {
+/* A user message, or (`synthetic`) text the model reads that the user did not
+ * type, which OpenCode stores as its own `synthetic` message and does not draw
+ * as a prompt. */
+static void oc2_message(OcV2 *c, const char *type, const char *text, i64 ts, bool counted) {
     oc2_assistant_close(c);
     JsonW *w = c->w;
     char id[64];
     oc_id(id, sizeof id, "msg", ++c->msg_seq);
     jsonw_obj_begin(w, NULL);
     jsonw_str(w, "id", id);
-    jsonw_str(w, "type", "user");
+    jsonw_str(w, "type", type);
     jsonw_obj_begin(w, "time");
     jsonw_i64(w, "created", ts);
     jsonw_obj_end(w);
     jsonw_str(w, "text", text);
     jsonw_obj_end(w);
     if (counted) c->written++;
+}
+
+static void oc2_user(OcV2 *c, const char *text, i64 ts, bool counted) {
+    oc2_message(c, "user", text, ts, counted);
 }
 
 static void oc2_text(OcV2 *c, const char *text, i64 ts) {
@@ -577,10 +662,13 @@ static void oc2_text(OcV2 *c, const char *text, i64 ts) {
     if (ts > c->open_t1) c->open_t1 = ts;
 }
 
-/* A tool part holds the call and its result. With no result it is an error
- * part, the way a call the agent never saw finish is stored. */
+/* A tool part holds the call and its result. With no result, or a failed
+ * one, it is an error part, the way a call that did not finish is stored. A
+ * recorded file change is its `metadata.files`, which OpenCode draws an edit's
+ * diff from. */
 static void oc2_tool(OcV2 *c, const char *name, const char *call_id, const char *input,
-                     bool has_result, const char *output, i64 t_call, i64 t_done) {
+                     bool has_result, const char *output, i64 t_call, i64 t_done,
+                     const BridgeCallFacts *f) {
     oc2_assistant_open(c, t_call);
     JsonW *w = c->w;
     char fallback[64];
@@ -593,11 +681,12 @@ static void oc2_tool(OcV2 *c, const char *name, const char *call_id, const char 
     jsonw_str(w, "id", call_id);
     jsonw_str(w, "name", name);
     jsonw_bool(w, "executed", false);
+    bool failed = f && f->failed;
     jsonw_obj_begin(w, "state");
-    jsonw_str(w, "status", has_result ? "completed" : "error");
+    jsonw_str(w, "status", has_result && !failed ? "completed" : "error");
     /* REQUIRED to be an object, as in 1.x. */
     jsonw_obj_or_wrap(w, "input", input);
-    if (has_result) {
+    if (has_result && !failed) {
         jsonw_arr_begin(w, "content");
         jsonw_obj_begin(w, NULL);
         jsonw_str(w, "type", "text");
@@ -605,11 +694,26 @@ static void oc2_tool(OcV2 *c, const char *name, const char *call_id, const char 
         jsonw_obj_end(w);
         jsonw_arr_end(w);
         jsonw_obj_begin(w, "metadata");
+        u32 add = 0, del = 0;
+        char *diff = f ? oc_file_diff(f, &add, &del) : NULL;
+        if (diff) {
+            jsonw_arr_begin(w, "files");
+            jsonw_obj_begin(w, NULL);
+            jsonw_str(w, "file", f->path);
+            jsonw_str(w, "patch", diff);
+            jsonw_str(w, "status", f->created ? "added" : "modified");
+            jsonw_i64(w, "additions", add);
+            jsonw_i64(w, "deletions", del);
+            jsonw_obj_end(w);
+            jsonw_arr_end(w);
+        }
+        free(diff);
         jsonw_obj_end(w);
     } else {
         jsonw_obj_begin(w, "error");
         jsonw_str(w, "type", "tool.execution");
-        jsonw_str(w, "message", "No output recorded in the source session.");
+        jsonw_str(w, "message", has_result && output && output[0]
+                                    ? output : "No output recorded in the source session.");
         jsonw_obj_end(w);
     }
     jsonw_obj_end(w);   /* state */
@@ -660,13 +764,7 @@ static u32 oc_write_v2(JsonW *w, const BridgeHistory *h, const char *sid, const 
     jsonw_i64(w, "updated", t1);
     if (finished) jsonw_i64(w, "idle", t1);
     jsonw_obj_end(w);
-    {
-        char title[600];
-        snprintf(title, sizeof title, "%s (from %s)",
-                 h->title && h->title[0] ? h->title : "Continued session",
-                 chat_tool_name(h->source_tool));
-        jsonw_str(w, "title", title);
-    }
+    jsonw_str(w, "title", h->title && h->title[0] ? h->title : "Continued session");
     /* Informational: the import takes its location from --directory. */
     jsonw_obj_begin(w, "location");
     jsonw_str(w, "directory", h->cwd && h->cwd[0] ? h->cwd : "/");
@@ -687,7 +785,8 @@ static u32 oc_write_v2(JsonW *w, const BridgeHistory *h, const char *sid, const 
                  "them. Continue from where the conversation left off.]",
                  chat_tool_name(h->source_tool),
                  h->title ? " \xe2\x80\x94 " : "", h->title ? h->title : "");
-        oc2_user(&c, note, oc2_ts(&c, h->event_count ? h->events[0].timestamp_ms : 0), false);
+        oc2_message(&c, "synthetic", note,
+                    oc2_ts(&c, h->event_count ? h->events[0].timestamp_ms : 0), false);
     }
 
     for (usize i = 0; i < h->event_count; i++) {
@@ -702,16 +801,17 @@ static u32 oc_write_v2(JsonW *w, const BridgeHistory *h, const char *sid, const 
             case BRIDGE_EVENT_CONTEXT:
             case BRIDGE_EVENT_COMPACTION: {
                 if (oc_side(e) == OC_SIDE_NONE) break;
-                /* Real conversation material that the user did not type, so it
-                 * is labelled in the text itself. */
+                /* Conversation material the user did not type: read by the
+                 * model, labelled for it, not drawn as a prompt. */
                 usize n = strlen(e->text) + 64;
                 char *buf = malloc(n);
                 if (buf) {
-                    snprintf(buf, n, "[%s context]\n%s", chat_tool_name(h->source_tool), e->text);
-                    oc2_user(&c, buf, ts, true);
+                    snprintf(buf, n, "[%s %s]\n%s", chat_tool_name(h->source_tool),
+                             e->type == BRIDGE_EVENT_COMPACTION ? "summary" : "context", e->text);
+                    oc2_message(&c, "synthetic", buf, ts, true);
                     free(buf);
                 } else {
-                    oc2_user(&c, e->text, ts, true);
+                    oc2_message(&c, "synthetic", e->text, ts, true);
                 }
                 break;
             }
@@ -724,8 +824,14 @@ static u32 oc_write_v2(JsonW *w, const BridgeHistory *h, const char *sid, const 
             case BRIDGE_EVENT_TOOL_CALL: {
                 const BridgeEvent *res = oc_pair_result(h, pairs, i);
                 i64 done = res && res->timestamp_ms > 0 ? res->timestamp_ms : ts;
-                oc2_tool(&c, oc2_tool_name(e), e->tool_call_id, e->tool_input,
-                         res != NULL, res ? res->tool_output : NULL, ts, done);
+                BridgeCallFacts f;
+                char name[128];
+                char *args = oc_call(h, i, true, &f, name, sizeof name);
+                oc2_tool(&c, name[0] ? name : oc2_tool_name(e), e->tool_call_id,
+                         args ? args : e->tool_input, res != NULL,
+                         res ? res->tool_output : NULL, ts, done, &f);
+                free(args);
+                bridge_call_facts_free(&f);
                 break;
             }
 
@@ -733,7 +839,8 @@ static u32 oc_write_v2(JsonW *w, const BridgeHistory *h, const char *sid, const 
                 /* Folded into its call. One no call claimed still carries real
                  * context: a completed call with no recorded input. */
                 if (pairs->claimed && pairs->claimed[i]) break;
-                oc2_tool(&c, oc2_tool_name(e), e->tool_call_id, NULL, true, e->tool_output, ts, ts);
+                oc2_tool(&c, oc2_tool_name(e), e->tool_call_id, NULL, true, e->tool_output, ts, ts,
+                         NULL);
                 break;
 
             default:

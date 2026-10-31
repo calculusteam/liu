@@ -2288,6 +2288,27 @@ void platform_shutdown(void) {
     g_platform.initialized = false;
 }
 
+#ifdef USE_METAL
+/* The device a window draws with. On a Mac with two GPUs the default device
+ * is the discrete one, and holding it keeps that GPU powered for as long as
+ * the window lives; a terminal's frames are light, so the integrated GPU
+ * (low power, driving displays, built in) is taken when there is one. A Mac
+ * with one GPU gets the default. Retained, like MTLCreateSystemDefaultDevice. */
+static id<MTLDevice> liu_window_metal_device(void) {
+#if defined(__x86_64__)
+    NSArray<id<MTLDevice>> *all = MTLCopyAllDevices();
+    id<MTLDevice> pick = nil;
+    if (all.count > 1) {
+        for (id<MTLDevice> d in all) {
+            if (d.isLowPower && !d.isHeadless && !d.isRemovable) { pick = [d retain]; break; }
+        }
+    }
+    [all release];
+    if (pick) return pick;
+#endif
+    return MTLCreateSystemDefaultDevice();
+}
+#endif
 
 PlatformWindow *platform_window_create(const PlatformWindowConfig *cfg) {
     @autoreleasepool {
@@ -2388,7 +2409,7 @@ PlatformWindow *platform_window_create(const PlatformWindowConfig *cfg) {
         g_blur_probe_window = w;
         platform_window_register(w);
 
-        w->mtl_device = MTLCreateSystemDefaultDevice();
+        w->mtl_device = liu_window_metal_device();
         w->mtl_layer = (CAMetalLayer *)w->view.layer;
         w->mtl_layer.device = w->mtl_device;
         w->mtl_layer.pixelFormat = MTLPixelFormatBGRA8Unorm_sRGB;
@@ -4916,6 +4937,15 @@ bool platform_is_liu_chrome_cmd_key(i32 key, u32 mods) {
         case KEY_UP:
         case KEY_DOWN:
             return true;
+        /* With Option the arrows take the keyboard to the pane beside (and
+         * with Ctrl as well nudge the divider); Cmd+Left / Right alone stay
+         * the page's text-field moves. */
+        case KEY_LEFT:
+        case KEY_RIGHT:
+            return (mods & MOD_ALT) != 0;
+        /* Cmd+Shift+Enter fills the tab with the focused pane. */
+        case KEY_ENTER:
+            return (mods & MOD_SHIFT) != 0;
         default:
             return false;
     }
@@ -6404,8 +6434,16 @@ static void platform_close_watch_source(void) {
 static bool platform_watch_file_internal(const char *path) {
     if (!path || !path[0]) return false;
 
-    int fd = open(path, O_EVTONLY);
+    /* O_NONBLOCK: a FIFO at the path opens at once instead of holding the
+     * main thread until something writes to it, and is not watched; the
+     * poll tries again, so a regular file put back is picked up. */
+    int fd = open(path, O_EVTONLY | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) return false;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        return false;
+    }
 
     dispatch_source_t source = dispatch_source_create(
         DISPATCH_SOURCE_TYPE_VNODE, fd,

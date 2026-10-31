@@ -747,6 +747,10 @@ const Theme THEME_Liu = {
     /* The active tab uses a neutral raised surface; violet remains on selection
      * and focus indicators. */
     .tab_active_bg   = { 0.145f, 0.145f, 0.161f, 1.0f },   /* #252529 ink-800 */
+    /* The open tab's pill sits just above the page, not on the raised
+     * surface: a pill as light as a button stood out of the strip, and even
+     * the well's ink-900 read too light; its rim carries the shape. */
+    .tab_pill_bg     = { 0.078f, 0.078f, 0.086f, 1.0f },   /* #141416 */
     .tab_active_fg   = { 0.969f, 0.969f, 0.973f, 1.0f },   /* #F7F7F8 ink-50 = ansi 15 */
     .tab_inactive_bg = { 0.039f, 0.039f, 0.043f, 1.0f },   /* #0A0A0B */
     .tab_inactive_fg = { 0.478f, 0.478f, 0.514f, 1.0f },   /* #7A7A83 ink-500, 4.7:1 */
@@ -958,6 +962,20 @@ Color theme_ui_accent(const Theme *t) {
     return t->ansi[12];
 }
 
+Color theme_tab_pill(const Theme *t) {
+    if (!t) return (Color){ 0.18f, 0.18f, 0.20f, 1.0f };
+    if (t->tab_pill_bg.a > 0.0f) return (Color){ t->tab_pill_bg.r, t->tab_pill_bg.g, t->tab_pill_bg.b, 1.0f };
+    /* tab_active_bg kept at least 0.06 off bg, on the side away from it:
+     * lighter on a dark theme, darker on a light one, so the pill is clearly
+     * filled even where tab_active_bg sits near bg. */
+    bool light = t->bg.r + t->bg.g + t->bg.b > t->fg.r + t->fg.g + t->fg.b;
+    if (light)
+        return (Color){ fminf(t->tab_active_bg.r, t->bg.r - 0.06f), fminf(t->tab_active_bg.g, t->bg.g - 0.06f),
+                        fminf(t->tab_active_bg.b, t->bg.b - 0.06f), 1.0f };
+    return (Color){ fmaxf(t->tab_active_bg.r, t->bg.r + 0.06f), fmaxf(t->tab_active_bg.g, t->bg.g + 0.06f),
+                    fmaxf(t->tab_active_bg.b, t->bg.b + 0.06f), 1.0f };
+}
+
 Color theme_voice_record(const Theme *t) {
     /* The fallback is a canonical red rather than the accent: this is the
      * "your microphone is open" light, and on the many themes whose accent is
@@ -1073,7 +1091,18 @@ AppConfig config_default(void) {
     c.paste_protection = true;
     c.agent_hooks = true;
     c.agent_hooks_notice_seen = false;
+    c.agent_orchestration = true;
+    c.agent_orchestration_max = 3;
+    snprintf(c.agent_orchestration_permission, sizeof c.agent_orchestration_permission, "write");
+    c.agent_orchestration_notice_seen = false;
+    c.agent_orchestration_guard = true;
+    c.agent_subagent_tabs = true;
+    c.agent_jobs_fold = 0;
+    c.agent_orchestration_ask_tools = true;
+    c.agent_orchestration_keep = true;
     c.shell_integration = true;
+    c.resume_agents = true;
+    c.restore_screen = true;
     c.command_marks = false;
     c.secure_keyboard_entry = false;
     c.secure_input_auto = true;
@@ -1554,6 +1583,22 @@ PromptRecallMode config_prompt_recall_parse(const char *s) {
     return PROMPT_RECALL_BADGE;
 }
 
+/* When a tab's job tabs start folded into their count chip
+ * (ui/agentctl_card.h, AgcFoldPolicy): 0 auto, 1 always, 2 never. */
+const char *config_jobs_fold_name(u8 policy) {
+    if (policy == 1) return "always";
+    if (policy == 2) return "never";
+    return "auto";
+}
+
+u8 config_jobs_fold_parse(const char *s) {
+    if (!s) return 0;
+    if (strcmp(s, "always") == 0) return 1;
+    if (strcmp(s, "never") == 0) return 2;
+    if (s[0] >= '0' && s[0] <= '2' && s[1] == '\0') return (u8)(s[0] - '0');
+    return 0;
+}
+
 static bool config_parse_i32(const char *s, i32 *out) {
     if (!s || !out) return false;
     errno = 0;
@@ -1848,6 +1893,11 @@ bool config_load(AppConfig *cfg, const char *filepath) {
             }
             else if (strcmp(key, "notes_vault_path") == 0) snprintf(cfg->notes_vault_path, sizeof(cfg->notes_vault_path), "%s", val);
             else if (strcmp(key, "lang") == 0) snprintf(cfg->lang, sizeof cfg->lang, "%s", val);
+            else if (strcmp(key, "agent_orchestration_permission") == 0) {
+                if (strcmp(val, "read") == 0 || strcmp(val, "write") == 0 || strcmp(val, "full") == 0)
+                    snprintf(cfg->agent_orchestration_permission, sizeof cfg->agent_orchestration_permission,
+                             "%s", val);
+            }
             else if (strcmp(key, "term") == 0) {
                 /* Only the two names Liu can stand behind: anything else
                  * would be a TERM no program here has an entry for. */
@@ -1879,6 +1929,9 @@ bool config_load(AppConfig *cfg, const char *filepath) {
             }
             else if (strcmp(key, "prompt_recall") == 0) {
                 cfg->prompt_recall = config_prompt_recall_parse(val);
+            }
+            else if (strcmp(key, "agent_jobs_fold") == 0) {
+                cfg->agent_jobs_fold = config_jobs_fold_parse(val);
             }
             else if (strcmp(key, "style_active_pane_indicator_color") == 0) {
                 Color color;
@@ -1965,12 +2018,25 @@ bool config_load(AppConfig *cfg, const char *filepath) {
             else if (strcmp(key, "paste_protection") == 0) cfg->paste_protection = strcmp(val, "true") == 0;
             else if (strcmp(key, "agent_hooks") == 0) cfg->agent_hooks = strcmp(val, "true") == 0;
             else if (strcmp(key, "shell_integration") == 0) cfg->shell_integration = strcmp(val, "true") == 0;
+            else if (strcmp(key, "resume_agents") == 0) cfg->resume_agents = strcmp(val, "true") == 0;
+            else if (strcmp(key, "restore_screen") == 0) cfg->restore_screen = strcmp(val, "true") == 0;
             else if (strcmp(key, "command_marks") == 0) cfg->command_marks = strcmp(val, "true") == 0;
             else if (strcmp(key, "secure_keyboard_entry") == 0) cfg->secure_keyboard_entry = strcmp(val, "true") == 0;
             else if (strcmp(key, "secure_input_auto") == 0) cfg->secure_input_auto = strcmp(val, "true") == 0;
             else if (strcmp(key, "ssh_legacy_algorithms") == 0) cfg->ssh_legacy_algorithms = strcmp(val, "true") == 0;
             else if (strcmp(key, "command_history") == 0) cfg->command_history = strcmp(val, "true") == 0;
             else if (strcmp(key, "agent_hooks_notice_seen") == 0) cfg->agent_hooks_notice_seen = strcmp(val, "true") == 0;
+            else if (strcmp(key, "agent_orchestration") == 0) cfg->agent_orchestration = strcmp(val, "true") == 0;
+            else if (strcmp(key, "agent_orchestration_notice_seen") == 0) cfg->agent_orchestration_notice_seen = strcmp(val, "true") == 0;
+            else if (strcmp(key, "agent_orchestration_guard") == 0) cfg->agent_orchestration_guard = strcmp(val, "true") == 0;
+            else if (strcmp(key, "agent_orchestration_ask_tools") == 0) cfg->agent_orchestration_ask_tools = strcmp(val, "true") == 0;
+            else if (strcmp(key, "agent_orchestration_keep") == 0) cfg->agent_orchestration_keep = strcmp(val, "true") == 0;
+            else if (strcmp(key, "agent_subagent_tabs") == 0) cfg->agent_subagent_tabs = strcmp(val, "true") == 0;
+            else if (strcmp(key, "agent_jobs_fold") == 0) cfg->agent_jobs_fold = config_jobs_fold_parse(val);
+            else if (strcmp(key, "agent_orchestration_max") == 0) {
+                i32 v = config_i32_or(val, cfg->agent_orchestration_max);
+                if (v >= 1 && v <= 8) cfg->agent_orchestration_max = v;
+            }
             else if (strcmp(key, "bold_is_bright") == 0) cfg->bold_is_bright = strcmp(val, "true") == 0;
             else if (strcmp(key, "show_scrollbar") == 0) cfg->show_scrollbar = strcmp(val, "true") == 0;
             else if (strcmp(key, "scrollbar_autohide") == 0) cfg->scrollbar_autohide = strcmp(val, "true") == 0;
@@ -2258,12 +2324,23 @@ bool config_save(const AppConfig *cfg, const char *filepath) {
     fprintf(f, "  \"paste_protection\": %s,\n", cfg->paste_protection ? "true" : "false");
     fprintf(f, "  \"agent_hooks\": %s,\n", cfg->agent_hooks ? "true" : "false");
     fprintf(f, "  \"shell_integration\": %s,\n", cfg->shell_integration ? "true" : "false");
+    fprintf(f, "  \"resume_agents\": %s,\n", cfg->resume_agents ? "true" : "false");
+    fprintf(f, "  \"restore_screen\": %s,\n", cfg->restore_screen ? "true" : "false");
     fprintf(f, "  \"command_marks\": %s,\n", cfg->command_marks ? "true" : "false");
     fprintf(f, "  \"secure_keyboard_entry\": %s,\n", cfg->secure_keyboard_entry ? "true" : "false");
     fprintf(f, "  \"secure_input_auto\": %s,\n", cfg->secure_input_auto ? "true" : "false");
     fprintf(f, "  \"ssh_legacy_algorithms\": %s,\n", cfg->ssh_legacy_algorithms ? "true" : "false");
     fprintf(f, "  \"command_history\": %s,\n", cfg->command_history ? "true" : "false");
     fprintf(f, "  \"agent_hooks_notice_seen\": %s,\n", cfg->agent_hooks_notice_seen ? "true" : "false");
+    fprintf(f, "  \"agent_orchestration\": %s,\n", cfg->agent_orchestration ? "true" : "false");
+    fprintf(f, "  \"agent_orchestration_max\": %d,\n", cfg->agent_orchestration_max);
+    fprintf(f, "  \"agent_orchestration_permission\": \"%s\",\n", cfg->agent_orchestration_permission);
+    fprintf(f, "  \"agent_orchestration_notice_seen\": %s,\n", cfg->agent_orchestration_notice_seen ? "true" : "false");
+    fprintf(f, "  \"agent_orchestration_guard\": %s,\n", cfg->agent_orchestration_guard ? "true" : "false");
+    fprintf(f, "  \"agent_orchestration_ask_tools\": %s,\n", cfg->agent_orchestration_ask_tools ? "true" : "false");
+    fprintf(f, "  \"agent_orchestration_keep\": %s,\n", cfg->agent_orchestration_keep ? "true" : "false");
+    fprintf(f, "  \"agent_subagent_tabs\": %s,\n", cfg->agent_subagent_tabs ? "true" : "false");
+    fprintf(f, "  \"agent_jobs_fold\": \"%s\",\n", config_jobs_fold_name(cfg->agent_jobs_fold));
     fprintf(f, "  \"bold_is_bright\": %s,\n", cfg->bold_is_bright ? "true" : "false");
     fprintf(f, "  \"show_scrollbar\": %s,\n", cfg->show_scrollbar ? "true" : "false");
     fprintf(f, "  \"scrollbar_autohide\": %s,\n", cfg->scrollbar_autohide ? "true" : "false");

@@ -59,8 +59,9 @@ typedef struct {
 static IconSlot g_slots[] = {
     [CHAT_TOOL_UNKNOWN]     = ICON_SLOT(NULL, 0),
     [CHAT_TOOL_CLAUDE]      = ICON_SLOT(AGENT_ICON_CLAUDE_data,      AGENT_ICON_CLAUDE_size),
-    [CHAT_TOOL_CODEX]       = ICON_SLOT(AGENT_ICON_CODEX_ONDARK_data,
-                                        AGENT_ICON_CODEX_ONDARK_size),
+    /* Codex wears the ChatGPT app icon: a black knot on its own white plate,
+     * so it reads on either surface and has one cut. */
+    [CHAT_TOOL_CODEX]       = ICON_SLOT(AGENT_ICON_CODEX_data,       AGENT_ICON_CODEX_size),
     [CHAT_TOOL_COPILOT]     = ICON_SLOT(AGENT_ICON_COPILOT_data,     AGENT_ICON_COPILOT_size),
     [CHAT_TOOL_CURSOR]      = ICON_SLOT(AGENT_ICON_CURSOR_data,      AGENT_ICON_CURSOR_size),
     [CHAT_TOOL_AMP]         = ICON_SLOT(AGENT_ICON_AMP_data,         AGENT_ICON_AMP_size),
@@ -75,14 +76,13 @@ static IconSlot g_slots[] = {
     [CHAT_TOOL_ANTIGRAVITY] = ICON_SLOT(AGENT_ICON_ANTIGRAVITY_data, AGENT_ICON_ANTIGRAVITY_size),
     [CHAT_TOOL_KIMI]        = ICON_SLOT(AGENT_ICON_KIMI_data,        AGENT_ICON_KIMI_size),
     [CHAT_TOOL_QWEN]        = ICON_SLOT(AGENT_ICON_QWEN_data,        AGENT_ICON_QWEN_size),
-    [CHAT_TOOL_AIDER]       = ICON_SLOT(AGENT_ICON_AIDER_data,       AGENT_ICON_AIDER_size),
     [CHAT_TOOL_AMAZON_Q]    = ICON_SLOT(AGENT_ICON_AMAZONQ_data,     AGENT_ICON_AMAZONQ_size),
     [CHAT_TOOL_CONTINUE]    = ICON_SLOT(AGENT_ICON_CONTINUE_data,    AGENT_ICON_CONTINUE_size),
     [CHAT_TOOL_WINDSURF]    = ICON_SLOT(AGENT_ICON_WINDSURF_data,    AGENT_ICON_WINDSURF_size),
     [CHAT_TOOL_COMMANDCODE] = ICON_SLOT(AGENT_ICON_COMMANDCODE_data, AGENT_ICON_COMMANDCODE_size),
     [CHAT_TOOL_XAI]         = ICON_SLOT(AGENT_ICON_XAI_ONDARK_data,
                                         AGENT_ICON_XAI_ONDARK_size),
-    /* Pi's mark is a dark plate with a white glyph, so like Codex it is the
+    /* Pi's mark is a dark plate with a white glyph, so like Droid it is the
      * derived inversion that serves the dark surface (g_slots_on_light below
      * holds the vendor file). */
     [CHAT_TOOL_PI]          = ICON_SLOT(AGENT_ICON_PI_ONDARK_data,
@@ -96,6 +96,18 @@ static IconSlot g_slots[] = {
     [CHAT_TOOL_OPENCLAW]    = ICON_SLOT(AGENT_ICON_OPENCLAW_data,    AGENT_ICON_OPENCLAW_size),
     [CHAT_TOOL_HERMES]      = ICON_SLOT(AGENT_ICON_HERMES_ONDARK_data,
                                         AGENT_ICON_HERMES_ONDARK_size),
+    /* Devin, Letta Code and Prime Agent ship flat single-tone marks, which are
+     * inked for the surface; Maki's is coloured. Qoder's light plate and Mastra
+     * Code's black one have a derived cut for the other surface (below). Muse
+     * Code has no artwork here and draws its letter. */
+    [CHAT_TOOL_DEVIN]       = ICON_SLOT(AGENT_ICON_DEVIN_data,       AGENT_ICON_DEVIN_size),
+    [CHAT_TOOL_QODER]       = ICON_SLOT(AGENT_ICON_QODER_data,       AGENT_ICON_QODER_size),
+    [CHAT_TOOL_LETTA]       = ICON_SLOT(AGENT_ICON_LETTA_data,       AGENT_ICON_LETTA_size),
+    [CHAT_TOOL_MASTRACODE]  = ICON_SLOT(AGENT_ICON_MASTRACODE_ONDARK_data,
+                                        AGENT_ICON_MASTRACODE_ONDARK_size),
+    [CHAT_TOOL_MAKI]        = ICON_SLOT(AGENT_ICON_MAKI_data,        AGENT_ICON_MAKI_size),
+    [CHAT_TOOL_MUSE]        = ICON_SLOT(NULL, 0),
+    [CHAT_TOOL_PRIME]       = ICON_SLOT(AGENT_ICON_PRIME_data,       AGENT_ICON_PRIME_size),
 };
 
 #define ICON_SLOT_COUNT ((i32)(sizeof g_slots / sizeof g_slots[0]))
@@ -119,13 +131,11 @@ static IconSlot g_slots_on_light[] = {
                                         AGENT_ICON_KIMI_ONLIGHT_size),
     [CHAT_TOOL_CONTINUE]    = ICON_SLOT(AGENT_ICON_CONTINUE_ONLIGHT_data,
                                         AGENT_ICON_CONTINUE_ONLIGHT_size),
-    /* The mirror image of the two above: Codex, Droid, xAI, Pi and Oh My Pi ship a BLACK badge
+    /* The mirror image of the two above: Droid, xAI, Pi and Oh My Pi ship a BLACK badge
      * (Hermes a black drawing), so the vendor's artwork is already the light-surface cut and it is
      * the DARK panel that swallows it — the badge disappears and only the mark floats, a size
      * smaller than every logo beside it. The vendor file therefore lands HERE and the derived
      * inversion takes the dark slot above. */
-    [CHAT_TOOL_CODEX]       = ICON_SLOT(AGENT_ICON_CODEX_data,
-                                        AGENT_ICON_CODEX_size),
     [CHAT_TOOL_DROID]       = ICON_SLOT(AGENT_ICON_DROID_data,
                                         AGENT_ICON_DROID_size),
     [CHAT_TOOL_XAI]         = ICON_SLOT(AGENT_ICON_XAI_data,
@@ -136,6 +146,13 @@ static IconSlot g_slots_on_light[] = {
                                         AGENT_ICON_OMP_size),
     [CHAT_TOOL_HERMES]      = ICON_SLOT(AGENT_ICON_HERMES_data,
                                         AGENT_ICON_HERMES_size),
+    /* Qoder's vendor file is a light plate (the dark-surface cut above) and its
+     * inversion serves light surfaces; Mastra Code's is a black plate, the
+     * other way round. */
+    [CHAT_TOOL_QODER]       = ICON_SLOT(AGENT_ICON_QODER_ONLIGHT_data,
+                                        AGENT_ICON_QODER_ONLIGHT_size),
+    [CHAT_TOOL_MASTRACODE]  = ICON_SLOT(AGENT_ICON_MASTRACODE_data,
+                                        AGENT_ICON_MASTRACODE_size),
 };
 
 /* Whose mark `tool` wears.
@@ -579,7 +596,6 @@ AgentTint agent_icon_tint(ChatTool tool) {
     case CHAT_TOOL_ANTIGRAVITY: return (AgentTint){0.60f, 0.40f, 0.90f, 1.0f}; /* violet        */
     case CHAT_TOOL_KIMI:        return (AgentTint){0.95f, 0.46f, 0.20f, 1.0f}; /* moonshot orange */
     case CHAT_TOOL_QWEN:        return (AgentTint){0.38f, 0.58f, 0.88f, 1.0f}; /* alibaba blue  */
-    case CHAT_TOOL_AIDER:       return (AgentTint){0.92f, 0.34f, 0.26f, 1.0f}; /* aider red     */
     case CHAT_TOOL_AMAZON_Q:    return (AgentTint){0.97f, 0.60f, 0.20f, 1.0f}; /* aws orange    */
     case CHAT_TOOL_CONTINUE:    return (AgentTint){0.28f, 0.65f, 0.50f, 1.0f}; /* continue teal */
     case CHAT_TOOL_WINDSURF:    return (AgentTint){0.10f, 0.72f, 0.62f, 1.0f}; /* codeium teal  */
@@ -589,6 +605,13 @@ AgentTint agent_icon_tint(ChatTool tool) {
     case CHAT_TOOL_OMP:         return (AgentTint){0.86f, 0.46f, 0.86f, 1.0f}; /* omp orchid    */
     case CHAT_TOOL_OPENCLAW:    return (AgentTint){1.00f, 0.32f, 0.30f, 1.0f}; /* claw red      */
     case CHAT_TOOL_HERMES:      return (AgentTint){0.34f, 0.78f, 0.74f, 1.0f}; /* hermes aqua   */
+    case CHAT_TOOL_DEVIN:       return (AgentTint){0.42f, 0.62f, 0.96f, 1.0f}; /* devin blue    */
+    case CHAT_TOOL_QODER:       return (AgentTint){0.18f, 0.84f, 0.42f, 1.0f}; /* qoder green   */
+    case CHAT_TOOL_LETTA:       return (AgentTint){0.70f, 0.70f, 0.74f, 1.0f}; /* letta grey    */
+    case CHAT_TOOL_MASTRACODE:  return (AgentTint){0.86f, 0.86f, 0.88f, 1.0f}; /* mastra silver */
+    case CHAT_TOOL_MAKI:        return (AgentTint){0.96f, 0.56f, 0.40f, 1.0f}; /* salmon        */
+    case CHAT_TOOL_MUSE:        return (AgentTint){0.30f, 0.52f, 0.98f, 1.0f}; /* muse blue     */
+    case CHAT_TOOL_PRIME:       return (AgentTint){0.92f, 0.92f, 0.94f, 1.0f}; /* prime white   */
     default:                    return (AgentTint){0.55f, 0.55f, 0.60f, 1.0f};
     }
 }
@@ -893,7 +916,6 @@ const char *agent_icon_letter(ChatTool tool) {
     case CHAT_TOOL_ANTIGRAVITY: return "↑";
     case CHAT_TOOL_KIMI:        return "✧";
     case CHAT_TOOL_QWEN:        return "Q";
-    case CHAT_TOOL_AIDER:       return "A";
     case CHAT_TOOL_AMAZON_Q:    return "Q";
     case CHAT_TOOL_CONTINUE:    return "▸";
     case CHAT_TOOL_WINDSURF:    return "W";
@@ -903,6 +925,13 @@ const char *agent_icon_letter(ChatTool tool) {
     case CHAT_TOOL_OMP:         return "ω";
     case CHAT_TOOL_OPENCLAW:    return "🦞";
     case CHAT_TOOL_HERMES:      return "☤";
+    case CHAT_TOOL_DEVIN:       return "D";
+    case CHAT_TOOL_QODER:       return "Q";
+    case CHAT_TOOL_LETTA:       return "L";
+    case CHAT_TOOL_MASTRACODE:  return "M";
+    case CHAT_TOOL_MAKI:        return "M";
+    case CHAT_TOOL_MUSE:        return "M";
+    case CHAT_TOOL_PRIME:       return "P";
     default:                    return "?";
     }
 }

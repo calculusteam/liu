@@ -617,6 +617,23 @@ struct Terminal {
      * only discontinuity and the delta absorbs it. */
     u64      content_writes;
 
+    /* The app's: the restore stream last written for this pane (ui.c,
+     * session_pane_screen) — its file's name, and content_writes and the
+     * history's end when it was written, so a pane that has not changed is
+     * not written again. `replay_owned`: this process created the file, so
+     * it is rewritten under the same name (a restored pane's file came from
+     * an earlier run and is replaced by one of its own). `replay_at`: the
+     * loop clock of the last write, which paces the refresh between saves.
+     * `replay_alt`, `replay_cols`, `replay_rows`: whether the alternate screen
+     * was up, and the grid's size, at that write. */
+    char     replay_name[48];
+    u64      replay_writes;
+    i64      replay_history_end;
+    bool     replay_owned;
+    bool     replay_alt;
+    i32      replay_cols, replay_rows;
+    f64      replay_at;
+
     /* The app's: until when this pane counts as FLOODING — its last drain ran
      * out of budget with bytes still queued (ui.c, poll_drain_pane). Rows are
      * built without ligatures meanwhile: hundreds of lines a frame scroll past

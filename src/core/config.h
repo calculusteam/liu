@@ -74,6 +74,13 @@ typedef struct {
     Color  voice_record;
     Color  voice_accent;
 
+    /* The open tab's pill in the strip and the docked list, same alpha == 0
+     * "not set" convention. Left at zero the pill is tab_active_bg, lifted
+     * off bg if the two sit close; set, it is this colour as it is.
+     * tab_active_bg stays the raised surface everywhere else (buttons,
+     * dialogs' secondary actions). */
+    Color  tab_pill_bg;
+
     /* Optional style overrides — applied to AppConfig when this theme
      * becomes active.  All fields use 0 as the "no override" sentinel
      * so existing zero-initialised built-in themes leave config alone.
@@ -124,6 +131,8 @@ const char **theme_list_names(i32 *count);
  * cyan/blue UI accents. Safe to call with `t == NULL` (returns a neutral
  * default). */
 Color theme_ui_accent(const Theme *t);
+/* The open tab's pill: tab_pill_bg when set, else tab_active_bg lifted off bg. */
+Color theme_tab_pill(const Theme *t);
 
 /* Voice-card colours (see the Theme fields). Both accept t == NULL. */
 Color theme_voice_record(const Theme *t);   /* recording light + live wave  */
@@ -250,6 +259,8 @@ typedef enum {
  * inverse. The parser also accepts "false"/"true" and a bare 0-2. */
 const char *config_prompt_recall_name(PromptRecallMode mode);
 PromptRecallMode config_prompt_recall_parse(const char *s);
+const char *config_jobs_fold_name(u8 policy);
+u8 config_jobs_fold_parse(const char *s);
 
 /* Maximum user-specified fallback fonts in config */
 #define MAX_CONFIG_FALLBACK_FONTS 4
@@ -322,6 +333,12 @@ typedef struct {
     bool    shell_integration;      /* give a pane's zsh or fish the marks Liu reads (OSC 133 prompt / command /
                                      * exit status, OSC 7 folder) by way of its environment — nothing is typed
                                      * into the shell and no file of the user's is edited (default ON) */
+    bool    resume_agents;          /* when Liu reopens its tabs, start an agent that was running in a pane on
+                                     * the session it had (its own resume flag, run by the pane's shell before
+                                     * its first prompt) (default ON) */
+    bool    restore_screen;         /* when Liu reopens its tabs, show each pane's earlier screen and scrollback
+                                     * above the new shell; kept between launches in a private folder
+                                     * (default ON) */
     bool    command_marks;          /* draw the left-margin bars for prompt and output rows and the exit-code
                                      * badge that those marks make possible (default OFF: the marks feed
                                      * history, folder tracking and "command finished" without them) */
@@ -347,6 +364,26 @@ typedef struct {
                                      * Liu edits no agent's files at launch; a hook can still be installed
                                      * by hand in Settings > Notifications. */
     bool    agent_hooks_notice_seen;/* the one-time notice that says so has been shown */
+    bool    agent_orchestration;    /* an agent in a pane may ask Liu to start another agent in a tab of its
+                                     * own (agentctl, `liu-agent`); every request is still put to the user
+                                     * (default ON). While ON, Liu also puts a short skill file that tells
+                                     * Claude Code and Codex about it in their skills folders, and takes it
+                                     * out again on quit. */
+    i32     agent_orchestration_max;/* delegated agents with a turn in flight at once; the rest wait (1-8, 3) */
+    char    agent_orchestration_permission[8]; /* the most a request may ask for: "read", "write"
+                                     * (default) or "full" */
+    bool    agent_orchestration_notice_seen; /* the one-time notice about the skill files has been shown */
+    bool    agent_orchestration_guard;     /* an edit of a path another agent of the team owns is asked about
+                                            * first (the lead's Claude Code) or refused (a delegated Claude) */
+    bool    agent_orchestration_ask_tools; /* a tool a delegated agent's level refuses is put to the user
+                                            * (Claude) instead of failing */
+    bool    agent_orchestration_keep;      /* a delegated agent's turn running when Liu quits is finished,
+                                            * and the job comes back beside its lead's resumed session */
+    bool    agent_subagent_tabs;           /* the subagents an agent in a pane starts itself (Claude Code's
+                                            * Agent tool, Codex's spawned agents…) are shown as job tabs
+                                            * beside its tab, read from the agent's own store (default ON) */
+    u8      agent_jobs_fold;               /* AgcFoldPolicy: when a tab's job tabs start folded into their
+                                            * count chip — 0 auto (past what fits), 1 always, 2 never */
     bool    cursor_blink;
     u8      cursor_style;      /* 0=block, 1=underline, 2=bar */
     bool    bold_is_bright;

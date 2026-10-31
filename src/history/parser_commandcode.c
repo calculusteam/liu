@@ -43,6 +43,10 @@ u32 parser_commandcode_line(Arena *a, const char *line, usize len,
     i64 t_ms = hist_parse_iso8601_ms(hist_cjson_str(root, "timestamp"));
     char *sid_own = hist_strdup(a, hist_cjson_str(root, "sessionId"));
     ChatRole text_role = cc_role(role);
+    /* A line marked isMeta is text Command Code sent and does not draw. */
+    cJSON *md = cJSON_GetObjectItemCaseSensitive(root, "metadata");
+    if (text_role == CHAT_ROLE_USER && md && hist_cjson_bool(md, "isMeta"))
+        text_role = CHAT_ROLE_SYSTEM;
 
     cJSON *content = cJSON_GetObjectItemCaseSensitive(root, "content");
     if (cJSON_IsString(content)) {

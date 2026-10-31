@@ -74,7 +74,19 @@ typedef struct {
     bool    replaying;               /* suppress sidecar writes in rebuild */
 } SugModel;
 
-static _Thread_local SugModel g_sug = { .prev_cmd = SUG_NONE };
+/* One model per thread that asks (the UI facade's worker; a caller of the
+ * synchronous API), allocated on first use. A thread-local VALUE this size
+ * would be copied into every thread that touches any thread-local of the
+ * binary, a whole template per thread. */
+static _Thread_local SugModel *g_sug;
+
+static SugModel *sug_model(void) {
+    if (!g_sug) {
+        g_sug = calloc(1, sizeof *g_sug);
+        if (g_sug) g_sug->prev_cmd = SUG_NONE;
+    }
+    return g_sug;
+}
 
 static const char *sug_str(const SugModel *m, u16 id) {
     return m->arena + m->cmds[id].off;
@@ -362,8 +374,9 @@ static bool sug_fresh(const SugModel *m, const char *dir,
 void cmd_suggest_observe(const char *dir, const char *cmd,
                          const CmdHistoryKey *previous,
                          const CmdHistoryKey *now) {
-    SugModel *m = &g_sug;
     if (!dir || !dir[0] || !cmd || !cmd[0] || !previous || !now) return;
+    SugModel *m = sug_model();
+    if (!m) return;
     if (!m->valid || strcmp(m->dir, dir) != 0) {
         /* A background pane's directory cannot change this model. Keep the
          * hot model; best() still validates its own log's identity. */
@@ -383,8 +396,8 @@ void cmd_suggest_observe(const char *dir, const char *cmd,
 }
 
 void cmd_suggest_feedback(const char *dir, const char *cmd, bool accepted) {
-    SugModel *m = &g_sug;
-    if (!m->valid || !dir || !cmd || strcmp(m->dir, dir) != 0) return;
+    SugModel *m = sug_model();
+    if (!m || !m->valid || !dir || !cmd || strcmp(m->dir, dir) != 0) return;
     u16 id = sug_find(m, cmd);
     if (id == SUG_NONE) return;
     SugCmd *c = &m->cmds[id];
@@ -396,8 +409,9 @@ void cmd_suggest_feedback(const char *dir, const char *cmd, bool accepted) {
 
 const char *cmd_suggest_best(const char *dir, const char *prefix,
                              i32 prefix_len) {
-    SugModel *m = &g_sug;
     if (!dir || !dir[0] || !prefix || prefix_len <= 0) return NULL;
+    SugModel *m = sug_model();
+    if (!m) return NULL;
 
     /* The CmdHistory cache is the freshness source — cmd_history_get costs
      * one stat on its own cache-hit path. */
@@ -510,10 +524,11 @@ const char *cmd_suggest_best(const char *dir, const char *prefix,
 }
 
 void cmd_suggest_shutdown(void) {
-    sug_sidecar_flush(&g_sug);
-    free(g_sug.arena);
-    g_sug.arena = NULL;
-    g_sug.valid = false;
+    if (!g_sug) return;
+    sug_sidecar_flush(g_sug);
+    free(g_sug->arena);
+    free(g_sug);
+    g_sug = NULL;
 }
 
 /* UI facade: only this worker performs file I/O and model rebuilds. The

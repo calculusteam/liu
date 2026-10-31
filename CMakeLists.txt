@@ -276,6 +276,8 @@ if(APPLE)
     # AudioUnitSetProperty, which is how the capture engine is pinned to one.
     find_library(COREAUDIO_FRAMEWORK CoreAudio REQUIRED)
     find_library(AUDIOTOOLBOX_FRAMEWORK AudioToolbox REQUIRED)
+    # FSEvents: the folders a team of agents works in, watched (agentctl_watch.c).
+    find_library(CORESERVICES_FRAMEWORK CoreServices REQUIRED)
     set(PLATFORM_LIBS
         ${COCOA_FRAMEWORK}
         ${OPENGL_FRAMEWORK}
@@ -292,6 +294,7 @@ if(APPLE)
         ${CARBON_FRAMEWORK}
         ${COREAUDIO_FRAMEWORK}
         ${AUDIOTOOLBOX_FRAMEWORK}
+        ${CORESERVICES_FRAMEWORK}
     )
     add_compile_definitions(PLATFORM_MACOS=1 GL_SILENCE_DEPRECATION=1)
 elseif(UNIX)
@@ -742,10 +745,8 @@ function(_embed_png_array var_prefix pngpath)
 endfunction()
 
 _embed_png_array(AGENT_ICON_CLAUDE      "${CMAKE_SOURCE_DIR}/assets/agents/claude.png")
+# Codex: the ChatGPT app icon (a black knot on a white plate), one cut for either surface.
 _embed_png_array(AGENT_ICON_CODEX       "${CMAKE_SOURCE_DIR}/assets/agents/codex.png")
-# Codex, Droid and xAI ship a BLACK badge, which is the light-surface cut —
-# the dark one is derived. scripts/gen_agent_onlight_icons.py.
-_embed_png_array(AGENT_ICON_CODEX_ONDARK "${CMAKE_SOURCE_DIR}/assets/agents/codex-on-dark.png")
 _embed_png_array(AGENT_ICON_COPILOT     "${CMAKE_SOURCE_DIR}/assets/agents/copilot.png")
 _embed_png_array(AGENT_ICON_CURSOR      "${CMAKE_SOURCE_DIR}/assets/agents/cursor.png")
 _embed_png_array(AGENT_ICON_AMP         "${CMAKE_SOURCE_DIR}/assets/agents/amp.png")
@@ -767,7 +768,6 @@ _embed_png_array(AGENT_ICON_KIMI        "${CMAKE_SOURCE_DIR}/assets/agents/kimi.
 # panel, so theirs are derived — scripts/gen_agent_onlight_icons.py.
 _embed_png_array(AGENT_ICON_KIMI_ONLIGHT "${CMAKE_SOURCE_DIR}/assets/agents/kimi-on-light.png")
 _embed_png_array(AGENT_ICON_QWEN        "${CMAKE_SOURCE_DIR}/assets/agents/qwen.png")
-_embed_png_array(AGENT_ICON_AIDER       "${CMAKE_SOURCE_DIR}/assets/agents/aider.png")
 _embed_png_array(AGENT_ICON_AMAZONQ     "${CMAKE_SOURCE_DIR}/assets/agents/amazon-q.png")
 _embed_png_array(AGENT_ICON_CONTINUE    "${CMAKE_SOURCE_DIR}/assets/agents/continue.png")
 _embed_png_array(AGENT_ICON_CONTINUE_ONLIGHT "${CMAKE_SOURCE_DIR}/assets/agents/continue-on-light.png")
@@ -785,6 +785,14 @@ _embed_png_array(AGENT_ICON_OMP_ONDARK  "${CMAKE_SOURCE_DIR}/assets/agents/omp-o
 _embed_png_array(AGENT_ICON_OPENCLAW    "${CMAKE_SOURCE_DIR}/assets/agents/openclaw.png")
 _embed_png_array(AGENT_ICON_HERMES      "${CMAKE_SOURCE_DIR}/assets/agents/hermes.png")
 _embed_png_array(AGENT_ICON_HERMES_ONDARK "${CMAKE_SOURCE_DIR}/assets/agents/hermes-on-dark.png")
+_embed_png_array(AGENT_ICON_DEVIN       "${CMAKE_SOURCE_DIR}/assets/agents/devin.png")
+_embed_png_array(AGENT_ICON_QODER       "${CMAKE_SOURCE_DIR}/assets/agents/qoder.png")
+_embed_png_array(AGENT_ICON_QODER_ONLIGHT "${CMAKE_SOURCE_DIR}/assets/agents/qoder-on-light.png")
+_embed_png_array(AGENT_ICON_LETTA       "${CMAKE_SOURCE_DIR}/assets/agents/letta.png")
+_embed_png_array(AGENT_ICON_MASTRACODE  "${CMAKE_SOURCE_DIR}/assets/agents/mastracode.png")
+_embed_png_array(AGENT_ICON_MASTRACODE_ONDARK "${CMAKE_SOURCE_DIR}/assets/agents/mastracode-on-dark.png")
+_embed_png_array(AGENT_ICON_MAKI        "${CMAKE_SOURCE_DIR}/assets/agents/maki.png")
+_embed_png_array(AGENT_ICON_PRIME       "${CMAKE_SOURCE_DIR}/assets/agents/prime.png")
 _embed_png_array(LIU_SLEEP_ICON         "${CMAKE_SOURCE_DIR}/assets/liu-sleep.png")
 # Sleeping-tab mascot as SVG SOURCE, not a raster: agent_icons.c rewrites the
 # three fill colours to the active theme before rasterising, so the card's
@@ -895,6 +903,7 @@ set(BRIDGE_SOURCES
     # Foundation
     src/history/bridge/ir.c
     src/history/bridge/tool_map.c
+    src/history/bridge/tool_args.c
     src/history/bridge/jsonw.c
     src/history/bridge/compatibility.c
     src/history/bridge/lineage.c
@@ -904,6 +913,7 @@ set(BRIDGE_SOURCES
     # Source parsers: agent store -> BridgeHistory
     src/history/bridge/sources/src_jsonl.c
     src/history/bridge/sources/src_claude.c
+    src/history/bridge/sources/src_commandcode.c
     src/history/bridge/sources/src_codex.c
     src/history/bridge/sources/src_grok.c
     src/history/bridge/sources/src_opencode.c
@@ -919,8 +929,10 @@ set(BRIDGE_SOURCES
     src/history/bridge/writers/writer_grok.c
     src/history/bridge/writers/writer_kimi.c
     src/history/bridge/writers/writer_cline.c
+    src/history/bridge/writers/writer_pi.c
     # Target adapters
     src/history/bridge/targets/target_codex.c
+    src/history/bridge/targets/codex_display.c
     src/history/bridge/targets/target_opencode.c
     src/history/bridge/targets/target_writers.c
     src/history/bridge/targets/target_handoff.c
@@ -958,6 +970,7 @@ set(CORE_SOURCES
     src/terminal/terminal.c
     src/terminal/vt_parser.c
     src/terminal/buffer.c
+    src/terminal/screen_replay.c
     src/terminal/mouse.c
     src/terminal/search.c
     src/terminal/selection.c
@@ -1003,6 +1016,7 @@ set(CORE_SOURCES
     src/ui/a11y_bridge.c
     src/ui/sidebar_sections.c
     src/ui/sidebar_customize.c
+    src/ui/sidebar_reorder.c
     src/ui/lightbox.c
     src/ui/sketch.c
     src/ui/sketch_layout.c
@@ -1024,6 +1038,7 @@ set(CORE_SOURCES
     src/ui/sftp_tab.c
     src/browser/browser_nav.c
     src/browser/browser_viewport.c
+    src/browser/browser_device.c
     src/browser/browser_format.c
     src/ui/filebrowser.c
     src/ui/bg_image.c
@@ -1049,6 +1064,8 @@ set(CORE_SOURCES
     src/history/util.c
     src/history/live_title.c
     src/history/live_title_async.c
+    src/history/agent_session.c
+    src/history/agent_session_async.c
     src/history/parser_claude.c
     src/history/parser_codex.c
     src/history/parser_copilot.c
@@ -1098,6 +1115,17 @@ list(APPEND CORE_SOURCES
     # "Is Liu frontmost?" for the suppression gate, published by the app instead
     # of queried from the window server (which cost a screen-recording prompt).
     src/notify/focus_state.c
+    # Agent control: an agent in a pane starts and drives another agent in a
+    # tab of its own (`liu-agent`, served on a thread of its own).
+    src/agentctl/agentctl_proto.c
+    src/agentctl/agentctl_server.c
+    src/agentctl/agentctl_skill.c
+    src/agentctl/agentctl_stream.c
+    src/agentctl/agentctl_watch.c
+    # The subagents an agent starts itself, read from its own store and shown
+    # as job tabs beside its tab.
+    src/agentctl/agentctl_subread.c
+    src/agentctl/agentctl_subagents.c
 )
 
 # Platform TTS / desktop-notification backend for the in-process server.
@@ -1273,7 +1301,7 @@ endif()
 if(LIU_BROWSER AND APPLE)
     find_library(WEBKIT_FRAMEWORK WebKit REQUIRED)
     list(APPEND PLATFORM_LIBS ${WEBKIT_FRAMEWORK})
-    list(APPEND CORE_SOURCES src/browser/browser_macos.m)
+    list(APPEND CORE_SOURCES src/browser/browser_macos.m src/browser/browser_device_art.c)
     add_compile_definitions(LIU_BROWSER=1)
 elseif(NOT APPLE)
     list(APPEND CORE_SOURCES src/browser/browser_linux.c)
@@ -1407,6 +1435,8 @@ if(APPLE)
     <string>${LIU_MACOS_BUNDLE_ID}</string>
     <key>CFBundleName</key>
     <string>Liu</string>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>Liu uses the microphone when you dictate a prompt with Voice Input, and when you record a custom notification sound. Speech is transcribed on this Mac by default; if you choose a hosted speech service in the Voice settings, your audio is sent to that service.</string>
     <key>NSLocalNetworkUsageDescription</key>
@@ -1547,6 +1577,13 @@ set(NOTIFY_SOURCES
     src/core/utf8.c
     src/core/string_utils.c
     src/core/net.c
+    # `liu-agent` (the same binary under another name): the command an agent
+    # runs to start and drive another agent, and the runner in that agent's tab.
+    src/agentctl/agentctl_proto.c
+    src/agentctl/agentctl_stream.c
+    src/agentctl/client.c
+    src/agentctl/runner.c
+    third_party/cjson/cJSON.c
 )
 
 set(NOTIFY_PLATFORM_LIBS "")
@@ -1590,6 +1627,7 @@ add_executable(liu-notify ${NOTIFY_SOURCES} ${NOTIFY_ASM_SOURCES})
 target_include_directories(liu-notify PRIVATE
     src
     third_party
+    third_party/cjson
 )
 
 # utf8.c interns grapheme clusters under a mutex (the table is paged and grows).

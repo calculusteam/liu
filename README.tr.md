@@ -55,6 +55,14 @@ Cmd+K ile komut paletini açın, ardından "agent history" yazarak yüklü tüm 
 
 Liu, ajanı sekme başına değil, her bölme için izler. Sekme kendini ajanın sohbetine göre adlandırır, ajan çalıştıran her bölme için bir logo taşır ve çıktı üretilirken bir etkinlik çubuğu süzülür. İşaretçiyi üzerinde tutun; bir panel her bölmeyi listeler: ajan, sohbet konusu ve `working 1m 12s` ya da `idle 40s` yazan bir rozet. Bir ajan çalışma dilimini bitirdiğinde o sekmenin altına bir kart iner ve tamamlanma sesi çalar.
 
+### Ajanlar Ajan Başlatır
+
+Bir bölmedeki ajan işi Liu üzerinden başka bir ajana devredebilir: `liu-agent start codex "port the tests"`. Liu önce size sorar, sonra onu isteyen sekmenin sağına bitişik küçük bir iş sekmesi olarak çalıştırır: durumunu gösteren hareketli bir pusun üzerinde logosu. İşaretçiyi üzerinde tutun, en yeni satırlarını görün; tıklayın, sohbeti açılsın: sıradaki turu gönderin, durdurun ya da oturumunu bir bölmede sürdürün. Birlikte başlatılan ajanlar ekip olarak çalışır; ikisi aynı dosyaya dokunduğunda haberdar edilirler.
+
+### Alt Ajan Sekmeleri
+
+Bir ajan kendi alt ajanlarını başlattığında (Claude Code'un Agent aracı, Codex, OpenCode, Copilot CLI, Cursor, Qwen Code, Droid, Crush ve diğerleri), her biri ajanın sekmesinin yanında bir iş sekmesi olur ve ajanın kendi kayıtlarından canlı okunur. Beş alt ajan, beş sekme; her birinin pusu kendine ait bir görüntü. Birinin üzerinde durun, en yeni satırlarını görün; tıklayın, tüm kaydını açın. Bittiğinde her biri tamamlandı ya da başarısız olarak görünür ve bir sonraki isteminizde temizlenir.
+
 ### Sesli Komut
 
 **⌘⇧M**'ye basın ve konuşun. Whisper large-v3-turbo bu Mac'te çalışır (ağ yok, hesap yok, hiçbir şey yüklenmez) ve kelimeler hangi bölme odaktaysa oraya yazılır; yani Claude Code'da da, düz bir kabukta da, bir REPL'de de çalışır. Canlı dalga formu mikrofonun gerçekte ne duyduğunu gösterir; durduğunuzda iz donar ve ses yazıya dökülürken üzerinden bir tarama geçer. Mikrofonu seçin, Whisper'ın bildiği 100 dilden birini seçin ya da bunun yerine bulut tabanlı bir konuşma API'sine yönlendirin.
@@ -85,7 +93,7 @@ Her not tek bir Kasa'da yaşar. **⌘K** → Not Oluştur, yerel bir ajanın do�
 
 ### Yerleşik Bildirim Sistemi
 
-`liu-notify`, AI ajanları gerçekten size ihtiyaç duyduğunda (ve yalnızca o zaman) sesli uyarı, masaüstü bildirimi veya kişiselleştirilmiş bir ses çalar. Liu kapalıyken bile çalışan, kendi başına bir arka plan servisidir.
+`liu-notify`, AI ajanları gerçekten size ihtiyaç duyduğunda (ve yalnızca o zaman) sesli uyarı, masaüstü bildirimi veya kişiselleştirilmiş bir ses çalar. Liu'nun içinde çalışır: kancalar açılışta ajanlarınıza eklenir ve Liu kapanınca kaldırılır; böylece başka yerde çalıştırdığınız ajanlar etkilenmez.
 
 ### Token Tasarrufu
 
@@ -103,6 +111,10 @@ Tek **⌘K** ile her komut, ayar, sunucu, snippet, tema ve Ajan Geçmişi kaydı
 
 32 sekmeye kadar, her birinde H/V split ağacında 8 bölmeye kadar. Bölme sürükle-bırak. **⌘⇧I** tüm aktif bölmelere aynı komutu eşzamanlı yayınlar. Bir sekmeyi dışarı sürükleyerek yeni pencere açın ya da başka bir pencerenin sekme şeridine bırakarak ona katın. Çıkıp yeniden açtığınızda Liu sekmelerinizi geri getirir.
 
+### Kaldığınız Yerden Devam
+
+Liu çalışırken sekmelerinizi kaydeder; çıkış, çökme ya da yeniden başlatma sonrası aynı pencereler, sekmeler, bölmeler ve klasörler geri gelir, her bölme önceki ekranını soluk bir `Restored session` satırının üzerinde gösterir. Çalışmakta olan bir ajan, kabuk tarafından kendi oturumunda yeniden başlatılır (Claude Code, Codex, OpenCode ve devam bayrağı olan her ajan); içine hiçbir şey yazılmaz.
+
 ### Dosya Tarayıcı
 
 Kenar çubuğunda yerel + SFTP tarayıcı, tek tıkla açma. NSFilePromise sürükle-bırak Finder'a dosya transferi arka planda. 32 MiB LRU görüntü önbelleği. Odaklı bölmenin çalışma dizininde açılır. Finder'dan bir dosyayı bölmeye bırakırsanız yolu isteme yazılır; bölme bir SSH oturumuysa dosya SFTP ile yüklenir.
@@ -113,7 +125,7 @@ N dakika boşta kalan sekmeler kendini otomatik askıya alır: CPU ve RAM nerede
 
 ### Sekme Grupları
 
-İlgili terminalleri sekme çubuğunda adlandırılmış, renk kodlu gruplara toplayın, Chrome tarzı. **⌘⇧G**, sürükle-bırak veya sağ tıkla ile oluşturun. Bir grubu daraltıp sekmelerini gizleyin ve uyutun, PTY/SSH bağlantılarını serbest bırakın. 8 renklik paletten yeniden renklendirin, satır içinde yeniden adlandırın, grubu çözün veya tüm grubu tek seferde kapatın. Adlandırılmış, renkli gruplar yeniden başlatmalarda korunur: aynı anda en fazla 8 grup.
+İlgili terminalleri sekme çubuğunda adlandırılmış, renk kodlu gruplara toplayın, Chrome tarzı. Sekmenin sağ tık menüsünden veya komut paletinden oluşturun; sekmeleri sürükleyerek gruba alın ya da çıkarın. Bir grubu daraltıp sekmelerini gizleyin ve uyutun, PTY/SSH bağlantılarını serbest bırakın. 8 renklik paletten yeniden renklendirin, satır içinde yeniden adlandırın, grubu çözün veya tüm grubu tek seferde kapatın. Adlandırılmış, renkli gruplar yeniden başlatmalarda korunur: aynı anda en fazla 8 grup.
 
 ### Site Manager
 

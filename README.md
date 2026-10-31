@@ -55,6 +55,14 @@ Press Cmd+K to open the command palette, then type "agent history" to browse eve
 
 Liu tracks the agent in every split pane, not just in every tab. A tab names itself after the agent's own chat, carries one logo per agent pane, and sweeps an activity bar while output is being produced. Rest the pointer on it and a panel lists each pane: agent, chat topic, and a pill reading `working 1m 12s` or `idle 40s`. When an agent finishes a stretch of work, a card drops in under that tab and the completion sound plays.
 
+### Agents Start Agents
+
+An agent in a pane can hand work to another through Liu: `liu-agent start codex "port the tests"`. Liu asks you first, then runs it as a small job tab joined to the right of the asking tab: its logo over a moving haze that shows its state. Rest the pointer on it for its newest lines; click it for its chat, where you can send the next turn, stop it, or continue its session in a pane. Agents started together work as a team and are told when two of them touch the same file.
+
+### Subagent Tabs
+
+When an agent starts subagents of its own (Claude Code's Agent tool, Codex, OpenCode, Copilot CLI, Cursor, Qwen Code, Droid, Crush and more), each becomes a job tab beside the agent's tab, read live from the agent's own records. Five subagents, five tabs, each haze a picture of its own. Rest on one for its newest lines, click it for its whole log; each reads done or failed when it ends, and they clear at your next prompt.
+
 ### Voice Prompt
 
 Press **⌘⇧M** and talk. Whisper large-v3-turbo runs on this Mac (no network, no account, nothing uploaded) and the words are typed into whichever pane has focus, so it works in Claude Code, in a plain shell, in a REPL. A live waveform shows what the microphone is actually hearing; when you stop, the trace freezes and a scan runs across it while the audio is transcribed. Pick the microphone, pick from all 100 languages Whisper knows, or point it at a hosted speech API instead.
@@ -85,7 +93,7 @@ Every note lives in one Vault. **⌘K** → Create Note lets a local agent draft
 
 ### Built-in notification system
 
-`liu-notify` speaks only when an agent truly needs you, and only then: a voice alert, a desktop banner, or a custom sound. A standalone background service that keeps running even when Liu is closed.
+`liu-notify` speaks only when an agent truly needs you, and only then: a voice alert, a desktop banner, or a custom sound. It runs inside Liu: the hooks go into your agents at launch and are removed when Liu quits, so agents you run elsewhere are not affected.
 
 ### Token Saving
 
@@ -103,6 +111,10 @@ A single **⌘K** fuzzy-searches every command, setting, host, snippet, theme an
 
 Up to 32 tabs, each with up to 8 panes in any H/V split tree. Pane drag-and-drop. **⌘⇧I** broadcasts input to every active pane simultaneously. Drag a tab out to make a window, or onto another window's tab strip to join it. Quit and relaunch, and Liu reopens the tabs you had.
 
+### Resume Where You Left Off
+
+Liu saves your tabs while it runs, so a quit, a crash or a restart brings back the same windows, tabs, splits and folders, each pane showing its earlier screen above a dim `Restored session` line. An agent that was running is started again on its own session by the shell (Claude Code, Codex, OpenCode and every agent with a resume flag), nothing typed into it.
+
 ### File Browser
 
 Sidebar local + SFTP browser with one-click open. NSFilePromise drag-to-Finder transfers files in the background. 32 MiB LRU image cache. The browser opens at the focused pane's working directory. Drop a Finder file on a pane and its path is typed into the prompt for you, or uploaded over SFTP when that pane is an SSH session.
@@ -113,7 +125,7 @@ Tabs idle for N minutes auto-suspend: CPU and RAM drop to near zero. Click to in
 
 ### Group Tabs
 
-Cluster related terminals into named, colour-coded groups right in the tab bar, Chrome-style. Create with **⌘⇧G**, drag-and-drop, or right-click. Collapse a group to hide its tabs and put them to sleep, freeing their PTY/SSH connections. Recolour from an 8-colour palette, rename inline, ungroup, or close a whole group at once. Named, coloured groups survive restarts: up to 8 at a time.
+Cluster related terminals into named, colour-coded groups right in the tab bar, Chrome-style. Create one from a tab's right-click menu or the command palette, and drag tabs in and out. Collapse a group to hide its tabs and put them to sleep, freeing their PTY/SSH connections. Recolour from an 8-colour palette, rename inline, ungroup, or close a whole group at once. Named, coloured groups survive restarts: up to 8 at a time.
 
 ### Site Manager
 

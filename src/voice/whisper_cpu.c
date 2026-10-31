@@ -74,6 +74,10 @@ struct WhisperCpu {
     /* Self-attention KV cache, [n_layer_t][n_ctx_t][n_state]. */
     f32 *self_k, *self_v;
     i32  kv_len;
+
+    /* One dequantized row each: a layer norm's gain and bias and a
+     * convolution's bias, [n_state]. */
+    f32 *norm_g, *norm_b, *conv_bias;
 };
 
 static f32 *wc_alloc(WhisperCpu *c, usize n, bool *ok) {
@@ -95,6 +99,7 @@ void whisper_cpu_free(WhisperCpu *c) {
     free(c->x); free(c->xn); free(c->q); free(c->k); free(c->v);
     free(c->att); free(c->ff); free(c->scores);
     free(c->cross_k); free(c->cross_v); free(c->self_k); free(c->self_v);
+    free(c->norm_g); free(c->norm_b); free(c->conv_bias);
     mem_budget_transient_adjust(MEM_VOICE, -(isize)c->accounted);
     free(c);
 }
@@ -179,6 +184,9 @@ WhisperCpu *whisper_cpu_create(const WhisperWeights *w, i32 n_threads,
     c->cross_v = wc_alloc(c, (usize)c->n_layer_t * ta * ns, &ok);
     c->self_k  = wc_alloc(c, (usize)c->n_layer_t * (usize)c->n_ctx_t * ns, &ok);
     c->self_v  = wc_alloc(c, (usize)c->n_layer_t * (usize)c->n_ctx_t * ns, &ok);
+    c->norm_g    = wc_alloc(c, ns, &ok);
+    c->norm_b    = wc_alloc(c, ns, &ok);
+    c->conv_bias = wc_alloc(c, ns, &ok);
 
     if (!ok) {
         if (err && err_cap) snprintf(err, err_cap, "out of memory");
@@ -333,9 +341,8 @@ static void wc_norm_slice(void *p, i32 begin, i32 end, i32 ith) {
 static bool wc_layernorm(WhisperCpu *c, f32 *x, i32 M,
                          const WhisperTensor *gw, const WhisperTensor *bw) {
     const i32 n = c->n_state;
-    /* n_state is 1280 for every Whisper size; the stack copies stay small. */
-    static _Thread_local f32 g[8192], b[8192];
-    if ((usize)n > sizeof g / sizeof *g) return false;
+    f32 *g = c->norm_g, *b = c->norm_b;
+    if (!g || !b) return false;
     if (!whisper_dequant_row(gw->data, gw->dtype, n, g)) return false;
     if (!whisper_dequant_row(bw->data, bw->dtype, n, b)) return false;
     WcNorm L = { x, g, b, n };
@@ -381,8 +388,8 @@ static void wc_conv_slice(void *p, i32 begin, i32 end, i32 ith) {
 static bool wc_conv1d(WhisperCpu *c, const f32 *in, i32 in_ch, i32 t_in,
                       const WhisperTensor *W, const WhisperTensor *B,
                       i32 stride, f32 *out, i32 out_ch, i32 t_out) {
-    static _Thread_local f32 bias[8192];
-    if ((usize)out_ch > sizeof bias / sizeof *bias) return false;
+    f32 *bias = c->conv_bias;
+    if (!bias || out_ch > c->n_state) return false;
     if (!whisper_dequant_row(B->data, B->dtype, out_ch, bias)) return false;
 
     const f32 *wq = wc_dequant(c, W);

@@ -298,6 +298,36 @@ static void copy_fitted(char *dst, usize cap, const char *src) {
     while (n > 0 && dst[n - 1] == ' ') dst[--n] = '\0';
 }
 
+usize agent_screen_text(Terminal *t, char *out, usize cap) {
+    if (!out || cap == 0) return 0;
+    out[0] = '\0';
+    if (!t || !t->cells || t->cols <= 0 || t->rows <= 0) return 0;
+    usize pos = 0;
+    for (i32 row = 0; row < t->rows; row++) {
+        i32 len = 0;
+        const Cell *cells = terminal_visible_row(t, row, &len);
+        if (!cells) continue;
+        if (len > t->cols) len = t->cols;
+        usize line_start = pos;
+        for (i32 x = 0; x < len; x++) {
+            u32 cp = cells[x].codepoint;
+            if (cp == 0) cp = ' ';
+            u8 tmp[24];
+            u32 n = (cp & (1u << 30)) ? utf8_cluster_encode(cp, tmp, sizeof tmp) : utf8_encode(cp, tmp);
+            if (n == 0) continue;
+            if (pos + n + 2 >= cap) { out[pos] = '\0'; return pos; }
+            for (u32 k = 0; k < n; k++) out[pos++] = (tmp[k] < 0x20) ? ' ' : (char)tmp[k];
+        }
+        while (pos > line_start && out[pos - 1] == ' ') pos--;
+        /* a row's newline and the final NUL need room too: an empty row
+         * adds one byte with no character before it */
+        if (pos + 2 > cap) { out[pos] = '\0'; return pos; }
+        out[pos++] = '\n';
+    }
+    out[pos] = '\0';
+    return pos;
+}
+
 bool agent_activity_scan(Terminal *t, char *out, usize cap) {
     if (!out || cap == 0) return false;
     out[0] = '\0';

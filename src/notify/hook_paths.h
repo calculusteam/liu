@@ -33,5 +33,9 @@
 /* Pi and Oh My Pi load every .ts in their extensions folder: files Liu owns. */
 #define LIU_HOOK_PI_REL           ".pi/agent/extensions/liu-notify.ts"
 #define LIU_HOOK_OMP_REL          ".omp/agent/extensions/liu-notify.ts"
+/* Devin CLI and Qoder CLI read Claude Code's hook format from settings files
+ * that are the user's. */
+#define LIU_HOOK_DEVIN_REL        ".config/devin/config.json"
+#define LIU_HOOK_QODER_REL        ".qoder/settings.json"
 
 #endif /* NOTIFY_HOOK_PATHS_H */

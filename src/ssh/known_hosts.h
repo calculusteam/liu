@@ -60,6 +60,11 @@ i32  known_hosts_list(KnownHostEntry *entries, i32 max_entries);
 bool known_hosts_remove_entry(const char *hostname, i32 port);
 bool known_hosts_remove_all(void);
 
+/* True when ~/.ssh or its known_hosts is there but refused as the trust store:
+ * not the user's, not a plain folder / file, or writable by another user.
+ * Says why a verification ended in HOST_KEY_ERROR. */
+bool known_hosts_store_unsafe(void);
+
 /* Host key revocation check (checks ~/.ssh/revoked_keys) */
 bool known_hosts_is_revoked(LIBSSH2_SESSION *session);
 

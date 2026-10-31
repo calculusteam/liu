@@ -241,6 +241,8 @@ bool sbc_mouse_move(AppState *app, f32 x, f32 y) {
             if (app->config.sidebar_order[i] == app->sbc_drag_id) { cur = i; break; }
         i32 want = sbc_slot_for_top(&L, y - app->sbc_drag_grab);
         if (cur >= 0 && want != cur) {
+            /* The bar beside the panel glides to the new order. */
+            app_side_slide_begin(app, app->sbc_drag_id, -1.0f);
             sbc_order_move(app->config.sidebar_order, SB_SEC_COUNT, cur, want);
             app->sbc_dirty = true;
         }

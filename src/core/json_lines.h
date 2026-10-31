@@ -20,8 +20,11 @@
 
 #include "core/types.h"
 
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 /* `src` (n bytes) laid out, NUL-terminated, in a malloc'd buffer of at most
  * 2n + 1 bytes; its length in `*out_n`. NULL when memory runs out. */
@@ -63,10 +66,16 @@ static inline char *json_lay_out_members(const char *src, usize n, usize *out_n)
 
 /* A whole settings file, NUL-terminated, in a malloc'd buffer; its length in
  * `*n_out`. NULL when it is missing, unreadable or longer than `max` — the
- * files are hand-editable, not unbounded. */
+ * files are hand-editable, not unbounded. Anything but a regular file (a FIFO
+ * would hold the caller until something wrote to it) reads as missing; a
+ * symbolic link is followed. */
 static inline char *json_read_file(const char *path, usize max, usize *n_out) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
+    int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return NULL;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) { close(fd); return NULL; }
+    FILE *f = fdopen(fd, "rb");
+    if (!f) { close(fd); return NULL; }
     usize cap = 4096, n = 0;
     char *buf = (char *)malloc(cap);
     while (buf) {

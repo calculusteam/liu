@@ -25,6 +25,12 @@
  * parent chain is `parentId` -> the previous line's `id`, same structural
  * role as Claude's parentUuid.
  *
+ * Text the model reads but the user did not say — the note that the
+ * conversation was imported, a source's context or summary — carries
+ * `metadata.isMeta`, which Command Code sends and does not draw. Tool calls
+ * are written as Command Code's own tools with its arguments (tool_args.h);
+ * a result names its call's tool.
+ *
  * Resume uses `commandcode --session <path>` rather than --resume: its
  * --resume matches an id OR a conversation name and only looks inside the
  * current directory's project bucket, so resuming from a pane sitting
@@ -32,7 +38,10 @@
  */
 #include "history/bridge/writers.h"
 #include "history/bridge/jsonw.h"
+#include "history/bridge/tool_args.h"
 #include "history/bridge/tool_map.h"
+
+#include "cJSON.h"
 #include "history/util.h"
 
 #include <stdio.h>
@@ -62,7 +71,8 @@ static void cc_envelope(JsonW *w, const BridgeHistory *h, const char *sid,
     (void)h;
 }
 
-static void cc_trailer(JsonW *w, const BridgeHistory *h, const char *id, i64 ts) {
+static void cc_trailer_meta(JsonW *w, const BridgeHistory *h, const char *id, i64 ts,
+                            bool hidden) {
     if (h->git_branch) jsonw_str(w, "gitBranch", h->git_branch);
     jsonw_obj_begin(w, "metadata");
     char iso[40];
@@ -71,7 +81,40 @@ static void cc_trailer(JsonW *w, const BridgeHistory *h, const char *id, i64 ts)
     jsonw_str(w, "source", "cli");
     jsonw_str(w, "messageId", id);
     jsonw_i64(w, "version", 2);
+    if (hidden) jsonw_bool(w, "isMeta", true);
     jsonw_obj_end(w);
+}
+
+static void cc_trailer(JsonW *w, const BridgeHistory *h, const char *id, i64 ts) {
+    cc_trailer_meta(w, h, id, ts, false);
+}
+
+/* The call at `index` as Command Code's own: its name into `name` and its
+ * arguments as JSON (malloc'd), or NULL. */
+static char *cc_call(const BridgeHistory *h, usize index, char *name, usize cap) {
+    BridgeCallFacts f;
+    bridge_call_facts(&h->events[index], bridge_result_for(h, index), &f);
+    cJSON *args = NULL;
+    char *json = NULL;
+    if (bridge_call_in_vocab(BRIDGE_VOCAB_COMMANDCODE, &f, name, cap, &args) && name[0])
+        json = cJSON_PrintUnformatted(args);
+    cJSON_Delete(args);
+    bridge_call_facts_free(&f);
+    return json;
+}
+
+/* The name the call a result at `ri` answers was written under. */
+static void cc_result_name(const BridgeHistory *h, usize ri, char *name, usize cap) {
+    const BridgeEvent *r = &h->events[ri];
+    hist_copy_bounded(name, cap, "shell_command");
+    for (usize k = ri; k-- > 0 && ri - k <= 4096;) {
+        const BridgeEvent *c = &h->events[k];
+        if (c->type == BRIDGE_EVENT_TOOL_CALL && c->tool_call_id && r->tool_call_id &&
+            !strcmp(c->tool_call_id, r->tool_call_id)) {
+            free(cc_call(h, k, name, cap));
+            return;
+        }
+    }
 }
 
 bool bridge_write_commandcode_session(const BridgeHistory *h, const char *session_id,
@@ -85,8 +128,7 @@ bool bridge_write_commandcode_session(const BridgeHistory *h, const char *sessio
     u32  warnings = 0;
     i64  now = bridge_now_ms();
 
-    /* Provenance as the first user turn, for the same reason as Claude's:
-     * this format has no system channel that survives a resume. */
+    /* Provenance: the first user turn, sent and not drawn. */
     {
         char id[64];
         if (!bridge_new_uuid(id, sizeof id)) { jsonw_close(&w, true); return false; }
@@ -107,7 +149,7 @@ bool bridge_write_commandcode_session(const BridgeHistory *h, const char *sessio
         jsonw_str(&w, "text", note);
         jsonw_obj_end(&w);
         jsonw_arr_end(&w);
-        cc_trailer(&w, h, id, now);
+        cc_trailer_meta(&w, h, id, now, true);
         jsonw_obj_end(&w);
         jsonw_raw_newline(&w);
         hist_copy_bounded(prev, sizeof prev, id);
@@ -145,7 +187,7 @@ bool bridge_write_commandcode_session(const BridgeHistory *h, const char *sessio
             }
             jsonw_obj_end(&w);
             jsonw_arr_end(&w);
-            cc_trailer(&w, h, id, ts);
+            cc_trailer_meta(&w, h, id, ts, e->type != BRIDGE_EVENT_USER);
             jsonw_obj_end(&w);
             jsonw_raw_newline(&w);
             hist_copy_bounded(prev, sizeof prev, id);
@@ -171,21 +213,20 @@ bool bridge_write_commandcode_session(const BridgeHistory *h, const char *sessio
                     }
                     j++;
                 } else if (b->type == BRIDGE_EVENT_TOOL_CALL) {
-                    const char *name = bridge_tool_name_for(CHAT_TOOL_COMMANDCODE, b->tool_kind);
-                    if (!name) name = b->tool_name;
-                    if (name && name[0]) {
+                    char name[128];
+                    char *args = cc_call(h, j, name, sizeof name);
+                    if (args) {
                         jsonw_obj_begin(&w, NULL);
                         jsonw_str(&w, "type", "tool-call");
                         jsonw_str(&w, "toolCallId", b->tool_call_id);
                         jsonw_str(&w, "toolName", name);
-                        jsonw_raw_or_str(&w, "input",
-                                         b->tool_input && b->tool_input[0]
-                                             ? b->tool_input : "{}");
+                        jsonw_raw_or_str(&w, "input", args);
                         jsonw_obj_end(&w);
                         any = true;
                     } else {
                         warnings++;
                     }
+                    free(args);
                     j++;
                 } else {
                     break;
@@ -209,12 +250,12 @@ bool bridge_write_commandcode_session(const BridgeHistory *h, const char *sessio
             jsonw_arr_begin(&w, "content");
             while (j < h->event_count && h->events[j].type == BRIDGE_EVENT_TOOL_RESULT) {
                 const BridgeEvent *b = &h->events[j];
-                const char *name = bridge_tool_name_for(CHAT_TOOL_COMMANDCODE, b->tool_kind);
-                if (!name) name = b->tool_name;
+                char name[128];
+                cc_result_name(h, j, name, sizeof name);
                 jsonw_obj_begin(&w, NULL);
                 jsonw_str(&w, "type", "tool-result");
                 jsonw_str(&w, "toolCallId", b->tool_call_id);
-                jsonw_str(&w, "toolName", name ? name : "shell_command");
+                jsonw_str(&w, "toolName", name);
                 jsonw_str(&w, "output", b->tool_output ? b->tool_output : "");
                 jsonw_obj_end(&w);
                 j++;

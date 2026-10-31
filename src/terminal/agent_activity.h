@@ -74,6 +74,10 @@
  */
 bool agent_activity_scan(Terminal *t, char *out, usize cap);
 
+/* The visible screen as text, one row a line, trailing blanks dropped;
+ * returns its length (cut at `cap`). */
+usize agent_screen_text(Terminal *t, char *out, usize cap);
+
 /* The line classifier, exposed for tests: given the text of one row (already
  * stripped of its rail and marker), does it read as a spinner/status line?
  * Returns false for an action line. */

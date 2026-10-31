@@ -61,7 +61,7 @@ static bool atomic_write(const char *path, const char *text) {
 
 /* Read a whole file into a malloc'd NUL-terminated buffer, or NULL. */
 static char *read_text(const char *path) {
-    FILE *f = fopen(path, "rb");
+    FILE *f = atomic_file_open_regular(path);   /* a FIFO is refused, not waited on */
     if (!f) return NULL;
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
     long sz = ftell(f);
@@ -109,7 +109,7 @@ static bool write_through(const char *path, const char *text) {
  *   - returns the malloc'd contents on success (*absent = false). */
 static char *read_text_distinguish(const char *path, bool *absent) {
     *absent = false;
-    FILE *f = fopen(path, "rb");
+    FILE *f = atomic_file_open_regular(path);   /* a FIFO is refused, not waited on */
     if (!f) { *absent = (errno == ENOENT); return NULL; }
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
     long sz = ftell(f);
@@ -1141,7 +1141,8 @@ bool agent_hook_supported(const char *id) {
     return !strcmp(id, "claude") || !strcmp(id, "grok") ||
            !strcmp(id, "codex")  || !strcmp(id, "opencode") ||
            !strcmp(id, "antigravity") || !strcmp(id, "commandcode") ||
-           !strcmp(id, "pi") || !strcmp(id, "omp");
+           !strcmp(id, "pi") || !strcmp(id, "omp") ||
+           !strcmp(id, "devin") || !strcmp(id, "qoder");
 }
 
 AgentHookResult agent_hook_install(const char *id, const char *bin) {
@@ -1154,6 +1155,8 @@ AgentHookResult agent_hook_install(const char *id, const char *bin) {
     if (!strcmp(id, "commandcode")) return commandcode_hooks_install(bin);
     if (!strcmp(id, "pi"))          return pi_install(bin);
     if (!strcmp(id, "omp"))         return omp_install(bin);
+    if (!strcmp(id, "devin"))       return devin_hooks_install(bin);
+    if (!strcmp(id, "qoder"))       return qoder_hooks_install(bin);
     return result(false, "%s: no hook integration", id);
 }
 
@@ -1177,6 +1180,8 @@ AgentHookResult agent_hook_uninstall(const char *id) {
     if (!strcmp(id, "commandcode")) return commandcode_hooks_uninstall();
     if (!strcmp(id, "pi"))          return pi_uninstall();
     if (!strcmp(id, "omp"))         return omp_uninstall();
+    if (!strcmp(id, "devin"))       return devin_hooks_uninstall();
+    if (!strcmp(id, "qoder"))       return qoder_hooks_uninstall();
     return result(false, "%s: no hook integration", id);
 }
 
@@ -1190,5 +1195,7 @@ bool agent_hook_installed(const char *id) {
     if (!strcmp(id, "commandcode")) return commandcode_hooks_installed();
     if (!strcmp(id, "pi"))          return pi_is_installed();
     if (!strcmp(id, "omp"))         return omp_is_installed();
+    if (!strcmp(id, "devin"))       return devin_hooks_installed();
+    if (!strcmp(id, "qoder"))       return qoder_hooks_installed();
     return false;
 }

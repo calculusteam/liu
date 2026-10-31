@@ -24,8 +24,11 @@
 #include "ssh/known_hosts.h"
 #include "ui/agent_icons.h"   /* TEMP */
 #include "ui/agent_resume.h"  /* codex_thread_uuid — the resume argv */
+#include "ui/agent_catalog.h" /* the agents Liu can start and resume */
 #include "ui/ui.h"
 #include "ui/pane_sessions.h"
+#include "ui/pane_zoom.h"
+#include "ui/pane_nav.h"
 #include "ui/bench_metrics.h"
 #include "ui/effective_settings.h"
 #include "ui/a11y_text.h"
@@ -79,6 +82,9 @@
 #include "ui/agent_input.h"
 #include "core/theme_import.h"
 #include "core/agent_detect.h"
+#include "agentctl/agentctl.h"
+#include "agentctl/agentctl_subagents.h"
+#include "agentctl/agentctl_skill.h"
 #include "core/cmd_history.h"
 #include "core/folder_history.h"
 #include "core/cmd_suggest.h"
@@ -164,6 +170,8 @@ static PlatformWindow *g_window_ptr = NULL;
 /* Multi-window helpers, defined with the window table further down but needed
  * by app-layer helpers that sit above it. */
 static void liu_broadcast_config(const AppState *src, bool reload_font);
+static void liu_agentctl_apply_config(const AppConfig *c);
+static void liu_agentctl_skills_remove(void);
 static void liu_config_commit(AppState *app);
 static void liu_new_window_from(AppState *a);
 static void liu_broadcast_keybindings(const AppState *src);
@@ -3395,7 +3403,10 @@ static bool browser_inject_body_to_agent(AppState *app, const char *body,
     body = safe + 6;
     bool input_refused = false;
 
-    /* Find agent target: focused tab first, then any terminal tab. */
+    /* Find agent target: focused tab first, then any terminal tab. Inside a
+     * tab, the agent the user was working with (app_tab_agent_target_pane):
+     * a pick is made with the browser pane in focus, so it is the terminal
+     * pane that had the keyboard before it. */
     i32 target_tab = -1;
     i32 target_pane = 0;
     Terminal *tt = NULL;
@@ -3405,13 +3416,10 @@ static bool browser_inject_body_to_agent(AppState *app, const char *body,
     if (focus >= 0 && focus < app->tab_count &&
         app->tabs[focus].kind == TAB_TERMINAL) {
         Tab *ftab = &app->tabs[focus];
-        i32 panes = ftab->split_pane_count > 0 ? ftab->split_pane_count : 1;
-        for (i32 p = 0; p < panes; p++) {
-            if (app_pane_running_agent(app, focus, p, NULL)) {
-                target_tab = focus;
-                target_pane = p;
-                break;
-            }
+        i32 p = app_tab_agent_target_pane(app, focus, NULL);
+        if (p >= 0) {
+            target_tab = focus;
+            target_pane = p;
         }
         /* When paste is requested, prefer the focused terminal even if no agent
          * has been detected, provided the pane is a live local session. */
@@ -3428,26 +3436,21 @@ static bool browser_inject_body_to_agent(AppState *app, const char *body,
         }
     }
 
-    if (target_tab < 0) {
-        for (i32 ti = 0; ti < app->tab_count; ti++) {
-            if (app->tabs[ti].kind != TAB_TERMINAL) continue;
-            Tab *cand = &app->tabs[ti];
-            i32 panes = cand->split_pane_count > 0 ? cand->split_pane_count : 1;
-            for (i32 p = 0; p < panes; p++) {
-                if (app_pane_running_agent(app, ti, p, NULL)) {
-                    target_tab = ti;
-                    target_pane = p;
-                    goto found;
-                }
-            }
+    for (i32 ti = 0; ti < app->tab_count && target_tab < 0; ti++) {
+        if (app->tabs[ti].kind != TAB_TERMINAL) continue;
+        i32 p = app_tab_agent_target_pane(app, ti, NULL);
+        if (p >= 0) {
+            target_tab = ti;
+            target_pane = p;
         }
     }
-found:
     if (target_tab >= 0 && !tt) {
         Tab *t = &app->tabs[target_tab];
-        /* Busy heuristic for auto-attach only */
-        if (!force_attach &&
-            platform_time_sec() < t->agent_work_until) {
+        /* Busy heuristic for auto-attach only, and the target agent's own:
+         * another agent at work in the same tab does not hold the text back
+         * (Tab.agent_work_until is the latest of all its panes). */
+        if (!force_attach && target_pane >= 0 && target_pane < MAX_SPLIT_PANES &&
+            platform_time_sec() < t->pane_agents[target_pane].work_until) {
             app_show_toast(app, "Agent busy — press Attach when idle");
             return false;
         }
@@ -3533,6 +3536,7 @@ static bool g_liu_hosting_notify = false;
 /* Defined next to the window table, far below — the atexit handler is the only
  * thing that needs it this early. */
 static void liu_save_all_sessions(void);
+static void liu_save_all_sessions_final(void);
 static void liu_launch_guard_settle(void);
 /* Agent ids whose notify hooks this instance installed, so atexit removes
  * exactly those (and nothing the user set up themselves). */
@@ -3570,12 +3574,17 @@ static void liu_lifecycle_atexit(void) {
      *
      * A no-op after the shutdown sequence has taken its own snapshot, and a
      * no-op when no window has tabs left, so the existing file survives. */
-    liu_save_all_sessions();
+    liu_save_all_sessions_final();
 
     /* An ordinary quit is not a failed launch, however soon it came. */
     liu_launch_guard_settle();
 
     if (g_liu_hooks_installed) liu_remove_agent_hooks();
+    /* The skill files describe a command that works only while Liu runs, and
+     * the socket and the jobs' files are this process's. */
+    liu_agentctl_skills_remove();
+    agentctl_exit_cleanup();
+    agentctl_subagents_exit();
     /* Drop the AF_UNIX socket too so a Cmd+Q (which skips notify_server_stop)
      * doesn't leave a stale node behind. Through the socket's owner check, not
      * a bare unlink(): the node at that path is this instance's only while it
@@ -3821,8 +3830,9 @@ static void app_send_command_and_execute(AppState *app, Terminal *t, Session *s,
  * typed input and resolves the @mention instead of a "[Pasted text]" block.
  *
  * Target resolution mirrors browser_inject_body_to_agent: the focused
- * terminal tab first (any pane running an agent, else the focused live-local
- * pane), then any terminal tab with a detected agent. With no agent tab the
+ * terminal tab first (its pane that app_tab_agent_target_pane() names, else
+ * the focused live-local pane), then any terminal tab with a detected agent.
+ * With no agent tab the
  * mention is copied to the clipboard so the user can paste it by hand.
  * Returns true when injected into an agent. */
 static bool app_inject_vault_source(AppState *app, const char *abspath) {
@@ -3836,19 +3846,18 @@ static bool app_inject_vault_source(AppState *app, const char *abspath) {
      * ui/agent_mention.h for why that is the safe default. */
     i32 agent_tool = 0;
 
-    /* Focused terminal tab first. */
+    /* Focused terminal tab first, and in it the agent the user was working
+     * with (app_tab_agent_target_pane). */
     i32 focus = app->active_tab;
     if (focus >= 0 && focus < app->tab_count &&
         app->tabs[focus].kind == TAB_TERMINAL) {
         Tab *ftab = &app->tabs[focus];
-        i32 panes = ftab->split_pane_count > 0 ? ftab->split_pane_count : 1;
-        for (i32 p = 0; p < panes && !ss; p++) {
-            i32 tool = app_pane_running_agent(app, focus, p, NULL);
-            if (tool) {
-                agent_tool = tool;
-                ss = app_pane_session(ftab, p);
-                tt = app_pane_terminal(ftab, p);
-            }
+        i32 tool = 0;
+        i32 p = app_tab_agent_target_pane(app, focus, &tool);
+        if (p >= 0) {
+            agent_tool = tool;
+            ss = app_pane_session(ftab, p);
+            tt = app_pane_terminal(ftab, p);
         }
         /* Prefer the focused pane even if no agent is detected yet, as long as
          * it's a live local session (same policy as browser injection). */
@@ -3865,14 +3874,12 @@ static bool app_inject_vault_source(AppState *app, const char *abspath) {
     for (i32 ti = 0; ti < app->tab_count && !ss; ti++) {
         if (app->tabs[ti].kind != TAB_TERMINAL) continue;
         Tab *cand = &app->tabs[ti];
-        i32 panes = cand->split_pane_count > 0 ? cand->split_pane_count : 1;
-        for (i32 p = 0; p < panes && !ss; p++) {
-            i32 tool = app_pane_running_agent(app, ti, p, NULL);
-            if (tool) {
-                agent_tool = tool;
-                ss = app_pane_session(cand, p);
-                tt = app_pane_terminal(cand, p);
-            }
+        i32 tool = 0;
+        i32 p = app_tab_agent_target_pane(app, ti, &tool);
+        if (p >= 0) {
+            agent_tool = tool;
+            ss = app_pane_session(cand, p);
+            tt = app_pane_terminal(cand, p);
         }
     }
 
@@ -3986,6 +3993,7 @@ static bool app_voice_inject_at(AppState *app, Terminal *t, Session *s, const ch
 
     if (app->config.voice.auto_submit) {
         app_send_input(app, s, &cr, 1);
+        app_agent_session_prompt_sent(app, t, platform_time_sec());
         /* A dictated prompt is submitted here rather than at the Enter handler,
          * so the recall badge has to be told about it from here too — otherwise
          * the one prompt the user never typed is the one it cannot show. Only
@@ -4192,28 +4200,6 @@ static void app_voice_pump(AppState *app) {
         app_show_toast(app, msg);
         voice_cancel();      /* back to idle so the next press can start */
     }
-}
-
-/* Agent session ids / paths are interpolated into shell command lines that are
- * then pasted and executed. They originate from on-disk agent-history files, so
- * a crafted id with shell metacharacters would be a command-injection vector
- * (bracketed paste does NOT shell-quote). Allow only the characters that
- * legitimately appear in session ids and resume paths (UUIDs, hashes,
- * timestamps, filesystem paths). */
-static bool agent_arg_is_safe(const char *s) {
-    if (!s || !s[0]) return false;
-    /* A leading '-' would make a DB-derived id an OPTION to the agent CLI it
-     * is pasted after (option injection); no session id or path starts so. */
-    if (s[0] == '-') return false;
-    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
-        unsigned char c = *p;
-        bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                  (c >= '0' && c <= '9') ||
-                  c == '.' || c == '_' || c == '-' || c == '/' ||
-                  c == '@' || c == ':' || c == '+' || c == '=';
-        if (!ok) return false;
-    }
-    return true;
 }
 
 static void app_import_default_ssh_config(AppState *app) {
@@ -4720,102 +4706,6 @@ static bool agent_binary_on_path(const char *name) {
     return false;
 }
 
-/* Catalog of CLI coding agents liu knows about. Kept in sync with
- * history/event.h ChatTool enum. `resume_fmt` may be NULL when the agent has
- * no documented native resume flag — then only "start new" is offered.
- * `resume_needs_path` toggles whether the %s is substituted with the
- * session-id or the full on-disk path (Command Code wants the path; see its
- * row). `binary` is the $PATH probe name; `new_cmd` runs a fresh session. */
-typedef struct {
-    u8          tool;              /* ChatTool */
-    const char *display;           /* human-readable name */
-    const char *binary;            /* $PATH probe target */
-    const char *resume_fmt;        /* printf fmt with one %s; NULL → no resume */
-    const char *new_cmd;           /* command that starts a fresh session */
-    /* Cross-tool handoff: printf fmt with one %s that receives a shell-quoted
-     * prompt (e.g. `'Read /path/handoff.md and continue from there'`). The
-     * picker uses this to offer "Continue with <other>" for chats originating
-     * in a different tool — the source transcript is dumped to a markdown
-     * file under ~/.liu-handoffs/ and the target CLI is launched with the
-     * pointer as its initial user message. NULL when no CLI exists that can
-     * accept a prompt argv (editor extensions, GUI editors). */
-    const char *cross_tool_fmt;
-    bool        resume_needs_path; /* if true, resume_fmt's %s = session path (not id) */
-} AgentCatalogEntry;
-
-/* Each picker command is formatted into a fixed-size buffer. If the command
- * does not fit, truncation changes the command and may leave shell quoting
- * unbalanced. Reject a command that would be truncated instead of executing a
- * partial string. */
-static bool agent_cmd_fits(int written, usize cap) {
-    return written > 0 && (usize)written < cap;
-}
-
-static const AgentCatalogEntry AGENT_CATALOG[] = {
-    /* tool                  display            binary         resume_fmt                               new_cmd        cross_tool_fmt        needs_path */
-    { CHAT_TOOL_CLAUDE,      "Claude",          "claude",      "claude --resume %s",                    "claude",       "claude %s",          false },
-    /* codex resume expects a thread UUID. The scanner identifies Codex sessions
-     * by rollout filename, so codex_thread_uuid() extracts the UUID used by the
-     * resume command; passing the full rollout filename does not match the
-     * command's argument format. */
-    { CHAT_TOOL_CODEX,       "Codex",           "codex",       "codex resume %s",                       "codex",        "codex %s",           false },
-    { CHAT_TOOL_COPILOT,     "GitHub Copilot",  "copilot",     "copilot --resume %s",                   "copilot",      "copilot -i %s",      false },
-    /* Probe the explicit cursor-agent executable so detection does not select
-     * a different CLI that also provides the generic agent alias on PATH. */
-    { CHAT_TOOL_CURSOR,      "Cursor",          "cursor-agent","cursor-agent --resume %s",              "cursor-agent", "cursor-agent %s",    false },
-    { CHAT_TOOL_AMP,         "Amp",             "amp",         "amp --thread %s",                       "amp",          "amp %s",             false },
-    /* Cline/Roo/Kilo are editor extensions — no CLI entry to hand a prompt to. */
-    { CHAT_TOOL_CLINE,       "Cline",           "code",        NULL,                                    "code",         NULL,                 false },
-    { CHAT_TOOL_ROO,         "Roo Code",        "code",        NULL,                                    "code",         NULL,                 false },
-    { CHAT_TOOL_KILO,        "Kilo Code",       "code",        NULL,                                    "code",         NULL,                 false },
-    { CHAT_TOOL_KIRO,        "Kiro",            "kiro",        NULL,                                    "kiro",         NULL,                 false },
-    { CHAT_TOOL_CRUSH,       "Crush",           "crush",       "crush --session %s",                    "crush",        "crush %s",           false },
-    { CHAT_TOOL_OPENCODE,    "OpenCode",        "opencode",    "opencode --session %s",                 "opencode",     "opencode run %s",    false },
-    { CHAT_TOOL_DROID,       "Factory Droid",   "droid",       "droid -s %s",                           "droid",        "droid exec %s",      false },
-    { CHAT_TOOL_ANTIGRAVITY, "Antigravity",     "agy",         "agy --conversation %s",                "agy",          "agy -i %s",          false },
-    { CHAT_TOOL_KIMI,        "Kimi",            "kimi",        "kimi --session %s",                     "kimi",         "kimi --prompt %s",   false },
-    { CHAT_TOOL_QWEN,        "Qwen",            "qwen",        "qwen --resume %s",                      "qwen",         "qwen %s",            false },
-    /* Aider keeps a single rolling chat history — restore replays it. */
-    { CHAT_TOOL_AIDER,       "Aider",           "aider",       "aider --restore-chat-history",          "aider",        NULL,                 false },
-    { CHAT_TOOL_AMAZON_Q,    "Amazon Q",        "q",           NULL,                                    "q chat",       NULL,                 false },
-    { CHAT_TOOL_CONTINUE,    "Continue",        "cn",          NULL,                                    "cn",           NULL,                 false },
-    { CHAT_TOOL_WINDSURF,    "Windsurf",        "windsurf",    NULL,                                    "windsurf .",   NULL,                 false },
-    /* Grok's TUI takes no positional prompt (only headless -p), so there is no
-     * interactive cross-tool handoff target. */
-    { CHAT_TOOL_XAI,         "Grok",            "grok",        "grok --resume %s",                      "grok",         NULL,                 false },
-    /* --session takes a transcript path, which is what makes this exact: its
-     * sibling --resume matches an id *or* a conversation name and only looks
-     * inside the current directory's project bucket, so resuming from a tab
-     * sitting anywhere else would silently drop into commandcode's own
-     * history picker. */
-    { CHAT_TOOL_COMMANDCODE, "Command Code",    "commandcode", "commandcode --session %s",              "commandcode",  "commandcode %s",     true  },
-    /* The standalone Cline CLI, distinct from the CHAT_TOOL_CLINE row above
-     * (that one is the VS Code extension, which has no CLI to resume into).
-     * `--id` takes the session directory's name, which is exactly the id the
-     * scanner records, so the %s needs no path. */
-    { CHAT_TOOL_CLINE_CLI,   "Cline CLI",       "cline",       "cline --id %s",                         "cline",        "cline %s",           false },
-    /* Pi and Oh My Pi share a session layout. Both resume by the session's
-     * UUID (`pi --session <path|id>`, `omp --resume <id prefix|path>`), which
-     * the scanner stores as the session id: unlike the file's path it is made
-     * of characters agent_arg_is_safe() lets through (a folder called
-     * "Arşiv 2" is in both stores), and the picker runs it in the folder the
-     * session ran in, where each looks first. Both take the opening message as
-     * a positional argument, which is what a handoff needs. omp's `--resume`
-     * takes its value OPTIONALLY (a picker without one), so the id is glued on
-     * with `=`: spaced, it could be read as the first message instead. */
-    { CHAT_TOOL_PI,          "Pi",              "pi",          "pi --session %s",                       "pi",           "pi %s",              false },
-    { CHAT_TOOL_OMP,         "Oh My Pi",        "omp",         "omp --resume=%s",                       "omp",          "omp %s",             false },
-    /* OpenClaw: `tui --session <key>` selects a session by its key
-     * ("agent:main:main" — colons are inside agent_arg_is_safe's set);
-     * `chat --message` opens the embedded TUI with a first message and needs
-     * no Gateway. Hermes: `--resume <id>` (id, title or "latest"); `chat -q`
-     * submits the query as the first turn and keeps the session open on a TTY.
-     */
-    { CHAT_TOOL_OPENCLAW,    "OpenClaw",        "openclaw",    "openclaw tui --session %s",             "openclaw tui", "openclaw chat --message %s", false },
-    { CHAT_TOOL_HERMES,      "Hermes",          "hermes",      "hermes --resume %s",                    "hermes",       "hermes chat -q %s",  false },
-};
-#define AGENT_CATALOG_COUNT ((i32)(sizeof AGENT_CATALOG / sizeof AGENT_CATALOG[0]))
-
 /* =========================================================================
  * Cross-tool handoff
  *
@@ -5143,26 +5033,21 @@ static void app_open_agent_picker(AppState *app, u8 session_tool,
         if (e->tool != session_tool) continue;
         if (!app_agent_has(app, e->tool)) break;
         struct AgentPickerRow *rr = &rows[app->agent_picker_row_count++];
-        const char *arg = e->resume_needs_path ? session_path : session_id;
-        bool have_arg = e->resume_needs_path ? have_path : have_sid;
-        /* Codex is the one agent whose resume argument is not the id the
-         * scanner stores — see its catalog row. An id the extractor rejects
-         * drops to "Continue", never to a guessed argument. */
-        char codex_uuid[40];
-        if (e->tool == CHAT_TOOL_CODEX && have_arg) {
-            if (codex_thread_uuid(arg, codex_uuid, sizeof codex_uuid)) arg = codex_uuid;
-            else have_arg = false;
-        }
+        /* The argument the row's resume flag takes (agent_resume_arg: Codex's
+         * thread UUID, a path for a row that resumes by path, never an id with
+         * shell metacharacters). Without one the row is a plain "Continue",
+         * never a guessed argument. */
         bool fmt_consumes_arg = (e->resume_fmt && strstr(e->resume_fmt, "%s") != NULL);
-        /* Never interpolate an id/path with shell metacharacters into the
-         * resume command; fall back to a plain "Continue" (new_cmd) instead. */
-        if (fmt_consumes_arg && have_arg && !agent_arg_is_safe(arg)) have_arg = false;
+        char arg[1024];
+        bool have_arg = fmt_consumes_arg &&
+                        agent_resume_arg(e, have_sid ? session_id : NULL,
+                                         have_path ? session_path : NULL, arg, sizeof arg);
         if (e->resume_fmt && (!fmt_consumes_arg || have_arg)) {
             rr->kind = 0;
             rr->tool = e->tool;
             snprintf(rr->label, sizeof rr->label, "Resume with %s", e->display);
             if (fmt_consumes_arg) {
-                snprintf(rr->command, sizeof rr->command, e->resume_fmt, arg ? arg : "");
+                snprintf(rr->command, sizeof rr->command, e->resume_fmt, arg);
             } else {
                 snprintf(rr->command, sizeof rr->command, "%s", e->resume_fmt);
             }
@@ -6613,10 +6498,15 @@ static void app_secure_keyboard_toggle(AppState *app) {
  * forgotten. */
 static void app_execute_palette_command(AppState *app, PlatformWindow *window, const PaletteItem *item) {
     if (!app || !item) return;
-    static AppConfig before;              /* main thread only; too large for the stack */
-    before = app->config;
+    /* Too large for the stack, and a static copy would stay resident for good
+     * after the first command: taken for the call. Without it the row runs
+     * and the change is treated as made. */
+    AppConfig *before = malloc(sizeof *before);
+    if (before) *before = app->config;
     app_execute_palette_row(app, window, item);
-    if (memcmp(&before, &app->config, sizeof before) != 0) {
+    bool changed = !before || memcmp(before, &app->config, sizeof *before) != 0;
+    free(before);
+    if (changed) {
         /* This window too: the broadcast applies the change to the OTHER
          * windows, and a row that only flips a value (ligatures, bold is
          * bright) must also redraw the rows already on screen here. */
@@ -7023,6 +6913,29 @@ static void app_execute_palette_row(AppState *app, PlatformWindow *window, const
         return;
     }
 
+    /* A job written here and run beside the focused pane (agent control):
+     * the chat opens empty for it. */
+    {
+        static const struct { const char *row; i32 agent; } delegate[] = {
+            { "Delegate to Codex", AGENTCTL_AGENT_CODEX }, { "Delegate to Claude Code", AGENTCTL_AGENT_CLAUDE },
+            { "Delegate to Gemini", AGENTCTL_AGENT_GEMINI }, { "Delegate to OpenCode", AGENTCTL_AGENT_OPENCODE },
+        };
+        for (usize i = 0; i < sizeof delegate / sizeof delegate[0]; i++) {
+            if (strcmp(item->text, delegate[i].row) != 0) continue;
+            app->palette_active = false;
+            if (!app->config.agent_orchestration)
+                app_show_toast_kind(app, NOTIFY_INFO, "Agent workflows are off (Settings > Terminal)");
+            else
+                app_agentctl_compose_open(app, delegate[i].agent);
+            return;
+        }
+        if (strcmp(item->text, "Agent Team") == 0) {
+            app->palette_active = false;
+            app_agentctl_team_open(app);
+            return;
+        }
+    }
+
     if (strcmp(item->text, "Agent History") == 0) {
         /* Lazy detect on first open; subsequent opens reuse the cached result.
          * User can force a refresh from the picker via ⌘R. */
@@ -7138,6 +7051,20 @@ static void app_execute_palette_row(AppState *app, PlatformWindow *window, const
         app_split_tab(app, SPLIT_H);
     } else if (strcmp(item->text, "Split Vertical") == 0) {
         app_split_tab(app, SPLIT_V);
+    } else if (strcmp(item->text, "Focus Pane Left") == 0) {
+        app_focus_pane_dir(app, PANE_NAV_LEFT);
+    } else if (strcmp(item->text, "Focus Pane Right") == 0) {
+        app_focus_pane_dir(app, PANE_NAV_RIGHT);
+    } else if (strcmp(item->text, "Focus Pane Above") == 0) {
+        app_focus_pane_dir(app, PANE_NAV_UP);
+    } else if (strcmp(item->text, "Focus Pane Below") == 0) {
+        app_focus_pane_dir(app, PANE_NAV_DOWN);
+    } else if (strcmp(item->text, "Next Pane") == 0) {
+        app_focus_pane_cycle(app, 1);
+    } else if (strcmp(item->text, "Previous Pane") == 0) {
+        app_focus_pane_cycle(app, -1);
+    } else if (strcmp(item->text, "Toggle Pane Zoom") == 0) {
+        app_pane_zoom_toggle(app);
     } else if (strcmp(item->text, "Toggle Sidebar") == 0) {
         if (app->sidebar_visible) app_sidebar_set_visible(app, false);
         else                      app_open_sidebar_for_context(app);
@@ -10834,10 +10761,18 @@ static void app_tick_translate(AppState *app) {
             app_translate_stream_filtered_bytes(app, text, (i32)strlen(text));
         }
     }
+    /* The backend answered; whether the answer could be put in the prompt is
+     * asked next. */
+    bool answered = exit_ok && got;
     if (seg_mode && got)
         got = translate_draft_finish_segment(app->translate_draft, app->translate_seg_cur) &&
               !app->translate_cancel_requested;
-    if (!exit_ok || !got) {
+    if (answered && !got && app->translate_draft && !app->translate_draft->begun) {
+        /* Nothing failed: the prompt changed under the translation (or it was
+         * stopped) before anything was erased, so it is as it was. */
+        app_translate_debug_log("stopped: the prompt changed before it was erased");
+        app_show_toast(app, "Translate stopped; prompt kept");
+    } else if (!exit_ok || !got) {
         app_translate_log_failure(app, got ? "child-exit" : "empty-output", wstatus);
         const char *who = app_translate_active_display(app);
         char msg[160];
@@ -11889,7 +11824,15 @@ static bool app_fb_paste_from(AppState *app, const FileClipboard *src, bool user
      * protected during that window. */
     app_fb_paste_task_suspend_sessions(task, true);
 
-    if (pthread_create(&task->tid, NULL, app_fb_paste_worker, task) != 0) {
+    /* The walkers recurse per folder level: the default thread stack is too
+     * small for the deepest tree they accept (FB_PASTE_WORKER_STACK). */
+    pthread_attr_t paste_attr;
+    bool paste_attr_ok = pthread_attr_init(&paste_attr) == 0;
+    if (paste_attr_ok) (void)pthread_attr_setstacksize(&paste_attr, FB_PASTE_WORKER_STACK);
+    int paste_rc = pthread_create(&task->tid, paste_attr_ok ? &paste_attr : NULL,
+                                  app_fb_paste_worker, task);
+    if (paste_attr_ok) pthread_attr_destroy(&paste_attr);
+    if (paste_rc != 0) {
         app_fb_paste_task_suspend_sessions(task, false);
         app_fb_paste_task_release_sessions(task);
         app_fb_paste_task_free(task);
@@ -13470,6 +13413,7 @@ static void liu_broadcast_keybindings(const AppState *src) {
 static bool g_liu_config_broadcasting = false;
 static void liu_broadcast_config(const AppState *src, bool reload_font) {
     if (!src || g_liu_config_broadcasting) return;
+    liu_agentctl_apply_config(&src->config);
     g_liu_config_broadcasting = true;
     for (i32 i = 0; i < g_liu_win_count; i++) {
         AppState       *dst = g_liu_wins[i].st;
@@ -13582,6 +13526,314 @@ static bool liu_close_exited_pane(AppState *st, i32 ti, i32 pane) {
         app_close_tab(st, ti);
     }
     return liu_after_tab_close(st);
+}
+
+/* ---- agent control ---------------------------------------------------------
+ *
+ * An agent in a pane asked Liu to start another agent in a tab of its own
+ * (agentctl/agentctl.h). The server thread owns the request; what needs a
+ * window — the start prompt, the job's tab — happens here, on a loop turn the
+ * server flagged (agentctl_main_pending), and nowhere else. */
+
+/* Agents whose skill file this instance wrote (agentctl/agentctl_skill.h),
+ * removed again at quit or when the setting goes off. */
+static const char *const k_agentctl_skill_agents[2] = { "claude", "codex" };
+static const char *const k_agentctl_skill_names[2]  = { "Claude Code", "Codex" };
+static bool g_agentctl_skills[2];
+static bool g_agentctl_running = false;
+static char g_agentctl_notice[200];
+
+static void liu_agentctl_skills_install(char *names, usize cap) {
+    if (names && cap) names[0] = '\0';
+    if (!g_agentctl_running) return;
+    for (i32 i = 0; i < 2; i++) {
+        if (g_agentctl_skills[i]) continue;
+        if (!agentctl_skill_install(NULL, k_agentctl_skill_agents[i])) continue;
+        g_agentctl_skills[i] = true;
+        ensure_lifecycle_atexit();
+        if (names && cap) {
+            usize at = strlen(names);
+            snprintf(names + at, cap - at, "%s%s", at ? " and " : "", k_agentctl_skill_names[i]);
+        }
+    }
+}
+
+/* The skill files stay while another Liu serves agent control: its panes'
+ * agents still read them. */
+static void liu_agentctl_skills_remove(void) {
+    bool keep = (g_agentctl_skills[0] || g_agentctl_skills[1]) && agentctl_other_live();
+    for (i32 i = 0; i < 2; i++) {
+        if (!g_agentctl_skills[i]) continue;
+        if (!keep) agentctl_skill_uninstall(NULL, k_agentctl_skill_agents[i]);
+        g_agentctl_skills[i] = false;
+    }
+}
+
+/* The setting, the limit and the permission ceiling, and the skill files
+ * that follow the setting. Called with every config change. */
+static void liu_agentctl_apply_config(const AppConfig *c) {
+    if (c) agentctl_subagents_set_enabled(c->agent_subagent_tabs);
+    if (!c || !g_agentctl_running) return;
+    AgentctlPolicy p;
+    p.enabled = c->agent_orchestration;
+    p.max_running = c->agent_orchestration_max;
+    p.perm_ceiling = agentctl_perm_parse(c->agent_orchestration_permission);
+    if (p.perm_ceiling < 0) p.perm_ceiling = AGENTCTL_PERM_WRITE;
+    p.guard = c->agent_orchestration_guard;
+    p.ask_tools = c->agent_orchestration_ask_tools;
+    p.keep = c->agent_orchestration_keep;
+    agentctl_set_policy(&p);
+    bool any = g_agentctl_skills[0] || g_agentctl_skills[1];
+    if (c->agent_orchestration && !any) liu_agentctl_skills_install(NULL, 0);
+    else if (!c->agent_orchestration && any) liu_agentctl_skills_remove();
+}
+
+/* A local pane closed: its delegated jobs end and the subagents its agent
+ * ran are no longer shown. Any thread. */
+static void liu_pane_gone(u64 serial) {
+    agentctl_pane_gone(serial);
+    agentctl_subagents_pane_gone(serial);
+}
+
+/* The window, tab and pane whose session is `serial`. */
+static bool liu_pane_by_serial(u64 serial, i32 *out_wi, i32 *out_ti, i32 *out_pi) {
+    if (!serial) return false;
+    for (i32 wi = 0; wi < g_liu_win_count; wi++) {
+        AppState *st = g_liu_wins[wi].st;
+        if (!st) continue;
+        for (i32 ti = 0; ti < st->tab_count; ti++) {
+            Tab *tab = &st->tabs[ti];
+            if (tab->kind != TAB_TERMINAL) continue;
+            i32 slots = tab_pane_slot_count(tab);
+            for (i32 p = 0; p < slots; p++) {
+                Session *s = tab_pane_session_at(tab, p);
+                if (!s || session_instance_id(s) != serial) continue;
+                if (out_wi) *out_wi = wi;
+                if (out_ti) *out_ti = ti;
+                if (out_pi) *out_pi = p;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/* "Claude Code (tab 2)": the asking pane, by its agent and its tab. */
+static void liu_agentctl_owner_label(u64 owner, char *out, usize cap) {
+    i32 wi, ti, pi;
+    if (!liu_pane_by_serial(owner, &wi, &ti, &pi)) { snprintf(out, cap, "an agent"); return; }
+    const PaneAgent *pa = &g_liu_wins[wi].st->tabs[ti].pane_agents[pi];
+    const char *who = pa->tool ? app_agent_display_name(pa->tool) : "a program";
+    snprintf(out, cap, "%s (tab %d)", who, ti + 1);
+}
+
+/* The next queued request of this window, raised as the start prompt.
+ * Requests withdrawn while they waited are skipped. */
+static bool liu_agentctl_show_next(AppState *st) {
+    while (st->agentctl_prompt_queued > 0) {
+        u32 job = st->agentctl_prompt_queue[0];
+        memmove(st->agentctl_prompt_queue, st->agentctl_prompt_queue + 1,
+                (usize)(st->agentctl_prompt_queued - 1) * sizeof st->agentctl_prompt_queue[0]);
+        st->agentctl_prompt_queued--;
+        AgentctlAction *a = calloc(1, sizeof *a);
+        if (!a) return false;
+        if (!agentctl_job_describe(job, a)) { free(a); continue; }
+        AgentctlPromptView *v = &st->agentctl_prompt;
+        memset(v, 0, sizeof *v);
+        v->job = job;
+        /* the requests of the same pane queued behind it: "Allow all N" */
+        for (i32 q = 0; q < st->agentctl_prompt_queued; q++) {
+            AgentctlAction qa;
+            if (agentctl_job_describe(st->agentctl_prompt_queue[q], &qa) && qa.owner_serial == a->owner_serial)
+                v->waiting++;
+        }
+        const AgentctlAgentInfo *ai = agentctl_agent_info(a->agent);
+        const char *name = ai ? ai->display : "an agent";
+        char owner[96];
+        liu_agentctl_owner_label(a->owner_serial, owner, sizeof owner);
+        snprintf(v->title, sizeof v->title, "Start %s?", name);
+        snprintf(v->who, sizeof v->who, "%s wants to start %s in a new tab.", owner, name);
+        if (v->who[0] >= 'a' && v->who[0] <= 'z') v->who[0] = (char)(v->who[0] - 'a' + 'A');
+        snprintf(v->how, sizeof v->how, "%s%s%s \xC2\xB7 %s",
+                 a->model[0] ? a->model : "its default model",
+                 a->effort[0] ? " \xC2\xB7 " : "", a->effort, agentctl_perm_describe(a->perm));
+        agentctl_prompt_folder(a->cwd, getenv("HOME"), v->where, sizeof v->where);
+        paste_confirm_summarize(a->preview, &v->task);
+        if (a->prompt_len > strlen(a->preview) && v->task.hidden == 0) v->task.hidden = 1;
+        free(a);
+        f64 now = platform_time_sec();
+        st->agentctl_prompt_active = true;
+        st->agentctl_prompt_shown_at = now;
+        st->agentctl_prompt_quiet_since = now;
+        app_agentctl_prompt_banner(st, v->title, v->who);
+        return true;
+    }
+    return false;
+}
+
+/* The user's answer, from a key or a click; `trust` lets this pane's later
+ * requests (up to this level) start without asking until it closes. */
+static void liu_agentctl_resolve(AppState *st, bool approved, bool trust) {
+    if (!st || !st->agentctl_prompt_active) return;
+    u32 job = st->agentctl_prompt.job;
+    AgentctlAction a;
+    char owner[96] = "";
+    if (agentctl_job_describe(job, &a)) liu_agentctl_owner_label(a.owner_serial, owner, sizeof owner);
+    agentctl_answer_ex(job, approved, owner, approved && trust);
+    st->agentctl_prompt_active = false;
+}
+
+/* "Continue in Codex": the job hands its session over and the agent's own
+ * interface opens on it in a new pane beside the pane that asked, in the
+ * same tab. */
+static void liu_agentctl_continue(AppState *from, u32 job) {
+    AgentctlTakeover t;
+    if (!agentctl_takeover(job, &t)) {
+        app_show_toast(from, "The job has no session to continue yet");
+        return;
+    }
+    AgentctlArgvScratch sc;
+    const char *argv[AGENTCTL_ARGV_CAP + 1];
+    char cmd[2048];
+    if (agentctl_takeover_argv(t.agent, t.model, t.effort, t.perm, t.session, &sc, argv, AGENTCTL_ARGV_CAP) <= 0 ||
+        !agentctl_shell_join(argv, cmd, sizeof cmd)) {
+        app_show_toast(from, "This session cannot be opened");
+        return;
+    }
+    i32 wi, ti, pi;
+    AppState *st = from;
+    if (liu_pane_by_serial(t.owner_serial, &wi, &ti, &pi)) {
+        st = g_liu_wins[wi].st;
+        if (st->active_tab != ti) app_switch_tab(st, ti);
+        st->tabs[ti].active_pane = pi;
+        g_liu_wins[wi].needs_redraw = true;
+    }
+    if (!app_split_tab_run(st, t.cwd, cmd))
+        app_show_toast(st, "Could not open a pane for it");
+}
+
+static void liu_agentctl_watch_logs(void);
+
+static void liu_route_agentctl(void) {
+    liu_agentctl_watch_logs();
+    /* A job appeared, went or changed state: every window paints, since a
+     * job tab joins whichever strip holds the pane that asked (rare: a few
+     * times a turn). A log only grew: the windows that show a log or a job
+     * tab's hover. */
+    u64 jobs = agentctl_jobs_gen();
+    u64 lines = agentctl_cards_gen();
+    for (i32 wi = 0; wi < g_liu_win_count; wi++) {
+        AppState *st = g_liu_wins[wi].st;
+        if (!st) continue;
+        if (st->agentctl_jobs_gen_seen != jobs) {
+            st->agentctl_jobs_gen_seen = jobs;
+            st->agentctl_gen_seen = lines;
+            g_liu_wins[wi].needs_redraw = true;
+            app_agentctl_msg_try_queued(st);     /* a turn ended: a message held for it goes */
+            app_agentctl_asks_settle(st);        /* an answered request's notice goes */
+        } else if (st->agentctl_gen_seen != lines) {
+            st->agentctl_gen_seen = lines;
+            if (st->agentctl_panel_open || st->agentctl_tip_job || st->agentctl_team_open) g_liu_wins[wi].needs_redraw = true;
+        }
+    }
+    if (!agentctl_main_pending()) return;
+    AgentctlAction *a = calloc(1, sizeof *a);
+    if (!a) return;
+    for (i32 guard = 0; guard < 64 && agentctl_take_action(a); guard++) {
+        i32 wi, ti, pi;
+        switch (a->kind) {
+        case AGACT_ASK: {
+            if (!liu_pane_by_serial(a->owner_serial, &wi, &ti, &pi)) {
+                agentctl_answer(a->job, false, "");
+                break;
+            }
+            AppState *st = g_liu_wins[wi].st;
+            if (st->agentctl_prompt_queued >= AGENTCTL_PROMPT_QUEUE) {
+                agentctl_answer(a->job, false, "");
+                break;
+            }
+            st->agentctl_prompt_queue[st->agentctl_prompt_queued++] = a->job;
+            g_liu_wins[wi].needs_redraw = true;
+            break;
+        }
+        case AGACT_DISMISS:
+            for (i32 w = 0; w < g_liu_win_count; w++) {
+                AppState *st = g_liu_wins[w].st;
+                if (!st) continue;
+                if (st->agentctl_prompt_active && st->agentctl_prompt.job == a->job) {
+                    st->agentctl_prompt_active = false;
+                    g_liu_wins[w].needs_redraw = true;
+                }
+            }
+            break;
+        case AGACT_FOCUS:
+            if (liu_pane_by_serial(a->owner_serial, &wi, &ti, &pi)) {
+                AppState *st = g_liu_wins[wi].st;
+                if (st->active_tab != ti) app_switch_tab(st, ti);
+                app_agentctl_panel_open(st, a->job);
+                g_liu_wins[wi].needs_redraw = true;
+            }
+            break;
+        case AGACT_NOTICE:
+            /* two agents of one team changed the same file, or one changed
+             * another's: said in the window of the pane that leads them */
+            if (liu_pane_by_serial(a->owner_serial, &wi, &ti, &pi) && a->preview[0]) {
+                app_show_toast_kind(g_liu_wins[wi].st, NOTIFY_WARNING, a->preview);
+                g_liu_wins[wi].needs_redraw = true;
+            }
+            break;
+        case AGACT_ENDED:
+        case AGACT_TOOL_ASK:
+        case AGACT_STARTED: {
+            /* a turn ended, a tool waits for the user's word, a job started
+             * without asking: a notice in the window of the pane that asked
+             * (none when its chat is open there), a banner when Liu is not in
+             * front */
+            if (!liu_pane_by_serial(a->owner_serial, &wi, &ti, &pi)) break;
+            AppState *st = g_liu_wins[wi].st;
+            const AgentctlAgentInfo *ai = agentctl_agent_info(a->agent);
+            char who[160], msg[AGENTCTL_PREVIEW_CAP + 200], head[300];
+            snprintf(who, sizeof who, "%s%s%s", ai ? ai->display : "Agent", a->label[0] ? " \xC2\xB7 " : "", a->label);
+            agentctl_fit(a->preview, 200, head, sizeof head);
+            NotificationKind kind = NOTIFY_INFO;
+            if (a->kind == AGACT_TOOL_ASK) {
+                snprintf(msg, sizeof msg, "%s asks to use %s", who, head);
+                kind = NOTIFY_WARNING;
+            } else if (a->kind == AGACT_STARTED) {
+                snprintf(msg, sizeof msg, "%s started without asking (this tab is trusted)", who);
+            } else if (a->outcome == AGO_DONE || a->outcome == AGO_NONE) {
+                snprintf(msg, sizeof msg, "%s finished%s%s", who, head[0] ? ": " : "", head);
+                kind = NOTIFY_SUCCESS;
+            } else {
+                snprintf(msg, sizeof msg, "%s failed%s%s", who, head[0] ? ": " : "", head);
+                kind = NOTIFY_ERROR;
+            }
+            bool chat_open = st->agentctl_panel_open && st->agentctl_panel_job == a->job;
+            if (a->kind == AGACT_TOOL_ASK) app_show_toast_about(st, app_agentctl_ask_about(a->job), kind, msg);
+            else if (!chat_open) app_show_toast_kind(st, kind, msg);
+            app_agentctl_prompt_banner(st, a->kind == AGACT_TOOL_ASK ? "Allow a tool?" : "Delegated agent", msg);
+            g_liu_wins[wi].needs_redraw = true;
+            break;
+        }
+        default: break;
+        }
+    }
+    free(a);
+}
+
+/* Whether any window shows a job's lines, so a new line is worth waking the
+ * loop for (agentctl_set_log_watched). */
+static void liu_agentctl_watch_logs(void) {
+    static bool was = false;
+    bool on = false;
+    for (i32 wi = 0; wi < g_liu_win_count && !on; wi++) {
+        AppState *st = g_liu_wins[wi].st;
+        on = st && (st->agentctl_panel_open || st->agentctl_tip_shown || st->agentctl_team_open);
+    }
+    if (on != was) {
+        agentctl_set_log_watched(on);
+        was = on;
+    }
 }
 
 /* main()'s `app` — see the banner above. */
@@ -14418,7 +14670,7 @@ static void liu_window_close(i32 idx) {
      * order is the other way round: what the user wants restored is what
      * survives this close, so the write has to see the shrunken table. */
     bool last_window = (g_liu_win_count == 1);
-    if (last_window) liu_save_all_sessions();
+    if (last_window) liu_save_all_sessions_final();
     /* Sampled BEFORE the free: after it there is no way to tell whether the
      * process globals named this window. */
     bool was_bound = (g_app_ptr == st || g_window_ptr == pw);
@@ -14500,6 +14752,12 @@ static AppState *soak_window_state(i32 i) {
  * are not restored. */
 static bool g_sessions_save_frozen = false;
 
+/* `LIU_NO_SESSIONS` keeps a run away from the saved session entirely: nothing
+ * is restored and nothing is written back (sessions.json, workspaces.json, the
+ * panes' screen streams, the launch mark), so a build run beside the installed
+ * Liu in the same home leaves that Liu's tabs as they are. */
+static bool liu_no_sessions(void) { return getenv("LIU_NO_SESSIONS") != NULL; }
+
 static void liu_save_all_sessions(void) {
     if (g_sessions_save_frozen) return;
     /* This probe creates and closes many tabs and windows. Skip session
@@ -14512,6 +14770,116 @@ static void liu_save_all_sessions(void) {
     for (i32 wi = 0; wi < g_liu_win_count && n < (i32)(sizeof sts / sizeof sts[0]); wi++)
         if (g_liu_wins[wi].st) sts[n++] = g_liu_wins[wi].st;
     if (n > 0) app_save_sessions_multi(sts, n);
+}
+
+/* The save a quit ends with: agent panes whose session is not known yet are
+ * looked up first (app_agent_sessions_settle), at most a second and a half in
+ * all, so an agent given its first message just before the quit is resumed. */
+static void liu_save_all_sessions_final(void) {
+    if (g_sessions_save_frozen || app_soak_active()) return;
+    f64 end = platform_time_sec() + 1.5;
+    for (i32 wi = 0; wi < g_liu_win_count; wi++) {
+        f64 left = end - platform_time_sec();
+        if (left <= 0.0) break;
+        if (g_liu_wins[wi].st) app_agent_sessions_settle(g_liu_wins[wi].st, left);
+    }
+    liu_save_all_sessions();
+}
+
+/* sessions.json is written while Liu runs, not only when it quits, so that a
+ * crash, a kill or a power cut leaves the tabs the user had for the next
+ * launch to reopen. A change to what the file records — a tab, a split, a
+ * group, a name, a pane's agent session (AppState.sessions_dirty, or the
+ * shape compared below) — is saved once it has settled; everything else, such
+ * as the folder a shell moved to (no event announces it), once a minute. A
+ * save that would write what the file already says writes nothing
+ * (app_save_sessions_multi), and between saves the panes' screen streams are
+ * kept recent in place (app_screens_refresh_one). */
+#define SESSIONS_AUTOSAVE_SETTLE_SEC  2.0
+#define SESSIONS_AUTOSAVE_EVERY_SEC  60.0
+#define SESSIONS_AUTOSAVE_LOOK_SEC    1.0
+#define SESSIONS_SCREEN_REFRESH_GAP_SEC 0.5
+static f64 g_sessions_change_at, g_sessions_saved_at, g_sessions_looked_at, g_screens_refresh_at;
+static u64 g_sessions_shape;
+
+static u64 liu_sessions_shape_mix(u64 h, u64 v) {
+    h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+    return h;
+}
+
+static u64 liu_sessions_shape_str(u64 h, const char *s) {
+    for (; s && *s; s++) h = (h ^ (u8)*s) * 0x100000001B3ull;
+    return liu_sessions_shape_mix(h, 0xFF);
+}
+
+/* What the sessions file says of the windows, as one number. */
+static u64 liu_sessions_shape(void) {
+    u64 h = 0xCBF29CE484222325ull;
+    h = liu_sessions_shape_mix(h, (u64)g_liu_win_count);
+    for (i32 wi = 0; wi < g_liu_win_count; wi++) {
+        const AppState *st = g_liu_wins[wi].st;
+        if (!st) continue;
+        h = liu_sessions_shape_mix(h, (u64)st->tab_count);
+        h = liu_sessions_shape_mix(h, (u64)(st->active_tab + 1));
+        for (i32 ti = 0; ti < st->tab_count && ti < MAX_TABS; ti++) {
+            const Tab *tab = &st->tabs[ti];
+            h = liu_sessions_shape_mix(h, (u64)tab->kind);
+            h = liu_sessions_shape_mix(h, (u64)tab_split_pane_count(tab));
+            h = liu_sessions_shape_mix(h, (u64)tab->split);
+            h = liu_sessions_shape_mix(h, (u64)(tab->group_index + 1));
+            h = liu_sessions_shape_mix(h, (u64)tab->sleeping);
+            h = liu_sessions_shape_mix(h, (u64)tab->active_pane);
+            if (tab->title_locked) h = liu_sessions_shape_str(h, tab->custom_title);
+            for (i32 p = 0; p < MAX_SPLIT_PANES; p++) {
+                const PaneAgent *pa = &tab->pane_agents[p];
+                h = liu_sessions_shape_mix(h, (u64)session_instance_id(app_pane_session(tab, p)));
+                h = liu_sessions_shape_mix(h, (u64)pa->tool);
+                h = liu_sessions_shape_str(h, pa->session_id);
+            }
+        }
+    }
+    return h;
+}
+
+static void liu_sessions_autosave_tick(f64 now) {
+    if (g_sessions_save_frozen || app_soak_active() || g_liu_win_count <= 0) return;
+    /* The first turn of the loop: the file was just read back. */
+    if (g_sessions_saved_at == 0.0) g_sessions_saved_at = now;
+    bool changed = false;
+    for (i32 wi = 0; wi < g_liu_win_count; wi++) {
+        AppState *st = g_liu_wins[wi].st;
+        if (st && st->sessions_dirty) { changed = true; st->sessions_dirty = false; }
+    }
+    if (now - g_sessions_looked_at >= SESSIONS_AUTOSAVE_LOOK_SEC) {
+        g_sessions_looked_at = now;
+        u64 shape = liu_sessions_shape();
+        if (g_sessions_shape != 0 && shape != g_sessions_shape) changed = true;
+        g_sessions_shape = shape;
+    }
+    if (changed && g_sessions_change_at == 0.0) g_sessions_change_at = now;
+    bool due = (g_sessions_change_at > 0.0 && now - g_sessions_change_at >= SESSIONS_AUTOSAVE_SETTLE_SEC) ||
+               now - g_sessions_saved_at >= SESSIONS_AUTOSAVE_EVERY_SEC;
+    if (!due) {
+        /* Between saves: one pane's screen stream at most, the most out of
+         * date, every SESSIONS_SCREEN_REFRESH_GAP_SEC; the windows take turns
+         * starting the search. */
+        if (now >= g_screens_refresh_at) {
+            g_screens_refresh_at = now + SESSIONS_SCREEN_REFRESH_GAP_SEC;
+            static i32 first_window;
+            i32 n = g_liu_win_count;
+            for (i32 k = 0; k < n; k++) {
+                AppState *st = g_liu_wins[(first_window + k) % n].st;
+                if (st && app_screens_refresh_one(st, now)) break;
+            }
+            first_window = n > 0 ? (first_window + 1) % n : 0;
+        }
+        return;
+    }
+    g_sessions_change_at = 0.0;
+    g_sessions_saved_at = now;
+    app_screens_lazy_save(true);
+    liu_save_all_sessions();
+    app_screens_lazy_save(false);
 }
 
 /* `LIU_POINTER_DEMO=<hz>` sends synthetic pointer events through the ordinary
@@ -15847,11 +16215,29 @@ static void liu_script_state(AppState *a, PlatformWindow *pw) {
     SAYI("fast_replies", session_fast_replies(app_focused_session(a)));
     for (i32 i = 0; i < a->tab_count; i++) {
         Tab *t = &a->tabs[i];
-        snprintf(v, sizeof v, "kind=%d panes=%d active_pane=%d split=%d ratio=%.2f group=%d sleeping=%d "
-                 "nosleep=%d working=%d agents=%d bell=%d title=%s",
-                 (int)t->kind, app_tab_pane_count(t), t->active_pane, (int)t->split, (double)t->split_ratio,
+        /* Each pane's terminal grid and the grid its drawn rectangle fits,
+         * "<cols>x<rows>:<cols>x<rows>": a pane whose two differ draws a
+         * screen of another size than the one it has. */
+        char grids[MAX_SPLIT_PANES * 28 + 8] = "-";
+        if (t->kind == TAB_TERMINAL) {
+            usize o = 0;
+            grids[0] = '\0';
+            for (i32 p = 0; p < app_tab_pane_count(t) && o + 28 < sizeof grids; p++) {
+                const Terminal *pt = app_tab_pane_terminal(t, p);
+                i32 fc = 0, fr = 0;
+                app_tab_pane_fit(a, t, p, &fc, &fr);
+                o += (usize)snprintf(grids + o, sizeof grids - o, "%s%dx%d:%dx%d", p ? "," : "",
+                                     pt ? pt->cols : 0, pt ? pt->rows : 0, fc, fr);
+            }
+        }
+        snprintf(v, sizeof v, "kind=%d panes=%d active_pane=%d zoom=%d split=%d ratio=%.2f group=%d sleeping=%d "
+                 "nosleep=%d working=%d agents=%d bell=%d pill=%.0f,%.0f grids=%s title=%s",
+                 (int)t->kind, app_tab_pane_count(t), t->active_pane, tab_zoomed_pane(t),
+                 (int)t->split, (double)t->split_ratio,
                  t->group_index, (int)t->sleeping, (int)t->sleep_disabled, t->agent_working_count,
-                 t->agent_count, (int)t->has_bell, tab_effective_title(t));
+                 t->agent_count, (int)t->has_bell,
+                 i < MAX_TABS ? (double)a->_tab_pill_x[i] : 0.0, i < MAX_TABS ? (double)a->_tab_pill_w[i] : 0.0,
+                 grids, tab_effective_title(t));
         char k[32];
         snprintf(k, sizeof k, "tab.%d", i);
         liu_script_kv(k, v);
@@ -15907,6 +16293,82 @@ static void liu_script_state(AppState *a, PlatformWindow *pw) {
             SAYI("browser_url_focused", tab->browser->url_focused);
             SAYI("browser_loading", tab->browser->loading);
             SAYI("browser_pick", tab->browser->pick_mode);
+            /* Device preview: the preset, the device drawn around the page
+             * (frame pixels) and what the native view holds (points in the
+             * page's rect). */
+            BrowserTab *bt = tab->browser;
+            const BrowserViewportPreset *vp = browser_viewport_get(bt->viewport_idx);
+            SAYI("browser_viewport", bt->viewport_idx);
+            liu_script_kv("browser_viewport_name", vp ? vp->name : "");
+            SAYI("browser_landscape", bt->viewport_landscape);
+            SAYF("browser_viewport_scale", bt->viewport_scale);
+            SAYI("browser_menu", bt->viewport_menu_open);
+            f32 bd = a->dpi_scale > 0.0f ? a->dpi_scale : 1.0f;
+            if (bt->layout.show_device)
+                liu_script_say("browser_device_btn=%.0f,%.0f\n",
+                               (double)(bt->layout.device_x + bt->layout.btn_s * 0.5f),
+                               (double)(bt->layout.btn_y + bt->layout.btn_s * 0.5f));
+            if (bt->viewport_menu_open) {
+                for (i32 vi = 0; vi < browser_viewport_count(); vi++) {
+                    f32 rx = 0.0f, ry = 0.0f;
+                    if (browser_viewport_menu_row_center(a, vi, &rx, &ry))
+                        liu_script_say("browser_menu_row_%d=%.0f,%.0f\n", vi,
+                                       (double)rx, (double)ry);
+                }
+                f32 mrx, mry, mrw, mrh;
+                if (browser_viewport_menu_rect(a, &mrx, &mry, &mrw, &mrh))
+                    liu_script_say("browser_menu_rect=%.1f,%.1f,%.1f,%.1f\n",
+                                   (double)mrx, (double)mry, (double)mrw, (double)mrh);
+            }
+            BrowserDeviceLayout dev;
+            if (browser_device_now(a, &dev)) {
+                liu_script_say("browser_device=%d,%d,%d\n", dev.kind, dev.cut, dev.n_keys);
+#define SAYR(k, s) liu_script_say("%s=%.1f,%.1f,%.1f,%.1f\n", (k), \
+                                  (double)((s).x * bd), (double)((s).y * bd), \
+                                  (double)((s).w * bd), (double)((s).h * bd))
+                SAYR("browser_screen", dev.screen);
+                SAYR("browser_page", dev.page);
+                SAYR("browser_body", dev.body);
+                SAYR("browser_glass", dev.glass);
+                SAYR("browser_cutout", dev.cutout);
+                SAYR("browser_bar", dev.bar);
+                SAYR("browser_clock", dev.clock);
+                SAYR("browser_signal", dev.signal);
+                SAYR("browser_wifi", dev.wifi);
+                SAYR("browser_battery", dev.battery);
+                SAYR("browser_percent", dev.percent);
+                SAYR("browser_indicator", dev.indicator);
+                SAYR("browser_base", dev.base);
+                SAYR("browser_lens", dev.lens);
+                SAYR("browser_home", dev.home);
+                SAYR("browser_flash", dev.flash);
+                SAYR("browser_speaker", dev.speaker);
+                SAYR("browser_hinge", dev.hinge);
+                SAYR("browser_knuckle0", dev.knuckles[0]);
+                SAYR("browser_knuckle1", dev.knuckles[1]);
+#undef SAYR
+                SAYI("browser_sys", dev.sys);
+                liu_script_say("browser_screen_css=%d,%d\n", dev.sw, dev.sh);
+                liu_script_say("browser_page_css=%d,%d\n", dev.vw, dev.vh);
+                SAYF("browser_screen_r", dev.screen.r[BDEV_TL] * bd);
+                liu_script_say("browser_page_r=%.1f,%.1f,%.1f,%.1f\n",
+                               (double)(dev.page.r[BDEV_TL] * bd), (double)(dev.page.r[BDEV_TR] * bd),
+                               (double)(dev.page.r[BDEV_BR] * bd), (double)(dev.page.r[BDEV_BL] * bd));
+            }
+            BrowserScreenProbe sp;
+            if (bt->native && browser_native_screen_probe(bt->native, &sp)) {
+                SAYF("browser_native_radius", sp.radius);
+                SAYI("browser_native_corners", sp.corners);
+                /* AppKit's page rect, back to frame pixels from the top. */
+                if (sp.have_page) {
+                    f32 top_pt = (f32)a->fb_height / bd - (sp.page_y + sp.page_h);
+                    liu_script_say("browser_native_page=%.1f,%.1f,%.1f,%.1f\n",
+                                   (double)(sp.page_x * bd), (double)(top_pt * bd),
+                                   (double)(sp.page_w * bd), (double)(sp.page_h * bd));
+                }
+            }
+            SAYI("browser_page_tint_known", bt->page_tint_known);
+            liu_script_say("browser_page_tint=%06x\n", bt->page_tint);
         }
         FileBrowser *fb = (tab->kind == TAB_FILEBROWSER && tab->fb) ? tab->fb : &a->filebrowser;
         SAYI("fb_open", fb->open);
@@ -16112,6 +16574,8 @@ static void liu_script_state(AppState *a, PlatformWindow *pw) {
     }
     SAYI("settings", a->settings.open);
     SAYI("settings_tab", a->settings.active_tab);
+    SAYI("cfg.resume_agents", a->config.resume_agents);
+    SAYI("cfg.restore_screen", a->config.restore_screen);
     {   /* Settings > Translate's Model menu: what it lists, which row is the
          * active one and which the configured model's, and where the last
          * frame put the chip, the card and the window's first row (pixels) —
@@ -16138,6 +16602,56 @@ static void liu_script_state(AppState *a, PlatformWindow *pw) {
     }
     SAYI("sidebar", a->sidebar_visible);
     SAYF("sidebar_w", a->sidebar_width);
+    {
+        /* The sections as the bar lays them out now, top to bottom, and a
+         * header drag in progress: name=hdr_y,hdr_h,body_y,body_h. */
+        char secs[96];
+        config_format_sidebar_sections(&a->config, secs, sizeof secs);
+        liu_script_kv("side_sections", secs);
+        SidebarLayout SL;
+        app_sidebar_layout(a, &SL);
+        static const char *const names[SB_SEC_COUNT] = { "tabs", "files", "agents", "notes" };
+        char shown[96];
+        usize o = 0;
+        shown[0] = '\0';
+        for (i32 i = 0; i < SL.n && !SL.rail; i++) {
+            const SidebarSectionRect *s = &SL.sec[i];
+            if (s->id >= SB_SEC_COUNT) continue;
+            liu_script_say("side_sec.%s=%.0f,%.0f,%.0f,%.0f\n", names[s->id],
+                           s->hdr_y, s->hdr_h, s->body_y, s->body_h);
+            if (sidebar_sec_drawn(s) && o + 12 < sizeof shown)
+                o += (usize)snprintf(shown + o, sizeof shown - o, "%s%s", o ? "," : "", names[s->id]);
+        }
+        liu_script_kv("side_shown", shown);
+        SAYI("side_sec_open_agents", a->sidebar_sec_inited ? a->sidebar_sec_open[SB_SEC_AGENTS] : 1);
+        /* The rail's section buttons, top to bottom: name=y,h. */
+        SidebarLayout DS;
+        app_side_drag_stack(a, &DS);
+        o = 0;
+        shown[0] = '\0';
+        for (i32 i = 0; i < DS.n && DS.rail; i++) {
+            const SidebarSectionRect *s = &DS.sec[i];
+            if (s->id >= SB_SEC_COUNT) continue;
+            liu_script_say("side_rail.%s=%.0f,%.0f\n", names[s->id], s->hdr_y, s->hdr_h);
+            if (o + 12 < sizeof shown)
+                o += (usize)snprintf(shown + o, sizeof shown - o, "%s%s", o ? "," : "", names[s->id]);
+        }
+        liu_script_kv("side_rail", shown);
+        SAYI("side_drag", a->side_drag_live ? a->side_drag_id : -1);
+        SAYI("side_drag_rail", a->side_drag_rail);
+        SAYI("side_drag_armed", a->side_drag_armed);
+        SAYI("side_drag_slot", a->side_drag_live ? app_side_drag_slot(a, &DS) : -1);
+        SAYI("side_slide", sidebar_slide_running(&a->side_slide, platform_time_sec()));
+        /* The docked list's jump pills: shown,tab,x,y,w,h,icons,more. */
+        SidebarJump jumps[2];
+        app_side_jumps(a, &SL, jumps);
+        for (i32 d = 0; d < 2; d++)
+            liu_script_say("side_jump.%s=%d,%d,%.0f,%.0f,%.0f,%.0f,%d,%d\n", d ? "down" : "up",
+                           (int)jumps[d].shown, jumps[d].n_icons ? jumps[d].tabs[0] : -1,
+                           jumps[d].x, jumps[d].y, jumps[d].w, jumps[d].h, jumps[d].n_icons, jumps[d].more);
+        SAYF("side_tabs_scroll", a->side_tabs_scroll);
+        SAYI("side_tabs_glide", a->side_tabs_glide && platform_time_sec() - a->side_tabs_glide_t0 < SIDEBAR_GLIDE_S);
+    }
     SAYI("search", a->search_active);
     liu_script_kv("search_query", a->search_query);
     SAYI("bench", a->bench_enabled);
@@ -16211,6 +16725,171 @@ static void liu_script_state(AppState *a, PlatformWindow *pw) {
     SAYI("kbi_dialog", a->kbi_dialog_active);
     SAYI("close_confirm", a->close_confirm_active);
     SAYI("paste_confirm", a->paste_confirm_active);
+    SAYI("agent_prompt", a->agentctl_prompt_active);
+    SAYI("agent_prompt_job", a->agentctl_prompt_active ? (i32)a->agentctl_prompt.job : 0);
+    SAYI("agent_prompt_queued", a->agentctl_prompt_queued);
+    SAYF("agent_prompt_age", a->agentctl_prompt_active ? platform_time_sec() - a->agentctl_prompt_shown_at : 0.0);
+    liu_script_kv("agent_prompt_title", a->agentctl_prompt_active ? a->agentctl_prompt.title : "");
+    liu_script_kv("agent_prompt_how", a->agentctl_prompt_active ? a->agentctl_prompt.how : "");
+    {
+        /* The job tabs as painted (the strip or the docked list); pill=x,w
+         * is the strip's pill of the tab each joins (0,0 when docked). */
+        i32 nj = 0;
+        for (i32 q = 0; q < a->jobtab_rect_n; q++, nj++) {
+            i32 ti = a->jobtab_rect[q].tab, k = a->jobtab_rect[q].k;
+            if (ti < 0 || ti >= MAX_TABS || k < 0 || k >= a->tab_jobs_n[ti]) continue;
+            const AgcTabJob *tj = &a->tab_jobs[ti][k];
+            char k2[32];
+            snprintf(k2, sizeof k2, "agent_jobtab.%d", nj);
+            const char *st = tj->state == AGJ_IDLE ? agentctl_outcome_name(tj->outcome)
+                                                   : agentctl_state_name(tj->state);
+            bool strip = !app_sidebar_tabs_docked(a);
+            AgcCue cue = agentctl_job_cue_ex(tj->state, tj->outcome, tj->end, tj->asking);
+            f32 dpi = a->dpi_scale > 0.0f ? a->dpi_scale : 1.0f;
+            /* how far the haze's last change of state has faded in (1 = done) */
+            f32 fade = 1.0f;
+            i32 from = 0;
+            for (i32 mi = 0; mi < AGC_HAZE_MEMO; mi++)
+                if (a->agentctl_haze_memo[mi].job == tj->job) {
+                    fade = agentctl_haze_fade(platform_time_sec() - a->agentctl_haze_memo[mi].fade_at);
+                    from = a->agentctl_haze_memo[mi].cue_from;
+                }
+            snprintf(v, sizeof v, "%.0f,%.0f,%.0f,%.0f tab=%d job=%u state=%s more=%d pill=%.0f,%.0f haze=%d moves=%d "
+                     "band=%.0f,%.0f cell=%.0f bw=%.0f rr=%.0f fade=%.2f from=%d edges=%d,%d,%d,%d chip=%d folded=%d",
+                     (double)a->jobtab_rect[q].x, (double)a->jobtab_rect[q].y,
+                     (double)a->jobtab_rect[q].w, (double)a->jobtab_rect[q].h, ti, tj->job, st,
+                     k == (a->tab_jobs[ti][0].chip ? 1 : 0) ? (i32)a->tab_jobs_more[ti] : 0,
+                     strip ? (double)a->_tab_pill_x[ti] : 0.0, strip ? (double)a->_tab_pill_w[ti] : 0.0,
+                     (int)cue, (int)agentctl_haze_moves(cue),
+                     (double)a->jobtab_rect[q].band_y, (double)a->jobtab_rect[q].band_h,
+                     (double)fmaxf(1.0f, roundf(AGC_HAZE_CELL_PT * dpi)), (double)fmaxf(1.0f, dpi),
+                     (double)a->jobtab_rect[q].rr, (double)fade, from,
+                     a->jobtab_rect[q].edges[0], a->jobtab_rect[q].edges[1],
+                     a->jobtab_rect[q].edges[2], a->jobtab_rect[q].edges[3],
+                     (int)tj->chip, (int)a->tab_jobs_folded[ti]);
+            liu_script_kv(k2, v);
+        }
+        SAYI("agent_jobtabs", nj);
+        SAYF("agent_tab_w", a->_tab_w);
+        SAYI("agent_tip", (i32)a->agentctl_tip_job);
+        SAYI("agent_tip_shown", (i32)a->agentctl_tip_shown);
+        SAYF("agent_tip_alpha", a->agentctl_tip_shown ? a->agentctl_tip_alpha : 0.0);
+        SAYI("agent_tip_opening", a->agentctl_tip_opening);
+        if (a->agentctl_tip_shown) {
+            /* the hover as last drawn: its rect, its first cell, how many
+             * rows of lines it showed, the cursor */
+            const AgcTipGeom *tg = &a->agentctl_tip_drawn;
+            char v[320];
+            snprintf(v, sizeof v, "%.0f,%.0f,%.0f,%.0f text=%.0f,%.0f row=%.0f cols=%d rows=%d shown=%d "
+                     "cursor=%d at=%.0f,%.0f,%.0f,%.0f",
+                     (double)tg->win.x, (double)tg->win.y, (double)tg->win.w, (double)tg->win.h,
+                     (double)tg->text_x, (double)tg->text_y,
+                     (double)tg->row_h, tg->cols, tg->rows, a->agentctl_tip_screen_rows,
+                     (int)a->agentctl_tip_cursor_kind,
+                     (double)a->agentctl_tip_cursor_at[0], (double)a->agentctl_tip_cursor_at[1],
+                     (double)a->agentctl_tip_cursor_at[2], (double)a->agentctl_tip_cursor_at[3]);
+            liu_script_kv("agent_tip_win", v);
+        }
+        SAYI("agent_frame_due", a->agentctl_next_edge > 0.0);
+        SAYF("agent_frame_in", a->agentctl_next_edge > 0.0 ? a->agentctl_next_edge - platform_time_sec() : 0.0);
+    }
+    SAYI("agent_panel", a->agentctl_panel_open);
+    SAYI("agent_compose", a->agentctl_compose_agent);
+    SAYI("agent_find", a->agentctl_find_on);
+    SAYI("agent_find_row", a->agentctl_find_row);
+    SAYI("agent_sel_a", a->agentctl_sel_a);
+    SAYI("agent_sel_b", a->agentctl_sel_b);
+    SAYI("agent_team", a->agentctl_team_open);
+    SAYI("agent_team_n", a->agentctl_team_n);
+    if (a->agentctl_team_open) {
+        AgcTeamGeom tg;
+        app_agentctl_team_layout(a, &tg);
+        for (i32 q = 0; q < tg.rows; q++) {
+            char k[40];
+            snprintf(k, sizeof k, "agent_team_row.%d", q);
+            snprintf(v, sizeof v, "%.0f,%.0f,%.0f,%.0f job=%u", (double)tg.row[q].x, (double)tg.row[q].y,
+                     (double)tg.row[q].w, (double)tg.row[q].h, a->agentctl_team_jobs[q]);
+            liu_script_kv(k, v);
+        }
+    }
+    SAYI("job_menu", a->job_ctx_menu_active);
+    if (a->job_ctx_menu_active) {
+        CtxMenuBox jb;
+        i32 jk[JOB_MENU_MAX_ROWS];
+        CtxMenuRow jr[JOB_MENU_MAX_ROWS];
+        i32 jn = app_job_menu_layout(a, &jb, jk, jr);
+        for (i32 q = 0; q < jn; q++) {
+            char k[40];
+            snprintf(k, sizeof k, "job_menu_row.%d", q);
+            snprintf(v, sizeof v, "%.0f,%.0f,%.0f,%.0f %s", (double)jb.x, (double)jb.row_y[q], (double)jb.w,
+                     (double)jb.row_h, jr[q].label);
+            liu_script_kv(k, v);
+        }
+    }
+    SAYI("agent_prompt_waiting", a->agentctl_prompt_active ? a->agentctl_prompt.waiting : 0);
+    if (a->agentctl_prompt_active) {
+        AgentctlPromptGeom pgm = agentctl_prompt_geom((f32)a->fb_width, (f32)a->fb_height, a->dpi_scale,
+                                                      paste_summary_rows(&a->agentctl_prompt.task));
+        snprintf(v, sizeof v, "%.0f,%.0f,%.0f,%.0f", (double)pgm.trust.x, (double)pgm.trust.y,
+                 (double)pgm.trust.w, (double)pgm.trust.h);
+        liu_script_kv("agent_prompt_trust", v);
+        snprintf(v, sizeof v, "%.0f,%.0f,%.0f,%.0f", (double)pgm.start.x, (double)pgm.start.y,
+                 (double)pgm.start.w, (double)pgm.start.h);
+        liu_script_kv("agent_prompt_start", v);
+    }
+    SAYI("agent_panel_job", a->agentctl_panel_open ? (i32)a->agentctl_panel_job : 0);
+    SAYI("agent_panel_rows", a->agentctl_panel_open ? a->agentctl_panel_row_count : 0);
+    if (a->agentctl_panel_open) {
+        AgentctlPanelGeom pg;
+        app_agentctl_panel_layout(a, &pg);
+        static const char *const names[AGC_BTN_COUNT] = { "hide", "close", "stop", "continue", "allow", "always",
+                                                          "deny", "merge", "discard", "review" };
+        for (i32 b = 0; b < AGC_BTN_COUNT; b++) {
+            if (pg.btn[b].w <= 0.0f) continue;
+            char k[40];
+            snprintf(k, sizeof k, "agent_panel_btn.%s", names[b]);
+            snprintf(v, sizeof v, "%.0f,%.0f,%.0f,%.0f", (double)pg.btn[b].x, (double)pg.btn[b].y,
+                     (double)pg.btn[b].w, (double)pg.btn[b].h);
+            liu_script_kv(k, v);
+        }
+        liu_script_kv("agent_panel_state", agentctl_state_name(a->agentctl_panel_snap.state));
+        SAYI("agent_panel_watched", a->agentctl_panel_snap.watched);   /* a subagent its own agent runs */
+        liu_script_kv("agent_panel_kind", a->agentctl_panel_snap.kind);
+        liu_script_kv("agent_panel_asking", a->agentctl_panel_snap.asking);
+        liu_script_kv("agent_panel_worktree", a->agentctl_panel_snap.worktree);
+        liu_script_kv("agent_panel_merged", a->agentctl_panel_snap.merged);
+        snprintf(v, sizeof v, "%llu %llu %llu %llu", (unsigned long long)a->agentctl_panel_snap.spent_in,
+                 (unsigned long long)a->agentctl_panel_snap.spent_cached,
+                 (unsigned long long)a->agentctl_panel_snap.spent_out,
+                 (unsigned long long)a->agentctl_panel_snap.spent_cost_micro);
+        liu_script_kv("agent_panel_spent", v);
+        snprintf(v, sizeof v, "%.0f,%.0f,%.0f,%.0f", (double)pg.log.x, (double)pg.log.y, (double)pg.log.w,
+                 (double)pg.log.h);
+        liu_script_kv("agent_panel_log", v);
+        SAYF("agent_panel_cell_h", pg.cell_h);
+        /* the chat's field: where it is, what it holds, whether Enter held it
+         * for later, why it last sent nothing */
+        snprintf(v, sizeof v, "%.0f,%.0f,%.0f,%.0f", (double)pg.input.x, (double)pg.input.y,
+                 (double)pg.input.w, (double)pg.input.h);
+        liu_script_kv("agent_panel_input", v);
+        liu_script_kv("agent_panel_msg", a->agentctl_msg_job == a->agentctl_panel_job ? a->agentctl_msg : "");
+        SAYI("agent_panel_msg_queued", a->agentctl_msg_queued);
+        liu_script_kv("agent_panel_msg_note", a->agentctl_msg_note);
+        liu_script_kv("agent_panel_team", a->agentctl_panel_snap.team);   /* the other jobs of its team */
+        /* its newest lines as the chat shows them */
+        {
+            const AgentctlSnapshot *ps = &a->agentctl_panel_snap;
+            i32 from = ps->nlines > 40 ? ps->nlines - 40 : 0;
+            for (i32 li = from; li < ps->nlines && ps->bytes; li++) {
+                char k[40], line[512];
+                u32 ll = ps->lines[li].len < sizeof line - 1 ? ps->lines[li].len : (u32)sizeof line - 1;
+                memcpy(line, ps->bytes + ps->lines[li].off, ll);
+                line[ll] = '\0';
+                snprintf(k, sizeof k, "agent_panel_line.%d", li - from);
+                liu_script_kv(k, line);
+            }
+        }
+    }
     SAYI("tab_rename", a->tab_rename_active);
     SAYI("chip_rename", a->chip_rename_active);
     SAYI("tab_menu", a->tab_ctx_menu_active);
@@ -16677,6 +17356,22 @@ static bool liu_script_next(AppState *a, PlatformEvent *ev, PlatformWindow *pw, 
         bool went = arg[0] == '/' && fb_open_path(&a->filebrowser, arg, false);
         liu_script_say(went ? "ok %d\n" : "err %d could not open that file\n", line_no);
         return went ? liu_script_paint(ev, pw) : false;
+    }
+    if (!strcmp(line, "pick")) {
+        /* `pick <text>`: the active tab's page hands Liu an element, as a
+         * click on it in Select Element does (the page's click is a trusted
+         * WebKit event no script can make): an <h1> whose text is <text>. */
+        static BrowserPick script_pick;
+        Tab *pt = app_active_tab(a);
+        if (!pt || !pt->browser) { liu_script_say("err %d the tab has no browser\n", line_no); return false; }
+        memset(&script_pick, 0, sizeof script_pick);
+        snprintf(script_pick.page_url, sizeof script_pick.page_url, "%s", pt->browser->url);
+        snprintf(script_pick.tag, sizeof script_pick.tag, "h1");
+        snprintf(script_pick.selector, sizeof script_pick.selector, "h1");
+        snprintf(script_pick.text, sizeof script_pick.text, "%s", arg);
+        app_browser_pick_arrived(a, pt->browser, &script_pick);
+        liu_script_say("ok %d\n", line_no);
+        return liu_script_paint(ev, pw);
     }
     if (!strcmp(line, "menu")) {
         /* `menu secure`: the menu bar's "Secure Keyboard Entry" item, as
@@ -20043,7 +20738,11 @@ static bool liu_continuous_visual(const AppState *a, f64 now) {
            a->ed_drag_dir != 0 ||
            /* A file drag paused over a tab is resolved by elapsed time, so keep
             * frames scheduled to render the fill animation. */
-           a->drag_spring.kind != DRAG_SPRING_NONE;
+           a->drag_spring.kind != DRAG_SPRING_NONE ||
+           /* Sections gliding to a new order after a drop. */
+           sidebar_slide_running(&a->side_slide, now) ||
+           /* The docked list gliding to a jump pill's tab. */
+           (a->side_tabs_glide && now - a->side_tabs_glide_t0 < (f64)SIDEBAR_GLIDE_S);
 }
 
 /* main()'s per-window loop state — the same re-pointing as `app`, and for the
@@ -20625,7 +21324,7 @@ int main(int argc, char **argv) {
 
     /* Restore persisted workspace groups (names, colors, collapsed). Tabs
      * always start ungrouped — sessions don't survive restart. */
-    app_load_workspaces(&app);
+    if (!liu_no_sessions()) app_load_workspaces(&app);
     /* Host the notification server in-process so agent hooks (liu-notify send)
      * have something to talk to without a separate persistent background
      * daemon. No-op if another instance already hosts the socket; the service
@@ -20668,6 +21367,38 @@ int main(int argc, char **argv) {
     if (liu_dev_env("LIU_HOOKS_NOTICE_DEMO"))     /* see it without a hosted service */
         snprintf(g_hooks_notice, sizeof g_hooks_notice,
                  "Liu added its notify hook to Claude Code, Codex, OpenCode");
+
+    /* Agent control (agentctl/agentctl.h): an agent in a pane may ask Liu to
+     * start another agent in a tab of its own. Started before the first pane,
+     * so every pane is told where the socket is; a thread that sleeps until
+     * somebody connects. The setting decides whether a request is accepted. */
+    {
+        char runner_bin[1024];
+        if (resolve_liu_notify_path(runner_bin, sizeof runner_bin) && runner_bin[0] == '/')
+            agentctl_set_runner(runner_bin);
+        agentctl_set_helpers(session_helper_bin_dir());
+        agentctl_set_state_dir(config_user_dir());
+    }
+    /* The subagents an agent in a pane starts itself, shown as job tabs
+     * beside its tab (agentctl/agentctl_subagents.h): a thread that starts
+     * with the first pane running an agent that has them. */
+    agentctl_subagents_start(platform_wake_event_loop, true);
+    agentctl_subagents_set_enabled(app.config.agent_subagent_tabs);
+    session_local_set_pane_gone_hook(liu_pane_gone);
+    ensure_lifecycle_atexit();
+    if (agentctl_start(platform_wake_event_loop)) {
+        g_agentctl_running = true;
+        liu_agentctl_apply_config(&app.config);
+        if (app.config.agent_orchestration && !app.config.agent_orchestration_notice_seen) {
+            char names[64];
+            liu_agentctl_skills_install(names, sizeof names);
+            if (names[0])
+                snprintf(g_agentctl_notice, sizeof g_agentctl_notice,
+                         "Liu added a skill so %s can start other agents in Liu tabs", names);
+        }
+    } else {
+        fprintf(stderr, "liu: agent control not started\n");
+    }
 
     /* Kick the CLI-agent probe off the main thread so its ~250 access()
      * syscalls overlap with window/Metal bring-up. Picker opens join the
@@ -20729,8 +21460,13 @@ int main(int argc, char **argv) {
     /* The restore replays the same saved state at every launch, so a launch
      * that keeps ending early stops replaying it (core/launch_guard.h): the
      * saved session is set aside, not deleted, and the window says so. */
+    bool no_sessions = liu_no_sessions();
+    if (no_sessions) {
+        g_sessions_save_frozen = true;
+        app_sessions_persist_off();
+    }
     i32 guard_failed = 0;
-    bool guard_skip = liu_launch_guard_begin(&guard_failed);
+    bool guard_skip = !no_sessions && liu_launch_guard_begin(&guard_failed);
     if (guard_skip) {
         char kept[1024];
         if (app_sessions_set_aside(kept, sizeof kept)) {
@@ -20752,7 +21488,7 @@ int main(int argc, char **argv) {
             app_show_info_banner(&app, line1, line2);
         }
     }
-    if (getenv("LIU_NO_RESTORE") || guard_skip || !app_restore_sessions(&app)) {
+    if (no_sessions || getenv("LIU_NO_RESTORE") || guard_skip || !app_restore_sessions(&app)) {
         Session *local_session = session_create_local(app.grid_cols, app.grid_rows);
         if (!local_session || session_status(local_session) != SESSION_CONNECTED) {
             char why[512];
@@ -20769,6 +21505,12 @@ int main(int argc, char **argv) {
          * an OSC 0/2 title or OSC 7 cwd. Other `app_new_tab` call sites
          * continue to use `Terminal`. */
         app_adopt_tab(&app, local_session, LIU_APP_TITLE);
+    }
+    if (app.restore_resumed_agents > 0) {
+        char msg[96];
+        snprintf(msg, sizeof msg, "Resumed %d agent%s", app.restore_resumed_agents,
+                 app.restore_resumed_agents == 1 ? "" : "s");
+        app_show_toast(&app, msg);
     }
     startup_stage("session_objects_ready");
 #ifdef LIU_SLEEP_SNAPSHOT_PROBE
@@ -21661,6 +22403,20 @@ int main(int argc, char **argv) {
         {
             f64 leave_in = app_fb_status_wake_in(&app, frame_now);
             if (leave_in > 0.0 && timeout > leave_in) timeout = leave_in;
+        }
+
+        /* A working job tab's haze draws a new picture on some of its
+         * AGC_HAZE_FPS frames and a job tab's hover counts a turn in whole
+         * minutes: sleep no further than the next frame either owes
+         * (agentctl_card.h). */
+        for (i32 wi = 0; wi < g_liu_win_count; wi++) {
+            AppState *ws = g_liu_wins[wi].st;
+            /* a hidden window is not painted, so its edge is never moved on:
+             * it must not hold the wait at 1 ms until it is shown again */
+            if (!ws || ws->agentctl_next_edge <= 0.0 || !g_liu_wins[wi].visible) continue;
+            f64 in = ws->agentctl_next_edge - frame_now;
+            if (in < 0.001) in = 0.001;
+            if (timeout > in) timeout = in;
         }
 
         /* A transfer's card counts what a worker moves, and the worker wakes
@@ -23051,6 +23807,331 @@ int main(int argc, char **argv) {
                 }
             }
 
+            /* "Start another agent?" (ui/agentctl_prompt.h) intercepts events,
+             * on the trust rule of ui/hostkey_prompt.h: nothing accepts in its
+             * first second, Enter only once the keyboard has been quiet for a
+             * second, Escape declines. A click outside the panel is no answer. */
+            if (app.agentctl_prompt_active) {
+                f64 ap_now = platform_time_sec();
+                HostkeyAnswer ap = HOSTKEY_ANSWER_NONE;
+                bool ap_trust = false;
+                if (event.type == EVENT_KEY_DOWN) {
+                    u32 ap_key = event.key.key;
+                    ap = hostkey_prompt_key(false, ap_key == KEY_ESCAPE, ap_key == KEY_ENTER,
+                                            ap_now - app.agentctl_prompt_quiet_since);
+                    if (ap == HOSTKEY_ANSWER_NONE) app.agentctl_prompt_quiet_since = ap_now;
+                    /* Shift+Enter: this one and the tab's later ones, on the same rule */
+                    ap_trust = ap == HOSTKEY_ANSWER_ACCEPT && (event.key.mods & MOD_SHIFT);
+                }
+                if (event.type == EVENT_CHAR_INPUT) app.agentctl_prompt_quiet_since = ap_now;
+                if (event.type == EVENT_MOUSE_DOWN) {
+                    AgentctlPromptGeom ag = agentctl_prompt_geom(
+                        (f32)app.fb_width, (f32)app.fb_height, app.dpi_scale,
+                        paste_summary_rows(&app.agentctl_prompt.task));
+                    AgentctlPromptHit hit = agentctl_prompt_hit(&ag, (f32)event.mouse.x, (f32)event.mouse.y);
+                    ap = hostkey_prompt_click(hit == AGENTCTL_PROMPT_HIT_START || hit == AGENTCTL_PROMPT_HIT_TRUST,
+                                              hit == AGENTCTL_PROMPT_HIT_DECLINE,
+                                              ap_now - app.agentctl_prompt_shown_at);
+                    ap_trust = ap == HOSTKEY_ANSWER_ACCEPT && hit == AGENTCTL_PROMPT_HIT_TRUST;
+                }
+                if (ap != HOSTKEY_ANSWER_NONE) {
+                    liu_agentctl_resolve(&app, ap == HOSTKEY_ANSWER_ACCEPT, ap_trust);
+                    needs_redraw = true;
+                    continue;
+                }
+                if (event.type != EVENT_RESIZE && event.type != EVENT_CLOSE &&
+                    event.type != EVENT_DPI_CHANGE &&
+                    event.type != EVENT_FOCUS && event.type != EVENT_BLUR)
+                    continue;
+            }
+
+            /* A job tab's context menu: a row is chosen with a click, the
+             * pointer or the arrow keys; anything else outside closes it. */
+            if (app.job_ctx_menu_active) {
+                bool jm_handled = false;
+                if (event.type == EVENT_MOUSE_MOVE) {
+                    app.hover_x = (f32)event.mouse.x;
+                    app.hover_y = (f32)event.mouse.y;
+                    i32 row = app_job_menu_row_at(&app, app.hover_x, app.hover_y);
+                    if (row != app.job_ctx_menu_selected) { app.job_ctx_menu_selected = row; needs_redraw = true; }
+                    if (row >= 0) platform_set_cursor(CURSOR_POINTER);
+                    jm_handled = true;
+                } else if (event.type == EVENT_MOUSE_DOWN) {
+                    i32 row = app_job_menu_row_at(&app, (f32)event.mouse.x, (f32)event.mouse.y);
+                    if (row >= 0 && event.mouse.button == 0) app_job_menu_run(&app, row);
+                    else app.job_ctx_menu_active = false;
+                    needs_redraw = true;
+                    jm_handled = true;
+                } else if (event.type == EVENT_KEY_DOWN) {
+                    CtxMenuBox jb;
+                    i32 jk[JOB_MENU_MAX_ROWS];
+                    CtxMenuRow jr[JOB_MENU_MAX_ROWS];
+                    i32 jn = app_job_menu_layout(&app, &jb, jk, jr);
+                    u32 k = event.key.key;
+                    if (k == KEY_ESCAPE) app.job_ctx_menu_active = false;
+                    else if (k == KEY_DOWN || k == KEY_UP) {
+                        i32 sel = app.job_ctx_menu_selected;
+                        for (i32 step = 0; step < jn; step++) {
+                            sel = sel < 0 ? (k == KEY_DOWN ? 0 : jn - 1) : (sel + (k == KEY_DOWN ? 1 : jn - 1)) % jn;
+                            if (jr[sel].enabled) break;
+                        }
+                        app.job_ctx_menu_selected = sel;
+                    } else if (k == KEY_ENTER && app.job_ctx_menu_selected >= 0) {
+                        app_job_menu_run(&app, app.job_ctx_menu_selected);
+                    }
+                    needs_redraw = true;
+                    jm_handled = true;
+                } else if (event.type == EVENT_CHAR_INPUT || event.type == EVENT_SCROLL) {
+                    jm_handled = true;
+                }
+                if (jm_handled) continue;
+            }
+
+            /* The team panel: a click on a job opens its chat; Escape or a
+             * click outside closes it. */
+            if (app.agentctl_team_open) {
+                if (event.type == EVENT_MOUSE_MOVE) {
+                    app.hover_x = (f32)event.mouse.x;
+                    app.hover_y = (f32)event.mouse.y;
+                    AgcTeamGeom tg;
+                    app_agentctl_team_layout(&app, &tg);
+                    if (agentctl_team_hit(&tg, app.hover_x, app.hover_y) >= 0) platform_set_cursor(CURSOR_POINTER);
+                } else if (event.type == EVENT_MOUSE_DOWN) {
+                    AgcTeamGeom tg;
+                    app_agentctl_team_layout(&app, &tg);
+                    i32 row = agentctl_team_hit(&tg, (f32)event.mouse.x, (f32)event.mouse.y);
+                    app.agentctl_team_open = false;
+                    if (row >= 0 && row < app.agentctl_team_n) app_agentctl_panel_open(&app, app.agentctl_team_jobs[row]);
+                    needs_redraw = true;
+                } else if (event.type == EVENT_KEY_DOWN && event.key.key == KEY_ESCAPE) {
+                    app.agentctl_team_open = false;
+                    needs_redraw = true;
+                }
+                if (event.type != EVENT_RESIZE && event.type != EVENT_CLOSE && event.type != EVENT_DPI_CHANGE &&
+                    event.type != EVENT_FOCUS && event.type != EVENT_BLUR)
+                    continue;
+            }
+
+            /* A delegated agent's chat (ui/agentctl_card.h): its field for
+             * the next message has the keyboard (Enter sends it), its buttons,
+             * its scroll, Escape or a click outside to hide it. A tool the job
+             * asks for takes Y / A / N while nothing is written; Cmd+F finds
+             * in its log, a drag over the log picks rows (Cmd+C copies them,
+             * Cmd+A picks all), Cmd+click on a file's name opens it. */
+            if (app.agentctl_panel_open) {
+                bool lg_handled = false;
+                bool lg_composing = app.agentctl_compose_agent >= 0;
+                bool lg_watched = !lg_composing && app.agentctl_panel_snap.watched;
+                bool lg_can_write = lg_composing ||
+                                    (!lg_watched && agentctl_msg_state(app.agentctl_panel_snap.state) != AGC_MSG_ENDED);
+                bool lg_asking = !lg_composing && app.agentctl_panel_snap.asking[0] != '\0';
+                u32 lg_cp = event.type == EVENT_CHAR_INPUT ? event.char_input.codepoint : 0;
+                u32 job = app.agentctl_panel_job;
+                if (app.agentctl_find_on) {
+                    /* find: the keys belong to the query */
+                    if (event.type == EVENT_CHAR_INPUT && !(event.char_input.mods & (MOD_CTRL | MOD_SUPER))) {
+                        TextEdit fe = app_edit(&app, app.agentctl_find, &app.agentctl_find_len, (i32)sizeof app.agentctl_find);
+                        textedit_insert_cp(&fe, APP_EDIT_UNDO(&app), event.char_input.codepoint);
+                        app_edit_done(&app, app.agentctl_find_len);
+                        app.agentctl_find_row = -1;
+                        app_agentctl_find_step(&app, -1);           /* the newest match first */
+                        lg_handled = true;
+                    } else if (event.type == EVENT_KEY_DOWN) {
+                        u32 fk = event.key.key;
+                        TextEdit fe = app_edit(&app, app.agentctl_find, &app.agentctl_find_len, (i32)sizeof app.agentctl_find);
+                        if (fk == KEY_ESCAPE || (fk == KEY_F && (event.key.mods & MOD_SUPER))) {
+                            app.agentctl_find_on = false;
+                            app.agentctl_find_row = -1;
+                        } else if (fk == KEY_ENTER) {
+                            app_agentctl_find_step(&app, (event.key.mods & MOD_SHIFT) ? 1 : -1);
+                        } else if (textedit_key(&fe, APP_EDIT_UNDO(&app), (i32)fk, event.key.mods)) {
+                            app_edit_done(&app, app.agentctl_find_len);
+                            app.agentctl_find_row = -1;
+                            if (app.agentctl_find_len) app_agentctl_find_step(&app, -1);
+                        }
+                        lg_handled = true;
+                    }
+                    if (lg_handled) {
+                        needs_redraw = true;
+                        continue;
+                    }
+                }
+                if (event.type == EVENT_CHAR_INPUT && lg_asking && app.agentctl_msg_len == 0 &&
+                    !(event.char_input.mods & (MOD_CTRL | MOD_SUPER)) &&
+                    (lg_cp == 'y' || lg_cp == 'Y' || lg_cp == 'a' || lg_cp == 'A' || lg_cp == 'n' || lg_cp == 'N')) {
+                    /* the tool it waits for: allowed once, always, or refused */
+                    const char *dec = (lg_cp == 'y' || lg_cp == 'Y') ? "allow" : (lg_cp == 'a' || lg_cp == 'A') ? "always" : "deny";
+                    agentctl_tool_answer(job, dec);
+                    lg_handled = true;
+                } else if (event.type == EVENT_CHAR_INPUT && (event.char_input.mods & MOD_CTRL) &&
+                    !(event.char_input.mods & MOD_SUPER) && lg_cp >= 'a' && lg_cp <= 'z') {
+                    /* the terminal's own keys: Ctrl+C stops the turn (or drops
+                     * what is written), Ctrl+D ends the job, asked twice; the
+                     * rest edit the line */
+                    if (lg_cp == 'c' && lg_watched) {
+                        snprintf(app.agentctl_msg_note, sizeof app.agentctl_msg_note, "Its own agent runs this subagent");
+                    } else if (lg_cp == 'c') {
+                        if (!lg_composing && app.agentctl_panel_snap.state == AGJ_RUNNING) agentctl_request_stop(job);
+                        else if (app.agentctl_msg_len > 0) {
+                            app.agentctl_msg[0] = '\0';
+                            app.agentctl_msg_len = 0;
+                            app.agentctl_msg_queued = false;
+                        }
+                        app.agentctl_msg_note[0] = '\0';
+                    } else if (lg_cp == 'd' && !lg_composing) {
+                        f64 dnow = platform_time_sec();
+                        if (lg_watched || app.agentctl_panel_snap.state == AGJ_ENDED ||
+                            (app.agentctl_close_armed_at > 0.0 && dnow - app.agentctl_close_armed_at < 6.0)) {
+                            app.agentctl_close_armed_at = 0.0;
+                            agentctl_request_close(job);
+                            app_agentctl_panel_close(&app);
+                        } else {
+                            app.agentctl_close_armed_at = dnow;
+                            snprintf(app.agentctl_msg_note, sizeof app.agentctl_msg_note, "Ctrl+D again ends this job");
+                        }
+                    } else if (lg_can_write) {
+                        TextEdit me = app_edit(&app, app.agentctl_msg, &app.agentctl_msg_len, (i32)sizeof app.agentctl_msg);
+                        if (textedit_key(&me, APP_EDIT_UNDO(&app), (i32)(KEY_A + (lg_cp - 'a')), MOD_CTRL))
+                            app_edit_done(&app, app.agentctl_msg_len);
+                    }
+                    lg_handled = true;
+                } else if (event.type == EVENT_CHAR_INPUT && lg_can_write) {
+                    TextEdit me = app_edit(&app, app.agentctl_msg, &app.agentctl_msg_len, (i32)sizeof app.agentctl_msg);
+                    textedit_insert_cp(&me, APP_EDIT_UNDO(&app), event.char_input.codepoint);
+                    app_edit_done(&app, app.agentctl_msg_len);
+                    app.agentctl_msg_note[0] = '\0';
+                    app.agentctl_close_armed_at = 0.0;
+                    lg_handled = true;
+                }
+                if (event.type == EVENT_KEY_DOWN) {
+                    AgentctlPanelGeom lg;
+                    app_agentctl_panel_layout(&app, &lg);
+                    u32 lk = event.key.key;
+                    bool cmd = (event.key.mods & MOD_SUPER) != 0;
+                    TextEdit me = app_edit(&app, app.agentctl_msg, &app.agentctl_msg_len, (i32)sizeof app.agentctl_msg);
+                    if (lk == KEY_ESCAPE) {
+                        if (app.agentctl_sel_a >= 0) app.agentctl_sel_a = app.agentctl_sel_b = -1;
+                        else {
+                            app_agentctl_panel_close(&app);
+                            app.agentctl_compose_agent = -1;
+                        }
+                        lg_handled = true;
+                    }
+                    else if (cmd && lk == KEY_F && !lg_composing) {
+                        app.agentctl_find_on = true;
+                        app.agentctl_find_row = -1;
+                        if (app.agentctl_find_len) app_agentctl_find_step(&app, -1);
+                        lg_handled = true;
+                    }
+                    else if (cmd && lk == KEY_C && app.agentctl_sel_a >= 0) { app_agentctl_panel_copy(&app, false); lg_handled = true; }
+                    else if (cmd && lk == KEY_A && app.agentctl_msg_len == 0 && app.agentctl_panel_row_count > 0) {
+                        app.agentctl_sel_a = 0;
+                        app.agentctl_sel_b = app.agentctl_panel_row_count - 1;
+                        lg_handled = true;
+                    }
+                    else if (lk == KEY_ENTER && cmd) {
+                        /* the session in the agent's own interface, beside */
+                        if (lg.btn[AGC_BTN_CONTINUE].w > 0.0f) {
+                            app_agentctl_panel_close(&app);
+                            liu_agentctl_continue(&app, job);
+                        }
+                        lg_handled = true;
+                    }
+                    else if (lk == KEY_ENTER)         { if (lg_can_write) app_agentctl_panel_send(&app); lg_handled = true; }
+                    else if (lg_can_write && textedit_key(&me, APP_EDIT_UNDO(&app), (i32)lk, event.key.mods)) {
+                        app_edit_done(&app, app.agentctl_msg_len);
+                        if (app.agentctl_msg_len == 0) app.agentctl_msg_queued = false;
+                        app.agentctl_msg_note[0] = '\0';
+                        lg_handled = true;
+                    }
+                    else if (lk == KEY_UP)            { app_agentctl_panel_scroll(&app, 1); lg_handled = true; }
+                    else if (lk == KEY_DOWN)          { app_agentctl_panel_scroll(&app, -1); lg_handled = true; }
+                    else if (lk == KEY_PAGE_UP)       { app_agentctl_panel_scroll(&app, lg.log_rows - 1); lg_handled = true; }
+                    else if (lk == KEY_PAGE_DOWN)     { app_agentctl_panel_scroll(&app, -(lg.log_rows - 1)); lg_handled = true; }
+                    else if (lk == KEY_HOME)          { app_agentctl_panel_scroll(&app, 1 << 20); lg_handled = true; }
+                    else if (lk == KEY_END)           { app_agentctl_panel_scroll(&app, -(1 << 20)); lg_handled = true; }
+                }
+                if (event.type == EVENT_SCROLL) {
+                    i32 lg_rows = 0;
+                    if (event.scroll.precise) {
+                        app.agentctl_panel_wheel += event.scroll.dy;
+                        f32 step = 28.0f * app.dpi_scale;
+                        while (app.agentctl_panel_wheel >= step)  { lg_rows++; app.agentctl_panel_wheel -= step; }
+                        while (app.agentctl_panel_wheel <= -step) { lg_rows--; app.agentctl_panel_wheel += step; }
+                    } else {
+                        lg_rows = (i32)(event.scroll.dy * 3.0f);
+                        if (lg_rows == 0 && event.scroll.dy != 0) lg_rows = event.scroll.dy > 0 ? 3 : -3;
+                    }
+                    if (lg_rows) app_agentctl_panel_scroll(&app, lg_rows);
+                    lg_handled = true;
+                }
+                if (event.type == EVENT_MOUSE_MOVE) {
+                    /* the panel keeps the move: it records the pointer itself */
+                    app.hover_x = (f32)event.mouse.x;
+                    app.hover_y = (f32)event.mouse.y;
+                    if (app.agentctl_selecting) {
+                        i32 row = app_agentctl_panel_row_at(&app, app.hover_x, app.hover_y);
+                        if (row >= 0 && row != app.agentctl_sel_b) { app.agentctl_sel_b = row; lg_handled = true; }
+                    }
+                }
+                if (event.type == EVENT_MOUSE_UP && app.agentctl_selecting) {
+                    app.agentctl_selecting = false;
+                    /* a click without a drag picks nothing */
+                    if (app.agentctl_sel_a == app.agentctl_sel_b) app.agentctl_sel_a = app.agentctl_sel_b = -1;
+                    lg_handled = true;
+                }
+                if (event.type == EVENT_MOUSE_DOWN) {
+                    AgentctlPanelGeom lg;
+                    app_agentctl_panel_layout(&app, &lg);
+                    f32 lx = (f32)event.mouse.x, ly = (f32)event.mouse.y;
+                    i32 b = agentctl_panel_hit(&lg, lx, ly);
+                    i32 row = b < 0 ? app_agentctl_panel_row_at(&app, lx, ly) : -1;
+                    char why[200] = "";
+                    if (b == AGC_BTN_HIDE) { app_agentctl_panel_close(&app); app.agentctl_compose_agent = -1; }
+                    else if (b == AGC_BTN_CLOSE) { agentctl_request_close(job); app_agentctl_panel_close(&app); }
+                    else if (b == AGC_BTN_STOP) agentctl_request_stop(job);
+                    else if (b == AGC_BTN_CONTINUE) { app_agentctl_panel_close(&app); liu_agentctl_continue(&app, job); }
+                    else if (b == AGC_BTN_ALLOW) agentctl_tool_answer(job, "allow");
+                    else if (b == AGC_BTN_ALWAYS) agentctl_tool_answer(job, "always");
+                    else if (b == AGC_BTN_DENY) agentctl_tool_answer(job, "deny");
+                    else if (b == AGC_BTN_MERGE || b == AGC_BTN_DISCARD) {
+                        if (!agentctl_request_merge(job, b == AGC_BTN_MERGE, why, sizeof why))
+                            snprintf(app.agentctl_msg_note, sizeof app.agentctl_msg_note, "%s", why);
+                    }
+                    else if (b == AGC_BTN_REVIEW) {
+                        /* the other agent reviews it, read-only, beside it */
+                        const AgentctlSnapshot *rs = &app.agentctl_panel_snap;
+                        AgentctlUserSpawn us;
+                        memset(&us, 0, sizeof us);
+                        us.owner_serial = rs->owner_serial;
+                        us.agent = rs->agent == AGENTCTL_AGENT_CLAUDE ? AGENTCTL_AGENT_CODEX : AGENTCTL_AGENT_CLAUDE;
+                        us.perm = AGENTCTL_PERM_READ;
+                        us.cwd = rs->cwd;
+                        us.prompt = "Review it.";
+                        us.prompt_len = strlen(us.prompt);
+                        us.review_of = job;
+                        u32 rj = agentctl_user_spawn(&us, why, sizeof why);
+                        if (rj) app_agentctl_panel_open(&app, rj);
+                        else snprintf(app.agentctl_msg_note, sizeof app.agentctl_msg_note, "%s", why);
+                    }
+                    else if (row >= 0 && (event.mouse.mods & MOD_SUPER)) {
+                        if (!app_agentctl_panel_open_path_at(&app, lx, ly))
+                            snprintf(app.agentctl_msg_note, sizeof app.agentctl_msg_note, "No file by that name here");
+                    }
+                    else if (row >= 0) {
+                        app.agentctl_sel_a = app.agentctl_sel_b = row;
+                        app.agentctl_selecting = true;
+                    }
+                    else if (!pc_rect_hit(lg.panel, lx, ly)) { app_agentctl_panel_close(&app); app.agentctl_compose_agent = -1; }
+                    lg_handled = true;
+                }
+                if (lg_handled) needs_redraw = true;
+                if (event.type != EVENT_RESIZE && event.type != EVENT_CLOSE &&
+                    event.type != EVENT_DPI_CHANGE &&
+                    event.type != EVENT_FOCUS && event.type != EVENT_BLUR)
+                    continue;
+            }
+
             /* Host key verification dialog intercepts events */
             if (app.hostkey_dialog_active) {
                 /* What says yes, and from when: ui/hostkey_prompt.h. A changed
@@ -23330,6 +24411,15 @@ int main(int argc, char **argv) {
             }
 
             Tab *tab = app_active_tab(&app);
+
+            /* Esc while a sidebar section is held by its header (or a rail
+             * button): the press is forgotten — no fold, no move, no detach
+             * — and the key goes no further. */
+            if (event.type == EVENT_KEY_DOWN && event.key.key == KEY_ESCAPE &&
+                app_side_drag_escape(&app)) {
+                needs_redraw = true;
+                continue;
+            }
 
             /* The image lightbox is modal over its window: it covers the pane
              * and everything it swallows is input the user cannot see the
@@ -24900,8 +25990,15 @@ int main(int argc, char **argv) {
                     if (key == KEY_UP)    { platform_window_snap(window, WIN_SNAP_TOP_HALF);     break; }
                     if (key == KEY_DOWN)  { platform_window_snap(window, WIN_SNAP_BOTTOM_HALF);  break; }
                 }
-                /* Cmd+Alt+Arrow: split divider nudge in active tab */
-                if ((mods & MOD_SUPER) && (mods & MOD_ALT) && !(mods & MOD_CTRL) && !(mods & MOD_SHIFT)) {
+                /* Split divider nudge in the active tab: Cmd+Ctrl+Alt+Arrow on
+                 * macOS, where Cmd+Alt+Arrow moves the keyboard between panes
+                 * (ACT_FOCUS_PANE_*); Super+Alt+Arrow elsewhere. */
+#ifdef PLATFORM_MACOS
+                const u32 nudge_mods = MOD_SUPER | MOD_CTRL | MOD_ALT;
+#else
+                const u32 nudge_mods = MOD_SUPER | MOD_ALT;
+#endif
+                if ((mods & (MOD_SUPER | MOD_CTRL | MOD_ALT | MOD_SHIFT)) == nudge_mods) {
                     Tab *at = app_active_tab(&app);
                     if (at && at->split != SPLIT_NONE) {
                         SplitLayoutNode *root = NULL;
@@ -25664,6 +26761,13 @@ int main(int argc, char **argv) {
                     case ACT_SPLIT_VERTICAL:
                         app_split_tab(&app, SPLIT_V);
                         break;
+                    case ACT_FOCUS_PANE_LEFT:  app_focus_pane_dir(&app, PANE_NAV_LEFT);  break;
+                    case ACT_FOCUS_PANE_RIGHT: app_focus_pane_dir(&app, PANE_NAV_RIGHT); break;
+                    case ACT_FOCUS_PANE_UP:    app_focus_pane_dir(&app, PANE_NAV_UP);    break;
+                    case ACT_FOCUS_PANE_DOWN:  app_focus_pane_dir(&app, PANE_NAV_DOWN);  break;
+                    case ACT_NEXT_PANE:        app_focus_pane_cycle(&app, 1);            break;
+                    case ACT_PREV_PANE:        app_focus_pane_cycle(&app, -1);           break;
+                    case ACT_TOGGLE_PANE_ZOOM: app_pane_zoom_toggle(&app);               break;
                     case ACT_RENAME_TAB:
                         app_start_tab_rename(&app, app.active_tab);
                         break;
@@ -25782,6 +26886,9 @@ int main(int argc, char **argv) {
                     if (key == KEY_ENTER && !app_translate_owns_prompt(&app, fs2))
                         app_record_submitted_command(&app, ft2, fs2);
                     app_send_input(&app, fs2, out, n);
+                    /* A prompt sent to an agent that has not opened its session yet. */
+                    if (key == KEY_ENTER && !prompt_enter_is_newline(mods, out, n))
+                        app_agent_session_prompt_sent(&app, ft2, platform_time_sec());
                     if (!app_translate_owns_prompt(&app, fs2)) {
                         bool agent = app_pane_is_agent(&app, ft2, fs2);
                         if (key == KEY_ENTER) {
@@ -26344,6 +27451,22 @@ int main(int argc, char **argv) {
                 if (event.mouse.button == 1) {
                     HitResult rc_hit = ui_hit_test(&app, mx, my);
 
+                    /* Right-click on a delegated agent's job tab: its menu. */
+                    if (rc_hit.type == HIT_TAB_JOB) {
+                        u32 rjob = app_tab_job_at(&app, rc_hit.index, rc_hit.sub_index);
+                        /* the count chip stands for every job: no one job's menu */
+                        if (app_tab_job_is_chip(&app, rc_hit.index, rc_hit.sub_index)) rjob = 0;
+                        if (rjob) {
+                            app.term_ctx_menu_active = app.tab_ctx_menu_active = app.group_ctx_menu_active = false;
+                            app.job_ctx_menu_active = true;
+                            app.job_ctx_menu_job = rjob;
+                            app.job_ctx_menu_x = mx;
+                            app.job_ctx_menu_y = my;
+                            app.job_ctx_menu_selected = -1;
+                            needs_redraw = true;
+                        }
+                        break;
+                    }
                     /* Right-click on a tab opens the tab context menu. */
                     if (rc_hit.type == HIT_TAB) {
                         /* Cancel any ongoing rename first */
@@ -26773,8 +27896,30 @@ int main(int argc, char **argv) {
                     break;
                 }
                 case HIT_TAB_GROUP_HEADER: {
-                    /* Toggle collapsed state of the clicked tab group */
+                    /* Toggle collapsed state of the clicked tab group — unless
+                     * its name is being edited: a click on the field is the
+                     * field's, not a fold. */
+                    if (app.chip_rename_active && app.chip_rename_group_index == hit.index)
+                        break;
                     app_toggle_tab_group_collapsed(&app, hit.index);
+                    break;
+                }
+                case HIT_JOB_TIP:
+                    /* A job tab's hover: the job's chat. */
+                    if (hit.index > 0) app_agentctl_panel_open(&app, (u32)hit.index);
+                    needs_redraw = true;
+                    break;
+                case HIT_TAB_JOB: {
+                    /* A delegated agent's tab: its log. The count chip in
+                     * front of them folds them into it, or opens them. */
+                    if (app_tab_job_is_chip(&app, hit.index, hit.sub_index)) {
+                        app_tab_jobs_toggle_fold(&app, hit.index);
+                        needs_redraw = true;
+                        break;
+                    }
+                    u32 job = app_tab_job_at(&app, hit.index, hit.sub_index);
+                    if (job) app_agentctl_panel_open(&app, job);
+                    needs_redraw = true;
                     break;
                 }
                 case HIT_TOOLBAR_BTN:
@@ -26940,11 +28085,14 @@ int main(int argc, char **argv) {
                             fb_go_up(&app.filebrowser);
                             if (wg) fb_graph_rescope(&app.filebrowser, app.filebrowser.cwd);
                         } else {
-                            /* Path/breadcrumb area — arm header drag. */
+                            /* Path/breadcrumb area — arm header drag: out of
+                             * the bar it detaches the explorer, inside it it
+                             * moves the section. */
                             app.fb_header_drag_pending = true;
                             app.fb_header_drag_active  = false;
                             app.fb_header_drag_start_x = mx;
                             app.fb_header_drag_start_y = my;
+                            app_side_drag_press(&app, SB_SEC_FILES, mx, my, false);
                         }
                     }
                     break;
@@ -26955,13 +28103,10 @@ int main(int argc, char **argv) {
                     i32 sec = hit.index;
                     if (sec < 0 || sec >= SB_SEC_COUNT) break;
                     if (hit.sub_index == 3) {
-                        /* Rail button: unfold the bar and make sure that section
-                         * is on and open — the click named it. */
-                        app_sidebar_set_visible(&app, true);
-                        app.config.sidebar_enabled[sec] = true;
-                        app.sidebar_sec_open[sec] = true;
-                        app.sidebar_sec_inited = true;
-                        RELAYOUT();
+                        /* Rail button: its click (a still release, below)
+                         * unfolds the bar on that section; dragged, it moves
+                         * the section among the others. */
+                        app_side_drag_press(&app, sec, mx, my, true);
                         break;
                     }
                     if (hit.sub_index == 1 && sec == SB_SEC_TABS) {
@@ -26969,12 +28114,21 @@ int main(int argc, char **argv) {
                         if (app_open_local_tab(&app, s, "Terminal") >= 0) RELAYOUT();
                         break;
                     }
-                    if (hit.sub_index == 0) {
-                        if (!app.sidebar_sec_inited) {
-                            for (i32 i = 0; i < SB_SEC_COUNT; i++) app.sidebar_sec_open[i] = true;
-                            app.sidebar_sec_inited = true;
-                        }
-                        app.sidebar_sec_open[sec] = !app.sidebar_sec_open[sec];
+                    /* The header folds or opens its section on a still
+                     * release, and moves it when dragged
+                     * (ui/sidebar_reorder.c). */
+                    if (hit.sub_index == 0)
+                        app_side_drag_press(&app, sec, mx, my, true);
+                    break;
+                }
+                case HIT_SIDEBAR_JUMP: {
+                    /* A jump pill: go to the nearest tab it stands for, and
+                     * let the list glide there rather than snap. */
+                    i32 ti = hit.index;
+                    if (ti >= 0 && ti < app.tab_count) {
+                        if (ti != app.active_tab) app_switch_tab(&app, ti);
+                        app._tab_scroll_last_active = app.active_tab;
+                        app_side_tabs_glide_to(&app, ti, platform_time_sec());
                     }
                     break;
                 }
@@ -27015,7 +28169,9 @@ int main(int argc, char **argv) {
                          * The pending arm is consumed by MOUSE_UP. */
                         bool cmd_click_handled = false;
                         if (event.mouse.mods & MOD_APP) {
-                            if (active->split != SPLIT_NONE) {
+                            /* A zoomed tab shows one pane: there is no layout
+                             * to drag it in, so the click is a single pane's. */
+                            if (active->split != SPLIT_NONE && tab_zoomed_pane(active) < 0) {
                                 i32 src_pane = app_pane_index_at(&app, active, mx, my);
                                 if (src_pane >= 0) {
                                     app.pane_drag_pending  = true;
@@ -27807,7 +28963,7 @@ int main(int argc, char **argv) {
                      * (browser_native_set_cmd_passthrough); over the browser's
                      * own Metal chrome strip the event always reaches Liu. */
                     if ((event.mouse.mods & MOD_SUPER) && atab &&
-                        atab->split != SPLIT_NONE) {
+                        atab->split != SPLIT_NONE && tab_zoomed_pane(atab) < 0) {
                         i32 src_pane = app_pane_index_at(&app, atab, mx, my);
                         if (src_pane >= 0) {
                             app.pane_drag_pending   = true;
@@ -27842,6 +28998,11 @@ int main(int argc, char **argv) {
             case EVENT_MOUSE_MOVE: {
                 app.hover_x = (f32)event.mouse.x;
                 app.hover_y = (f32)event.mouse.y;
+
+                /* A section header held for a reorder: the lifted header and
+                 * its drop line follow the pointer, whatever is under it. */
+                if (app_side_drag_move(&app, app.hover_x, app.hover_y))
+                    needs_redraw = true;
 
                 /* The settings panel derives every hover highlight from the
                  * pointer during its own render (s_hover_amt), so a frame has
@@ -28654,7 +29815,8 @@ int main(int argc, char **argv) {
                             break;
                         }
                         case HIT_TAB: case HIT_TAB_CLOSE: case HIT_TAB_NEW:
-                        case HIT_TAB_GROUP_HEADER:
+                        case HIT_TAB_GROUP_HEADER: case HIT_TAB_JOB: case HIT_JOB_TIP:
+                        case HIT_SIDEBAR_JUMP:
                         case HIT_STATUS_GIT:
                         case HIT_SCROLL_BOTTOM:
                         case HIT_TOOLBAR_BTN:    platform_set_cursor(CURSOR_POINTER); break;
@@ -28945,6 +30107,31 @@ int main(int argc, char **argv) {
                     break;
                 }
 #endif
+                /* A held section header or rail button: dropped where it
+                 * points, or its click when it never moved. Before anything
+                 * below can break out, so a press is never left armed under a
+                 * free pointer; the explorer's detach is decided further down,
+                 * on its own. */
+                {
+                    i32 rail_open = -1;
+                    if (app_side_drag_release(&app, (f32)event.mouse.x, (f32)event.mouse.y, &rail_open))
+                        needs_redraw = true;
+                    if (rail_open >= 0 && rail_open < SB_SEC_COUNT) {
+                        /* A rail button's click: unfold the bar and make sure
+                         * that section is on and open — the click named it. */
+                        app_sidebar_set_visible(&app, true);
+                        app.config.sidebar_enabled[rail_open] = true;
+                        if (!app.sidebar_sec_inited) {
+                            for (i32 i = 0; i < SB_SEC_COUNT; i++) app.sidebar_sec_open[i] = true;
+                            app.sidebar_sec_inited = true;
+                        }
+                        app.sidebar_sec_open[rail_open] = true;
+                        i32 _w, _h, _fw, _fh;
+                        platform_window_get_size(window, &_w, &_h);
+                        platform_window_get_framebuffer_size(window, &_fw, &_fh);
+                        app_update_layout(&app, _w, _h, _fw, _fh);
+                    }
+                }
                 if (sftp_tab_mouse_up(&app, (f32)event.mouse.x, (f32)event.mouse.y,
                                       event.mouse.button, event.mouse.mods)) {
                     needs_redraw = true;
@@ -29563,6 +30750,8 @@ int main(int argc, char **argv) {
                  * above, the wheel must neither scroll the pane behind it nor
                  * be reported to the program there (app_dialog_has_pointer). */
                 if (app_dialog_has_pointer(&app)) break;
+                /* nor over a job tab's hover, which covers the pane under it */
+                if (ui_hit_test(&app, app.hover_x, app.hover_y).type == HIT_JOB_TIP) break;
 
                 /* (Cmd+Scroll → opacity gesture removed by request — opacity is
                  * adjusted only via Settings; no scroll/drag shortcut.) */
@@ -29688,6 +30877,7 @@ int main(int argc, char **argv) {
                             /* Trackpad deltas are pixels; a wheel notch is rows. */
                             f32 d = event.scroll.precise ? -event.scroll.dy
                                                          : -event.scroll.dy * L.row_h;
+                            app.side_tabs_glide = false;   /* the hand takes over */
                             app.side_tabs_scroll = sidebar_scroll_clamp(sr, app.side_tabs_scroll + d);
                             handled = true;
                         } else if (sr->id == SB_SEC_FILES) {
@@ -30477,12 +31667,25 @@ int main(int argc, char **argv) {
         /* Before the session poll, so a turn edge the agent reported is
          * already in its pane when the per-tab pass derives the strip. */
         liu_route_agent_signals();
+        liu_route_agentctl();
         liu_activity_tick(platform_time_sec());
         liu_secure_input_tick();
         liu_pane_focus_tick();
+        for (i32 wi = 0; wi < g_liu_win_count; wi++)
+            if (g_liu_wins[wi].st) {
+                app_pane_zoom_settle(g_liu_wins[wi].st);
+                app_note_keyboard_pane(g_liu_wins[wi].st);
+            }
         /* Up long enough: this launch succeeded (core/launch_guard.h). */
         if (g_launch_guard_armed && platform_time_sec() >= g_launch_guard_healthy_at)
             liu_launch_guard_settle();
+        for (i32 wi = 0; wi < g_liu_win_count; wi++)
+            if (g_liu_wins[wi].st) app_agent_sessions_tick(g_liu_wins[wi].st, platform_time_sec());
+        liu_sessions_autosave_tick(platform_time_sec());
+        /* The transcript viewer, a handoff and a migration use the borrowed
+         * scan arena only until they return: half a minute after the last of
+         * them its written pages go back. */
+        chat_scan_arena_trim_idle(30.0);
         i32 fd_fires = platform_take_fd_fire_count();
         /* had_saturated_pane_last_frame is the second half of the read-watch
          * hold: that pane's watch is silenced on purpose, so this is the only
@@ -30972,6 +32175,22 @@ int main(int argc, char **argv) {
                 if (g_liu_wins[wi].st == cur) g_liu_wins[wi].needs_redraw = true;
         }
 
+        /* The same for the agent-control skill files: once, then remembered. */
+        if (g_agentctl_notice[0] && !g_hooks_notice[0] && !liu_intro_active() && g_liu_win_count > 0 &&
+            !app.info_banner_active) {
+            app_show_info_banner(&app, g_agentctl_notice,
+                "It is removed when Liu quits. Settings > Terminal turns this off."
+                "     [Esc] or click = close");
+            g_agentctl_notice[0] = '\0';
+            if (!app.config.agent_orchestration_notice_seen) {
+                app.config.agent_orchestration_notice_seen = true;
+                config_save(&app.config, config_file_path());
+                liu_broadcast_config(cur, false);
+            }
+            for (i32 wi = 0; wi < g_liu_win_count; wi++)
+                if (g_liu_wins[wi].st == cur) g_liu_wins[wi].needs_redraw = true;
+        }
+
         /* Local model download: when it finishes, record + persist the path
          * so the local backend can use it immediately (and on next launch),
          * then toast. Polled regardless of whether Settings is open, so a
@@ -31010,21 +32229,23 @@ int main(int argc, char **argv) {
          * through `cur` is not enough. Consumed at the TOP of the next
          * iteration (the timeout bucket and pace_presents), which is why it is
          * a "last frame" flag: the poll runs after them. */
+        /* Output does not arm the interaction boost: the next bytes wake the
+         * loop themselves (the pty reader, a socket's watch, the backlog
+         * latch), and while output is on screen the ladder above already
+         * polls at FRAME_DT_INTERACTIVE and the display link paces the
+         * frames. The boost after every burst only added turns that found
+         * nothing. Only data for the visible terminal repaints; the repaint
+         * is per window — see the poll loop above. LIU_OUTPUT_BOOST=1 arms it
+         * again. */
         had_visible_session_data_last_frame = any_visible_data;
-        if (had_session_data_last_frame && any_visible_data) {
-            /* Only data destined for the currently visible terminal both
-             * triggers a repaint and arms the 200 ms ProMotion boost.
-             * Background tabs receive their bytes (terminal_feed already
-             * ran above), but no pixel on screen changes, and repainting
-             * at 120 Hz for a hidden tab burning logs would be wasted
-             * work. The tab bar's title / activity indicator catches up
-             * on the next visible repaint (at most 0.5 s away on the
-             * cursor-blink edge). */
-            app_note_interaction(&app, platform_time_sec());
-            /* The repaint itself is per window — see the poll loop above.
-             * This still arms the ProMotion boost process-wide, which is
-             * correct: the boost is about how fast the panel may refresh, not
-             * about which window gets painted. */
+        {
+            static i32 output_boost = -1;
+            if (output_boost < 0) {
+                const char *ob = getenv("LIU_OUTPUT_BOOST");
+                output_boost = (ob && ob[0] == '1') ? 1 : 0;
+            }
+            if (output_boost && had_session_data_last_frame && any_visible_data)
+                app_note_interaction(&app, platform_time_sec());
         }
 
         /* Pick up any completed background paste/transfer worker so the
@@ -31175,9 +32396,18 @@ int main(int argc, char **argv) {
          * close-confirm resolves). */
         /* Nor over a dialog being typed into (the connect form, a server's
          * prompt, a key's passphrase): it would take the keys meant for it. */
-        if (!app.hostkey_dialog_active && !app.close_confirm_active &&
+        /* A request to start another agent, when nothing is being answered
+         * or typed into: the same rule, and the two never stack. */
+        if (!app.agentctl_prompt_active && app.agentctl_prompt_queued > 0 &&
+            !app.hostkey_dialog_active && !app.close_confirm_active &&
             !app.paste_confirm_active && !app.ssh_dialog_active &&
             !app.kbi_dialog_active && !app.passphrase_dialog_active) {
+            if (liu_agentctl_show_next(&app)) needs_redraw = true;
+        }
+        if (!app.hostkey_dialog_active && !app.close_confirm_active &&
+            !app.paste_confirm_active && !app.ssh_dialog_active &&
+            !app.kbi_dialog_active && !app.passphrase_dialog_active &&
+            !app.agentctl_prompt_active) {
             for (i32 i = 0; i < app.tab_count && !app.hostkey_dialog_active; i++) {
                 Session *panes[MAX_SPLIT_PANES];
                 i32 np = pane_sessions_collect(&app.tabs[i], panes);
@@ -31376,7 +32606,8 @@ int main(int argc, char **argv) {
             for (i32 wi = 0; wi < g_liu_win_count; wi++) {
                 AppState *ws = g_liu_wins[wi].st;
                 if (!ws || ws->visible_session_data_this_frame) continue;
-                if (liu_continuous_visual(ws, now) || transfer_edge)
+                if (liu_continuous_visual(ws, now) || transfer_edge ||
+                    (ws->agentctl_next_edge > 0.0 && now >= ws->agentctl_next_edge))
                     g_liu_wins[wi].needs_redraw = true;
                 else if (blink_edge && ws->config.cursor_blink && ws->window_focused &&
                          ws->renderer.cursor_blink_in_frame)
@@ -31812,7 +33043,7 @@ cleanup:
      *
      * Then freeze: the teardown loop below closes the windows one by one, and
      * each close would otherwise re-save a smaller tab set over this one. */
-    liu_save_all_sessions();
+    liu_save_all_sessions_final();
     g_sessions_save_frozen = true;
 
     /* Drain the in-flight sidebar paste worker so the orphan thread can't UAF

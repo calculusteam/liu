@@ -9,6 +9,7 @@
 #include "notify/hook_paths.h"
 #include "notify/hook_scan.h"
 #include "core/config.h"
+#include "core/atomic_file.h"
 
 #include "cJSON.h"
 
@@ -159,7 +160,7 @@ static bool home_join(char *out, usize cap, const char *home, const char *rel) {
  * caller distinguishes those with access() first, because "absent" and
  * "unreadable" are different findings and must not collapse into one. */
 static char *slurp(const char *path, usize cap_bytes) {
-    FILE *f = fopen(path, "rb");
+    FILE *f = atomic_file_open_regular(path);   /* a FIFO is refused, not waited on */
     if (!f) return NULL;
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
     long sz = ftell(f);
@@ -246,7 +247,7 @@ typedef struct {
 
 /* Every surface hook_paths.h names, in the order doctor prints them. The
  * `shared` flag is the one that decides whether a broken file may be repaired:
- * grok, opencode, pi and omp are files Liu owns outright, the other four are
+ * grok, opencode, pi and omp are files Liu owns outright, the other six are
  * the user's and a merge failure there is reported, never overwritten.
  *
  * Every row carries its installer's id, so a stale hook on any surface is
@@ -261,6 +262,8 @@ static const HookSurface g_surfaces[] = {
     { "antigravity", "Antigravity",  LIU_HOOK_ANTIGRAVITY_REL, true,  true  },
     { "pi",          "Pi",           LIU_HOOK_PI_REL,          false, false },
     { "omp",         "Oh My Pi",     LIU_HOOK_OMP_REL,         false, false },
+    { "devin",       "Devin",        LIU_HOOK_DEVIN_REL,       true,  true  },
+    { "qoder",       "Qoder",        LIU_HOOK_QODER_REL,       true,  true  },
 };
 #define G_SURFACE_COUNT ((i32)(sizeof g_surfaces / sizeof g_surfaces[0]))
 

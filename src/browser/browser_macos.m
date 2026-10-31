@@ -9,6 +9,7 @@
 #include "browser/pick_element_js.h"
 #include "browser/browser_chrome_js.h"
 #include "browser/browser_gesture_js.h"
+#include "browser/browser_tint_js.h"
 #include "platform/platform.h"
 #include "core/text_sanitize.h"
 
@@ -141,6 +142,14 @@ static BrowserNavClass LiuResolveBrowserHost(const char *host) {
 @property (nonatomic, copy)   NSString *pageTitle;
 @property (nonatomic, copy)   NSString *pageURL;
 @property (nonatomic, copy)   NSString *statusMsg;
+/* The colour a phone's browser frames the page in, 0xRRGGBB: its
+ * theme-color (themeTint) when it names one, else the background its top
+ * shows (pageBackground, reported by BROWSER_TINT_JS). pageTintKnown false
+ * while neither is known. A device's status bar is painted in it. */
+@property (nonatomic, assign) u32 pageTint;
+@property (nonatomic, assign) bool pageTintKnown;
+@property (nonatomic, assign) u32 themeTint, pageBackground;
+@property (nonatomic, assign) bool themeTintKnown, pageBackgroundKnown;
 /* Pending pick JSON body (UTF-8), owned by host until take_pick. */
 @property (nonatomic, assign) char *pendingJson;
 @property (nonatomic, assign) f64 lastMsgTime;
@@ -310,6 +319,7 @@ static void *kLiuTitleKVOCtx = &kLiuTitleKVOCtx;
 static void *kLiuURLKVOCtx = &kLiuURLKVOCtx;
 static void *kLiuBackKVOCtx = &kLiuBackKVOCtx;
 static void *kLiuForwardKVOCtx = &kLiuForwardKVOCtx;
+static void *kLiuTintKVOCtx = &kLiuTintKVOCtx;
 
 /* A named client world has its own globals, DOM wrappers and message handlers.
  * Page scripts can change the DOM, but cannot call or replace this bridge. */
@@ -336,6 +346,8 @@ LIU_BUMP_SCALAR_SETTER(setHasPendingAsk,  _hasPendingAsk,  bool)
 LIU_BUMP_SCALAR_SETTER(setHasPendingNav,  _hasPendingNav,  bool)
 LIU_BUMP_SCALAR_SETTER(setCanBack, _canBack, bool)
 LIU_BUMP_SCALAR_SETTER(setCanFwd,  _canFwd,  bool)
+LIU_BUMP_SCALAR_SETTER(setPageTint, _pageTint, u32)
+LIU_BUMP_SCALAR_SETTER(setPageTintKnown, _pageTintKnown, bool)
 #undef LIU_BUMP_SCALAR_SETTER
 
 #define LIU_BUMP_STRING_SETTER(Setter, ivar)                              \
@@ -372,7 +384,43 @@ LIU_BUMP_STRING_SETTER(setStatusMsg, _statusMsg)
         self.canFwd = self.webView.canGoForward;
         return;
     }
+    if (context == kLiuTintKVOCtx) {
+        [self readPageTint];
+        return;
+    }
     [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
+}
+
+/* The page's theme-color (macOS 12 and later) in sRGB. The colour under the
+ * page is not asked: Liu sets it to the terminal theme's background. */
+- (void)readPageTint {
+    NSColor *c = nil;
+    if (@available(macOS 12.0, *)) c = self.webView.themeColor;
+    NSColor *rgb = c ? [c colorUsingColorSpace:[NSColorSpace sRGBColorSpace]] : nil;
+    self.themeTintKnown = false;
+    if (rgb && rgb.alphaComponent >= 0.5) {
+        u32 v = 0;
+        CGFloat comp[3] = { rgb.redComponent, rgb.greenComponent, rgb.blueComponent };
+        for (i32 i = 0; i < 3; i++) {
+            CGFloat x = comp[i] < 0.0 ? 0.0 : comp[i] > 1.0 ? 1.0 : comp[i];
+            v = (v << 8) | (u32)(x * 255.0 + 0.5);
+        }
+        self.themeTint = v;
+        self.themeTintKnown = true;
+    }
+    [self settlePageTint];
+}
+
+- (void)settlePageTint {
+    if (self.themeTintKnown) {
+        self.pageTint = self.themeTint;
+        self.pageTintKnown = true;
+    } else if (self.pageBackgroundKnown) {
+        self.pageTint = self.pageBackground;
+        self.pageTintKnown = true;
+    } else {
+        self.pageTintKnown = false;
+    }
 }
 
 - (instancetype)initWithParentView:(NSView *)parent {
@@ -395,9 +443,15 @@ LIU_BUMP_STRING_SETTER(setStatusMsg, _statusMsg)
         injectionTime:WKUserScriptInjectionTimeAtDocumentStart
         forMainFrameOnly:NO inContentWorld:LiuBrowserWorld()];
     [uc addUserScript:gesture]; [gesture release];
+    WKUserScript *tint = [[WKUserScript alloc]
+        initWithSource:[NSString stringWithUTF8String:BROWSER_TINT_JS]
+        injectionTime:WKUserScriptInjectionTimeAtDocumentEnd
+        forMainFrameOnly:YES inContentWorld:LiuBrowserWorld()];
+    [uc addUserScript:tint]; [tint release];
     [uc addScriptMessageHandler:self contentWorld:LiuBrowserWorld() name:@"liuPick"];
     [uc addScriptMessageHandler:self contentWorld:LiuBrowserWorld() name:@"liuBrowser"];
     [uc addScriptMessageHandler:self contentWorld:LiuBrowserWorld() name:@"liuGesture"];
+    [uc addScriptMessageHandler:self contentWorld:LiuBrowserWorld() name:@"liuTint"];
 
     WKWebViewConfiguration *cfg = [[WKWebViewConfiguration alloc] init];
     cfg.userContentController = uc;
@@ -423,6 +477,8 @@ LIU_BUMP_STRING_SETTER(setStatusMsg, _statusMsg)
     [wv addObserver:self forKeyPath:@"URL" options:0 context:kLiuURLKVOCtx];
     [wv addObserver:self forKeyPath:@"canGoBack" options:0 context:kLiuBackKVOCtx];
     [wv addObserver:self forKeyPath:@"canGoForward" options:0 context:kLiuForwardKVOCtx];
+    if (@available(macOS 12.0, *))
+        [wv addObserver:self forKeyPath:@"themeColor" options:0 context:kLiuTintKVOCtx];
 
     NSView *box = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 1, 1)];
     box.wantsLayer = YES;
@@ -513,12 +569,19 @@ LIU_BUMP_STRING_SETTER(setStatusMsg, _statusMsg)
         @try { [self.webView removeObserver:self forKeyPath:@"canGoForward"
                                     context:kLiuForwardKVOCtx]; }
         @catch (NSException *e) { (void)e; }
+        if (@available(macOS 12.0, *)) {
+            @try { [self.webView removeObserver:self forKeyPath:@"themeColor"
+                                        context:kLiuTintKVOCtx]; }
+            @catch (NSException *e) { (void)e; }
+        }
         [self.webView.configuration.userContentController
             removeScriptMessageHandlerForName:@"liuPick" contentWorld:LiuBrowserWorld()];
         [self.webView.configuration.userContentController
             removeScriptMessageHandlerForName:@"liuBrowser" contentWorld:LiuBrowserWorld()];
         [self.webView.configuration.userContentController
             removeScriptMessageHandlerForName:@"liuGesture" contentWorld:LiuBrowserWorld()];
+        [self.webView.configuration.userContentController
+            removeScriptMessageHandlerForName:@"liuTint" contentWorld:LiuBrowserWorld()];
         self.webView.navigationDelegate = nil;
         self.webView.UIDelegate = nil;
         [self.webView stopLoading];
@@ -626,6 +689,19 @@ static NSData *liu_pick_sanitize(id body, NSString *sourceURL);
         return;
     }
     if (!message.frameInfo.isMainFrame) return;
+
+    /* The main frame's background, from BROWSER_TINT_JS: one number. */
+    if ([message.name isEqualToString:@"liuTint"]) {
+        id rgb = [message.body isKindOfClass:[NSDictionary class]]
+               ? ((NSDictionary *)message.body)[@"rgb"] : nil;
+        if (![rgb isKindOfClass:[NSNumber class]]) return;
+        long long v = [(NSNumber *)rgb longLongValue];
+        if (v < 0 || v > 0xFFFFFF) return;
+        self.pageBackground = (u32)v;
+        self.pageBackgroundKnown = true;
+        [self settlePageTint];
+        return;
+    }
 
     /* Internal chrome actions ("Ask Agent", Recents nav) — handled regardless
      * of pick mode. */
@@ -1530,7 +1606,44 @@ struct BrowserNative {
     bool   have_clip;     /* false = unclipped (clip covers everything) */
     i32    vp_w, vp_h;    /* active device viewport in CSS px; 0 = fill */
     bool   cmd_passthrough; /* mirrors clipBox.cmdPassthrough — skips repeat sets */
+    bool   have_shape;    /* a device screen shape is set (a corner radius) */
+    BrowserScreenShape shape;
 };
+
+/* CALayer corner bits for the corners in BrowserScreenShape order (TL, TR,
+ * BR, BL). The views are not flipped, so a layer's max-Y edge is its top. */
+static const CACornerMask kLiuCorner[4] = {
+    kCALayerMinXMaxYCorner, kCALayerMaxXMaxYCorner,
+    kCALayerMaxXMinYCorner, kCALayerMinXMinYCorner,
+};
+
+/* Round the visible page where it meets the device's rounded display. Only
+ * corners of the page the clip still shows are rounded: a corner the clip
+ * cuts through is the panel's edge, not the display's. */
+static void browser_apply_shape(BrowserNative *n, NSRect f, NSRect c) {
+    CALayer *cl = n->host.clipBox.layer;
+    const BrowserScreenShape *s = &n->shape;
+    const CGFloat eps = 0.5;
+    bool left  = NSMinX(c) <= NSMinX(f) + eps;
+    bool right = NSMaxX(c) >= NSMaxX(f) - eps;
+    bool top   = NSMaxY(c) >= NSMaxY(f) - eps;
+    bool bot   = NSMinY(c) <= NSMinY(f) + eps;
+    bool keep[4] = { top && left, top && right, bot && right, bot && left };
+    CGFloat radius = 0.0;
+    CACornerMask mask = 0;
+    for (i32 i = 0; i < 4; i++) {
+        if (!n->have_shape || !keep[i] || !(s->r[i] > 0.0f)) continue;
+        mask |= kLiuCorner[i];
+        if (s->r[i] > radius) radius = s->r[i];
+    }
+    CGFloat lim = fmin(c.size.width, c.size.height) * 0.5;
+    if (radius > lim) radius = lim;
+    if (radius <= 0.0 || !mask) { radius = 0.0; mask = 0; }
+    if (cl) {
+        if (cl.cornerRadius != radius) cl.cornerRadius = radius;
+        if (mask && cl.maskedCorners != mask) cl.maskedCorners = mask;
+    }
+}
 
 /* Push last_frame + clip into AppKit. The clip view takes the *visible* rect
  * and the page box keeps its full frame inside it, offset so the page does not
@@ -1568,6 +1681,7 @@ static void browser_apply_geometry(BrowserNative *n) {
             [n->host.webBox setBoundsSize:f.size];
             n->host.webView.frame = NSMakeRect(0, 0, f.size.width, f.size.height);
         }
+        browser_apply_shape(n, f, c);
     }
 }
 
@@ -1714,6 +1828,273 @@ void browser_native_set_viewport_pt(BrowserNative *n,
     n->vp_w = vw;
     n->vp_h = vh;
     browser_apply_geometry(n);
+}
+
+void browser_native_set_screen_shape(BrowserNative *n, const BrowserScreenShape *shape) {
+    if (!n || !n->host || !n->host.clipBox) return;
+    BrowserScreenShape s;
+    memset(&s, 0, sizeof s);
+    bool want = false;
+    if (shape) {
+        s = *shape;
+        for (i32 i = 0; i < 4; i++) {
+            if (!isfinite(s.r[i]) || s.r[i] < 0.0f) s.r[i] = 0.0f;
+            if (s.r[i] > 0.0f) want = true;
+        }
+    }
+    if (!want) memset(&s, 0, sizeof s);
+    /* Called every main-loop wake — same per-wake no-op guard as set_visible. */
+    if (n->have_shape == want && !memcmp(&n->shape, &s, sizeof s)) return;
+    n->have_shape = want;
+    n->shape = s;
+    if (n->have_frame) {
+        @autoreleasepool { browser_apply_geometry(n); }
+    }
+}
+
+bool browser_native_screen_probe(BrowserNative *n, BrowserScreenProbe *out) {
+    if (!out) return false;
+    memset(out, 0, sizeof *out);
+    if (!n || !n->host || !n->host.clipBox) return false;
+    CALayer *cl = n->host.clipBox.layer;
+    out->radius = cl ? (f32)cl.cornerRadius : 0.0f;
+    if (out->radius > 0.0f) {
+        for (i32 i = 0; i < 4; i++)
+            if (cl.maskedCorners & kLiuCorner[i]) out->corners |= 1u << i;
+    }
+    if (n->have_frame) {
+        /* The page box as placed: clipBox's frame in the window plus webBox's
+         * offset inside it, which is the unclipped page rect. */
+        NSRect c = n->host.clipBox.frame;
+        NSRect b = n->host.webBox.frame;
+        out->have_page = true;
+        out->page_x = (f32)(c.origin.x + b.origin.x);
+        out->page_y = (f32)(c.origin.y + b.origin.y);
+        out->page_w = (f32)b.size.width;
+        out->page_h = (f32)b.size.height;
+    }
+    return true;
+}
+
+/* --- status bar masks ------------------------------------------------------
+ * Drawn with AppKit alone (an NSBitmapImageRep context): the targets that link
+ * this file do not all link CoreGraphics or CoreText. White on transparent,
+ * so the colour space does not enter: the alpha channel is the coverage. */
+
+#define LIU_MASK_CACHE 24
+typedef struct {
+    bool valid;
+    u8   kind;
+    char text[64];
+    f32  size_px, weight;
+    i32  w_px, h_px;
+    u8  *pixels;
+    i32  w, h;
+    f32  baseline, cap;
+    u64  used;
+} LiuMaskEntry;
+static LiuMaskEntry g_masks[LIU_MASK_CACHE];
+static u64 g_mask_tick;
+
+static bool mask_matches(const LiuMaskEntry *e, const BrowserMaskSpec *s) {
+    return e->valid && e->kind == s->kind && e->size_px == s->size_px &&
+           e->weight == s->weight && e->w_px == s->w_px && e->h_px == s->h_px &&
+           !strcmp(e->text, s->text ? s->text : "");
+}
+
+/* A w x h premultiplied RGBA bitmap, rows top first, and a graphics context
+ * drawing into it with y up. */
+static NSBitmapImageRep *mask_rep(i32 w, i32 h) {
+    return [[NSBitmapImageRep alloc]
+        initWithBitmapDataPlanes:NULL pixelsWide:w pixelsHigh:h bitsPerSample:8
+                 samplesPerPixel:4 hasAlpha:YES isPlanar:NO
+                  colorSpaceName:NSDeviceRGBColorSpace bitmapFormat:0
+                     bytesPerRow:(NSInteger)w * 4 bitsPerPixel:32];
+}
+
+static bool mask_begin(NSBitmapImageRep *rep) {
+    if (!rep || !rep.bitmapData) return false;
+    memset(rep.bitmapData, 0, (usize)rep.bytesPerRow * (usize)rep.pixelsHigh);
+    NSGraphicsContext *ctx = [NSGraphicsContext graphicsContextWithBitmapImageRep:rep];
+    if (!ctx) return false;
+    [NSGraphicsContext saveGraphicsState];
+    [NSGraphicsContext setCurrentContext:ctx];
+    ctx.shouldAntialias = YES;
+    ctx.imageInterpolation = NSImageInterpolationHigh;
+    [[NSColor whiteColor] set];
+    return true;
+}
+
+static void mask_end(void) {
+    [[NSGraphicsContext currentContext] flushGraphics];
+    [NSGraphicsContext restoreGraphicsState];
+}
+
+/* The rows and columns of `rep` that hold any coverage, as fractions of its
+ * size, y measured from the bottom. False when it is empty. */
+static bool mask_extent(NSBitmapImageRep *rep, NSRect *out) {
+    i32 w = (i32)rep.pixelsWide, h = (i32)rep.pixelsHigh;
+    const u8 *px = rep.bitmapData;
+    i32 x0 = w, x1 = -1, y0 = h, y1 = -1;
+    for (i32 y = 0; y < h; y++)
+        for (i32 x = 0; x < w; x++)
+            if (px[(usize)y * (usize)rep.bytesPerRow + (usize)x * 4 + 3] > 24) {
+                if (x < x0) x0 = x;
+                if (x > x1) x1 = x;
+                if (y < y0) y0 = y;
+                if (y > y1) y1 = y;
+            }
+    if (x1 < x0 || y1 < y0) return false;
+    *out = NSMakeRect((CGFloat)x0 / w, (CGFloat)(h - 1 - y1) / h,
+                      (CGFloat)(x1 - x0 + 1) / w, (CGFloat)(y1 - y0 + 1) / h);
+    return true;
+}
+
+/* A convex shape with rounded corners: `inset` is the shape already pulled in
+ * by `d` on every side; filled, then stroked `2 d` wide with round joins, it
+ * reaches the shape's edges again with its corners rounded. */
+static void mask_rounded_polygon(NSBezierPath *inset, CGFloat d) {
+    inset.lineJoinStyle = NSLineJoinStyleRound;
+    inset.lineWidth = 2.0 * d;
+    [inset fill];
+    if (d > 0.0) [inset stroke];
+}
+
+static bool mask_render(const BrowserMaskSpec *s, LiuMaskEntry *e) {
+    NSBitmapImageRep *rep = nil;
+    if (s->kind == BROWSER_MASK_TEXT) {
+        NSString *str = s->text ? [NSString stringWithUTF8String:s->text] : nil;
+        if (!str.length || !(s->size_px > 1.0f) || s->size_px > 512.0f) return false;
+        NSFont *font = [NSFont systemFontOfSize:s->size_px weight:s->weight];
+        if (!font) return false;
+        NSAttributedString *as = [[[NSAttributedString alloc] initWithString:str attributes:@{
+            NSFontAttributeName: font,
+            NSForegroundColorAttributeName: [NSColor whiteColor] }] autorelease];
+        CGFloat asc = ceil(font.ascender), desc = ceil(-font.descender);
+        i32 w = (i32)ceil(as.size.width) + 2, h = (i32)(asc + desc) + 2;
+        if (w <= 2 || w > 4096 || h > 1024) return false;
+        rep = [mask_rep(w, h) autorelease];
+        if (!mask_begin(rep)) return false;
+        /* Without the line-fragment option a rect's origin is the baseline. */
+        [as drawWithRect:NSMakeRect(1.0, desc + 1.0, w, h) options:0];
+        mask_end();
+        e->baseline = (f32)(asc + 1.0);
+        e->cap = (f32)font.capHeight;
+    } else {
+        i32 w = s->w_px, h = s->h_px;
+        if (w < 1 || h < 1 || w > 1024 || h > 1024) return false;
+        rep = [mask_rep(w, h) autorelease];
+        if (s->kind == BROWSER_MASK_SYMBOL) {
+            NSImage *img = nil;
+            if (@available(macOS 11.0, *)) {
+                NSString *name = s->text ? [NSString stringWithUTF8String:s->text] : nil;
+                img = name ? [NSImage imageWithSystemSymbolName:name accessibilityDescription:nil] : nil;
+                NSImageSymbolConfiguration *cfg =
+                    [NSImageSymbolConfiguration configurationWithPointSize:64.0 weight:s->weight];
+                if (img && cfg) img = [img imageWithSymbolConfiguration:cfg] ?: img;
+            }
+            if (!img || !(img.size.width > 0.0) || !(img.size.height > 0.0)) return false;
+            /* The symbol's canvas carries margins: find what it draws on a
+             * large raster, then draw it again so that part fills the box. */
+            NSSize big = NSMakeSize(img.size.width * 4.0, img.size.height * 4.0);
+            NSBitmapImageRep *probe = [mask_rep((i32)ceil(big.width), (i32)ceil(big.height)) autorelease];
+            if (!mask_begin(probe)) return false;
+            [img drawInRect:NSMakeRect(0, 0, probe.pixelsWide, probe.pixelsHigh)];
+            mask_end();
+            NSRect ext;
+            if (!mask_extent(probe, &ext)) return false;
+            CGFloat k = fmin((CGFloat)w / (ext.size.width * probe.pixelsWide),
+                             (CGFloat)h / (ext.size.height * probe.pixelsHigh));
+            CGFloat dw = probe.pixelsWide * k, dh = probe.pixelsHigh * k;
+            CGFloat ox = (w - ext.size.width * dw) * 0.5 - ext.origin.x * dw;
+            CGFloat oy = (h - ext.size.height * dh) * 0.5 - ext.origin.y * dh;
+            if (!mask_begin(rep)) return false;
+            [img drawInRect:NSMakeRect(ox, oy, dw, dh)];
+            mask_end();
+        } else if (s->kind == BROWSER_MASK_FAN) {
+            /* A quarter fan (45 degrees either side of up) from its tip at the
+             * bottom centre, the corners rounded by d. */
+            CGFloat R = fmin((CGFloat)h, (CGFloat)w / M_SQRT2);
+            CGFloat d = R * 0.09;
+            CGFloat tip = d * M_SQRT2, r = R - d - tip;
+            NSPoint a = NSMakePoint(w * 0.5, ((CGFloat)h - R) * 0.5 + tip);
+            NSBezierPath *p = [NSBezierPath bezierPath];
+            [p moveToPoint:a];
+            [p appendBezierPathWithArcWithCenter:a radius:r startAngle:135.0 endAngle:45.0 clockwise:YES];
+            [p closePath];
+            if (!mask_begin(rep)) return false;
+            mask_rounded_polygon(p, d);
+            mask_end();
+        } else if (s->kind == BROWSER_MASK_WEDGE) {
+            /* The right angle at the bottom right; pulled in towards the
+             * incentre by d, then rounded back out. */
+            CGFloat hyp = hypot((CGFloat)w, (CGFloat)h);
+            CGFloat rho = ((CGFloat)w + h - hyp) * 0.5;
+            CGFloat d = fmin(rho * 0.6, fmin(w, h) * 0.10);
+            CGFloat f = (rho - d) / rho;
+            NSPoint c = NSMakePoint(w - rho, rho);
+            NSPoint v[3] = { NSMakePoint(0, 0), NSMakePoint(w, 0), NSMakePoint(w, h) };
+            NSBezierPath *p = [NSBezierPath bezierPath];
+            for (i32 i = 0; i < 3; i++) {
+                NSPoint q = NSMakePoint(c.x + (v[i].x - c.x) * f, c.y + (v[i].y - c.y) * f);
+                if (i == 0) [p moveToPoint:q]; else [p lineToPoint:q];
+            }
+            [p closePath];
+            if (!mask_begin(rep)) return false;
+            mask_rounded_polygon(p, d);
+            mask_end();
+        } else {
+            return false;
+        }
+        e->baseline = 0.0f;
+        e->cap = 0.0f;
+    }
+    usize bytes = (usize)rep.pixelsWide * (usize)rep.pixelsHigh * 4;
+    u8 *px = malloc(bytes);
+    if (!px) return false;
+    for (i32 y = 0; y < (i32)rep.pixelsHigh; y++)
+        memcpy(px + (usize)y * (usize)rep.pixelsWide * 4,
+               rep.bitmapData + (usize)y * (usize)rep.bytesPerRow, (usize)rep.pixelsWide * 4);
+    free(e->pixels);
+    e->pixels = px;
+    e->w = (i32)rep.pixelsWide;
+    e->h = (i32)rep.pixelsHigh;
+    return true;
+}
+
+bool browser_native_mask(const BrowserMaskSpec *spec, BrowserMask *out) {
+    if (!out) return false;
+    memset(out, 0, sizeof *out);
+    if (!spec || (spec->text && strlen(spec->text) >= sizeof g_masks[0].text) ||
+        !isfinite(spec->size_px) || !isfinite(spec->weight))
+        return false;
+    LiuMaskEntry *e = NULL;
+    for (i32 i = 0; i < LIU_MASK_CACHE && !e; i++)
+        if (mask_matches(&g_masks[i], spec)) e = &g_masks[i];
+    if (!e) {
+        /* The least recently used entry gives way. */
+        e = &g_masks[0];
+        for (i32 i = 1; i < LIU_MASK_CACHE; i++)
+            if (!g_masks[i].valid || (e->valid && g_masks[i].used < e->used)) e = &g_masks[i];
+        e->valid = false;
+        e->kind = spec->kind;
+        snprintf(e->text, sizeof e->text, "%s", spec->text ? spec->text : "");
+        e->size_px = spec->size_px;
+        e->weight = spec->weight;
+        e->w_px = spec->w_px;
+        e->h_px = spec->h_px;
+        bool ok;
+        @autoreleasepool { ok = mask_render(spec, e); }
+        if (!ok) return false;
+        e->valid = true;
+    }
+    e->used = ++g_mask_tick;
+    out->pixels = e->pixels;
+    out->w = e->w;
+    out->h = e->h;
+    out->baseline = e->baseline;
+    out->cap = e->cap;
+    return true;
 }
 
 void browser_native_make_first_responder(BrowserNative *n) {
@@ -1875,6 +2256,8 @@ bool browser_native_poll(BrowserNative *n, BrowserTab *tab) {
         tab->pending_pick = h.hasPendingPick;
         tab->pending_ask = h.hasPendingAsk;
         tab->pending_nav = h.hasPendingNav;
+        tab->page_tint = h.pageTint;
+        tab->page_tint_known = h.pageTintKnown;
     }
     return true;
 }

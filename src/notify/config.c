@@ -371,8 +371,9 @@ bool notify_config_load(NotifyConfig *cfg) {
 
     /* O_NOFOLLOW: a same-UID attacker must not be able to point a symlink
      * here at a sensitive file; the file is opened read-only but is also
-     * stat()ed. */
-    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+     * stat()ed. O_NONBLOCK: a FIFO opens at once and fails the S_ISREG test
+     * instead of holding the caller. */
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0) return false;
     struct stat st;
     if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||

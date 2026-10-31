@@ -584,6 +584,8 @@ static void meta_add(char *meta, usize cap, usize *len, const char *key, const c
     meta[*len] = '\0';
 }
 
+int agentctl_tool_hook(const char *tool);
+
 static int cmd_send(int argc, char **argv) {
     const char *tool_s = NULL, *event_s = NULL, *title = "", *body = "", *flags_s = NULL;
     bool hook = false;
@@ -601,6 +603,23 @@ static int cmd_send(int argc, char **argv) {
         else if ((v = arg_value(argv[i], "--body"))  ) body    = v;
         else if ((v = arg_value(argv[i], "--flags")) ) flags_s = v;
         else if (!strcmp(argv[i], "--hook")          ) hook    = true;
+    }
+
+    /* An agent Liu runs for another agent (agentctl: its runner sets
+     * LIU_AGENT_JOB for the agent and everything it starts) is in no pane;
+     * its job tab shows how its turns go, so what its hooks report is not the
+     * user's to hear again. Dropped as a success: a hook must never fail its
+     * agent. */
+    {
+        const char *job = getenv("LIU_AGENT_JOB");
+        if (hook && job && job[0]) {
+            HookPayload drained = {0};
+            (void)read_hook_payload(&drained);   /* the agent's write must not meet a closed pipe */
+            return 0;
+        }
+        /* a tool hook of the agent in this pane: for its team, never a
+         * notification */
+        if (hook && event_s && !strncmp(event_s, "tool", 4)) return agentctl_tool_hook(tool_s);
     }
 
     u8  tool  = parse_tool(tool_s);
@@ -874,6 +893,8 @@ static int cmd_doctor(void) {
     stale += doctor_scan_agent("antigravity", LIU_HOOK_ANTIGRAVITY_REL, home);
     stale += doctor_scan_agent("pi",          LIU_HOOK_PI_REL,          home);
     stale += doctor_scan_agent("omp",         LIU_HOOK_OMP_REL,         home);
+    stale += doctor_scan_agent("devin",       LIU_HOOK_DEVIN_REL,       home);
+    stale += doctor_scan_agent("qoder",       LIU_HOOK_QODER_REL,       home);
 
     if (stale > 0) {
         printf("\n%d stale hook(s). Launching Liu once rewrites every hook to the\n"
@@ -913,8 +934,18 @@ static void usage(void) {
         "  liu-notify status\n"
         "  liu-notify stop\n"
         "  liu-notify doctor      diagnose the service and any leftover agent hooks\n"
+        "  liu-notify agent ...   the same as liu-agent: start and drive another agent\n"
         "\n"
         "  LIU_NOTIFY_DEBUG=1     log every hook decision next to the socket\n");
+}
+
+int agentctl_client_main(int argc, char **argv);
+
+/* The name this binary was started as, without its folder. */
+static const char *invoked_as(const char *argv0) {
+    if (!argv0) return "";
+    const char *slash = strrchr(argv0, '/');
+    return slash ? slash + 1 : argv0;
 }
 
 int main(int argc, char **argv) {
@@ -924,9 +955,13 @@ int main(int argc, char **argv) {
      * user's LC_CTYPE. */
     setlocale(LC_ALL, "C");
 
+    /* Started as `liu-agent` (the link in ~/.liu/bin): agent control. */
+    if (!strcmp(invoked_as(argv[0]), "liu-agent")) return agentctl_client_main(argc, argv);
+
     if (argc < 2) { usage(); return 64; }
 
     const char *cmd = argv[1];
+    if (!strcmp(cmd, "agent")) return agentctl_client_main(argc - 1, argv + 1);
     if (!strcmp(cmd, "daemon")) return notify_daemon_main();
     if (!strcmp(cmd, "send"))   return cmd_send(argc - 2, argv + 2);
     if (!strcmp(cmd, "status")) return cmd_status();

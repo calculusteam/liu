@@ -169,6 +169,35 @@ static inline f32 ui_win_ctl_zone_pt(void) {
 #define SIDEBAR_BORDER_W_PT     2.0f
 #define SIDEBAR_RESIZE_GRAB_PT  5.0f
 
+/* A section header (render_side_header) and the drag that moves a section.
+ * The mixes are display-space steps of the text colour over the panel's
+ * surface (panel_wash). */
+#define SIDE_HDR_RADIUS_PT       6.0f
+#define SIDE_HDR_HOVER_MIX       0.045f   /* the explorer's hovered row */
+#define SIDE_HDR_GRIP_PT        12.0f    /* in a 22pt box left of the header's actions */
+#define SIDE_HDR_BADGE_H_PT     16.0f    /* the count's pill */
+#define SIDE_HDR_BADGE_PAD_PT    4.0f
+#define SIDE_HDR_BADGE_GAP_PT    7.0f
+#define SIDE_HDR_BADGE_MIX       0.08f
+#define SIDE_DRAG_LIFT_H_PT     30.0f    /* the lifted header under the pointer */
+#define SIDE_DRAG_LIFT_X_PT     16.0f    /* its left edge: clear of the line's dot */
+#define SIDE_DRAG_LIFT_INSET_PT  6.0f    /* its right edge */
+#define SIDE_DRAG_SOURCE_VEIL    0.55f    /* the panel laid over the section being moved */
+#define SIDE_DRAG_LINE_PT        2.0f
+#define SIDE_DRAG_LINE_INSET_PT  8.0f
+#define SIDE_DRAG_LINE_DOT_PT    6.0f
+#define SIDE_RAIL_LINE_INSET_PT  5.0f    /* the rail's drop line: its dot's centre */
+/* A tab group in the docked list: its chip is the strip's (GROUP_CHIP_*), its
+ * open members are indented and the group's line (GROUP_LINE_*) runs down the
+ * gutter the indent leaves. The painter and the hit test read the indent. */
+/* The docked list's jump pill (render_side_jumps; its geometry is
+ * SIDEBAR_JUMP_* in ui/sidebar_layout.h): text colour mixed into the panel. */
+#define SIDE_JUMP_FILL_MIX       0.10f
+#define SIDE_JUMP_HOVER_MIX      0.06f
+#define SIDE_JUMP_RIM_ALPHA      0.22f
+#define SIDE_GROUP_INDENT_PT    12.0f
+#define SIDE_GROUP_LINE_X_PT    12.0f    /* the line's centre: mid-gutter, 6pt row inset + half the indent */
+
 /* File-browser list rows: one uniform height everywhere — the 16pt text cell
  * plus an EQUAL top/bottom padding (content is centred inside the row, so the
  * padding lands half above / half below). The row height formula below is the
@@ -177,6 +206,31 @@ static inline f32 ui_win_ctl_zone_pt(void) {
  * hittest.c — always change it HERE, never inline. */
 #define FB_ENTRY_VPAD_PT        6.0f    /* per-side vertical padding */
 #define FB_ENTRY_H(ch, dpi)     ((ch) + 2.0f * FB_ENTRY_VPAD_PT * (dpi))
+
+/* The explorer panel (fb_render_sidebar): a header over rows of one height.
+ * The renderer, fb_handle_click and both hit tests read its geometry through
+ * fb_list_hdr_h / fb_list_row_h / fb_list_entry_at (filebrowser.h).
+ *
+ * A row is [chevron][gap][icon][gap][name]. One level of depth moves a row by
+ * the chevron and its gap, so a child's chevron stands under its parent's
+ * icon and the indent guide under the parent's chevron. */
+#define FB_PANEL_HDR_PT          26.0f   /* holds FB_PANEL_BTN_PT's chip with 2pt to spare */
+#define FB_PANEL_ROW_PT          28.0f
+#define FB_PANEL_PAD_PT          12.0f   /* header inset, left and right */
+#define FB_PANEL_ROW_PAD_PT       8.0f   /* a top-level row's chevron from the edge */
+#define FB_PANEL_CHEV_PT         12.0f
+#define FB_PANEL_CHEV_GAP_PT      4.0f
+#define FB_PANEL_INDENT_PT       (FB_PANEL_CHEV_PT + FB_PANEL_CHEV_GAP_PT)
+#define FB_PANEL_ICON_PT         16.0f
+#define FB_PANEL_ICON_GAP_PT      6.0f
+#define FB_PANEL_BTN_PT          22.0f   /* a header button's hover chip, square */
+#define FB_PANEL_BTN_RADIUS_PT    5.0f
+#define FB_PANEL_SIZE_COL_PT     64.0f   /* room a file's size takes at the row's end */
+#define FB_PANEL_SIZE_MIN_W_PT  300.0f   /* the size column shows from this panel width */
+#define FB_PANEL_SCROLL_W_PT      5.0f
+/* The panel's surface: the window's background moved this far toward its
+ * text colour, lighter on a dark theme and darker on a light one. */
+#define FB_PANEL_SURFACE_MIX      0.035f
 
 /* The file browser's name prompt (ui/fb_menu.h: fb_prompt_geom). Its context
  * menu has no numbers of its own — see CTX_MENU_* below. */
@@ -327,7 +381,7 @@ static inline f32 ui_tab_close_x(f32 pill_x, f32 pill_w, f32 close_sz,
  * ui_icon_box_px, which snaps them to an even pixel count. */
 #define FB_HDR_ICON_PT         14.0f
 #define FB_HDR_CHIP_PT         20.0f
-#define FB_HDR_PAD_PT          16.0f   /* breadcrumb inset AND the icons' optical margin */
+#define FB_HDR_PAD_PT          FB_PANEL_PAD_PT   /* the icons' optical margin from the right edge */
 #define FB_HDR_BTN_W_CELLS      3.0f   /* click box width, in UI cells */
 
 /* X of the FB header's RIGHT-MOST action button box (the close ✕).

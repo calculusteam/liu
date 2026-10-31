@@ -298,6 +298,9 @@ static bool session_proc_argv_agent(pid_t pid, char *out, usize out_cap) {
         if (ai == 0) {
             const char *bn0 = strrchr(arg, '/');
             bn0 = bn0 ? bn0 + 1 : arg;
+            /* Liu's own helper: `liu-agent spawn codex …` names the agent it
+             * asks Liu to start, it is not that agent. */
+            if (!strcmp(bn0, "liu-agent") || !strcmp(bn0, "liu-notify")) break;
             if (session_proc_name_is_agent(bn0)) {
                 snprintf(out, out_cap, "%s", bn0);
                 found = true;
@@ -367,11 +370,12 @@ static bool session_proc_path_agent(pid_t pid, char *out, usize out_cap) {
     for (char *tok = strtok_r(path, "/", &save); tok;
          tok = strtok_r(NULL, "/", &save)) {
         if (strlen(tok) >= 5 && session_proc_name_is_agent(tok)) {
-            /* Not these two: both run behind an interpreter that names them in
-             * argv (the rung that does that is above), and "hermes" is as likely
-             * a folder somebody's own project lives in — any native binary
-             * built under it would be taken for the agent. */
-            if (strcmp(tok, "hermes") == 0 || strcmp(tok, "openclaw") == 0) continue;
+            /* Not these four: each runs behind an interpreter that names it in
+             * argv (the rung that does that is above), and "hermes" or "letta"
+             * is as likely a folder somebody's own project lives in — any
+             * native binary built under it would be taken for the agent. */
+            if (strcmp(tok, "hermes") == 0 || strcmp(tok, "openclaw") == 0 ||
+                strcmp(tok, "letta") == 0 || strcmp(tok, "mastracode") == 0) continue;
             snprintf(out, out_cap, "%s", tok);
             return true;
         }
@@ -639,6 +643,7 @@ typedef struct {
 
 static void socket_channel_relay_close(SocketChannelRelay *c);
 static bool socket_channel_relay_poll(SocketChannelRelay *c);
+static bool socket_channel_relay_step(SocketChannelRelay *c, bool *moved);
 
 /* =========================================================================
  * X11 forwarding relay
@@ -816,6 +821,8 @@ typedef struct {
     int              local_fd;   /* one end of socketpair */
     LIBSSH2_CHANNEL *channel;   /* direct-tcpip channel */
     LIBSSH2_SESSION *session;   /* owning session (for blocking mode) */
+    int              session_sock; /* the socket `session` runs over */
+    int              stop_rd, stop_wr; /* a byte here ends the thread's wait */
     atomic_bool      running;
     pthread_t        thread;
 } ChannelRelay;
@@ -1001,6 +1008,7 @@ struct Session {
      * closed, split or carried to another tab or window. */
     LinkState       link;
     char            link_reason[256];   /* why the link last went down, kept across the reconnect */
+    char            auth_refused[256];  /* the server's refusal of the last credential offered (connect worker) */
 
     /* Workers keep cached SFTP handles alive via the suspend count. Each
      * libssh2 call owns io_lock; SFTP operation state additionally remains
@@ -1488,7 +1496,13 @@ static LIBSSH2_USERAUTH_KBDINT_RESPONSE_FUNC(ssh_kbdint_callback) {
  * keyboard-interactive dialog, or the stored password. Returns libssh2's
  * answer, or the failure it was called with when nothing is left to try. */
 static int ssh_auth_second_step(Session *s, const SSHConfig *config, int auth_rc) {
+    s->auth_refused[0] = '\0';
     if (auth_rc == 0 || libssh2_userauth_authenticated(s->ssh_session)) return 0;
+    /* Asking what the server still accepts is a call of its own, and it
+     * replaces libssh2's last error: the refusal is kept to be told. */
+    char *refusal = NULL;
+    libssh2_session_last_error(s->ssh_session, &refusal, NULL, 0);
+    snprintf(s->auth_refused, sizeof s->auth_refused, "%s", refusal ? refusal : "");
     char *rest = libssh2_userauth_list(s->ssh_session, config->username,
                                        (unsigned int)strlen(config->username));
     switch (ssh_auth_second_factor(rest, config->password[0] != '\0')) {
@@ -1537,7 +1551,10 @@ static int ssh_verify_hostkey_for(Session *s, LIBSSH2_SESSION *ssh,
         return -1;
     }
     if (hk == HOST_KEY_ERROR) {
-        set_error(s, "SSH host key verification failed");
+        set_error(s, known_hosts_store_unsafe()
+            ? "SSH host key not checked: ~/.ssh/known_hosts can be changed by other users "
+              "(run chmod go-w ~/.ssh ~/.ssh/known_hosts)"
+            : "SSH host key verification failed");
         return -1;
     }
 
@@ -1801,13 +1818,19 @@ static const char *liu_helper_bin_dir(void) {
 
     /* Every helper Liu ships. Missing ones are skipped rather than failing the
      * whole directory — a dev build has liu-history, a packaged .app may not. */
-    static const char *helpers[] = { "liu-notify", "liu-history" };
+    /* `liu-agent` is liu-notify under another name: the binary picks its
+     * commands by the name it was started as. */
+    static const struct { const char *name, *binary; } helpers[] = {
+        { "liu-notify",  "liu-notify"  },
+        { "liu-history", "liu-history" },
+        { "liu-agent",   "liu-notify"  },
+    };
     for (usize i = 0; i < sizeof helpers / sizeof helpers[0]; i++) {
         char target[1200], link[1200];
-        if ((usize)snprintf(target, sizeof target, "%s/%s", exe_dir, helpers[i]) >= sizeof target)
+        if ((usize)snprintf(target, sizeof target, "%s/%s", exe_dir, helpers[i].binary) >= sizeof target)
             continue;
         if (access(target, X_OK) != 0) continue;
-        if ((usize)snprintf(link, sizeof link, "%s/%s", dir, helpers[i]) >= sizeof link)
+        if ((usize)snprintf(link, sizeof link, "%s/%s", dir, helpers[i].name) >= sizeof link)
             continue;
         unlink(link);              /* replace whatever a previous run left */
         (void)symlink(target, link);
@@ -1816,7 +1839,70 @@ static const char *liu_helper_bin_dir(void) {
     return dir;
 }
 
+const char *session_helper_bin_dir(void) {
+    return liu_helper_bin_dir();
+}
+
 static char g_local_shell_integration[1024];      /* "" = none */
+static char g_local_agent_sock[256];               /* "" = the agent door is shut */
+
+void session_local_set_agent_sock(const char *path) {
+    snprintf(g_local_agent_sock, sizeof g_local_agent_sock, "%s", path ? path : "");
+}
+
+/* Which pane a local shell process is: the shell forkpty() started for a
+ * session, and that session's serial. The agent-control server asks it from
+ * its own thread to tell which pane a caller runs in — it walks the caller's
+ * parents up to the process whose parent is Liu, which is a pane's shell — so
+ * the answer comes from the process tree, not from anything the caller says. */
+#define LOCAL_PANE_TABLE_CAP 1024
+static struct { pid_t pid; u64 serial; } g_local_panes[LOCAL_PANE_TABLE_CAP];
+static i32 g_local_pane_count = 0;
+static pthread_mutex_t g_local_panes_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void local_pane_note(pid_t pid, u64 serial) {
+    if (pid <= 0 || serial == 0) return;
+    pthread_mutex_lock(&g_local_panes_mu);
+    if (g_local_pane_count < LOCAL_PANE_TABLE_CAP) {
+        g_local_panes[g_local_pane_count].pid = pid;
+        g_local_panes[g_local_pane_count].serial = serial;
+        g_local_pane_count++;
+    }
+    pthread_mutex_unlock(&g_local_panes_mu);
+}
+
+static void (*g_local_pane_gone)(u64 serial);
+
+void session_local_set_pane_gone_hook(void (*fn)(u64 serial)) {
+    g_local_pane_gone = fn;
+}
+
+static void local_pane_forget(u64 serial) {
+    if (serial == 0) return;
+    bool was = false;
+    pthread_mutex_lock(&g_local_panes_mu);
+    for (i32 i = 0; i < g_local_pane_count; i++) {
+        if (g_local_panes[i].serial != serial) continue;
+        g_local_panes[i] = g_local_panes[--g_local_pane_count];
+        was = true;
+        break;
+    }
+    pthread_mutex_unlock(&g_local_panes_mu);
+    if (was && g_local_pane_gone) g_local_pane_gone(serial);
+}
+
+bool session_local_pane_of_shell(i32 pid, u64 *serial) {
+    bool found = false;
+    pthread_mutex_lock(&g_local_panes_mu);
+    for (i32 i = 0; i < g_local_pane_count; i++) {
+        if (g_local_panes[i].pid != (pid_t)pid) continue;
+        if (serial) *serial = g_local_panes[i].serial;
+        found = true;
+        break;
+    }
+    pthread_mutex_unlock(&g_local_panes_mu);
+    return found;
+}
 static char g_local_term[48];                      /* "" = the default */
 static char g_local_terminfo_dir[1024];
 
@@ -1900,6 +1986,13 @@ static bool local_env_build(LocalEnvVec *v, const char *shell, const LocalEnvVar
     v->items = calloc(v->cap, sizeof *v->items);
     if (!v->items) return false;
     for (usize i = 0; i < inherited; i++) {
+        /* A pane's first command is Liu's to give (session_create_local_first),
+         * never something inherited from the environment Liu started in. */
+        if (local_env_matches(environ[i], "LIU_RESUME_COMMAND")) continue;
+        /* Nor which Liu, or which delegated job, a pane belongs to: a Liu
+         * started from another Liu's pane inherits both. */
+        if (local_env_matches(environ[i], "LIU_AGENT_SOCK") ||
+            local_env_matches(environ[i], "LIU_AGENT_JOB")) continue;
         v->items[v->count] = strdup(environ[i]);
         if (!v->items[v->count]) { local_env_free(v); return false; }
         v->count++;
@@ -2040,6 +2133,11 @@ static bool local_env_build(LocalEnvVec *v, const char *shell, const LocalEnvVar
         if (!local_env_set(v, "LIU_PANE_ID", pane_id)) {
             local_env_free(v); return false;
         }
+    }
+    /* Where `liu-agent` reaches this Liu (agentctl). Only the path: who may
+     * use it is decided by the server from the caller's process tree. */
+    if (g_local_agent_sock[0] && !local_env_set(v, "LIU_AGENT_SOCK", g_local_agent_sock)) {
+        local_env_free(v); return false;
     }
     v->items[v->count] = NULL;
     return true;
@@ -2211,9 +2309,43 @@ const char *session_shell_mark_key(const Session *s) {
     return s && s->type == SESSION_LOCAL ? s->mark_key : "";
 }
 
+/* How a pane's shell is told to run a command before its first prompt.
+ *
+ * A zsh that reads Liu's integration takes it from LIU_RESUME_COMMAND: its
+ * .zshenv moves the text into a shell variable before any startup file runs
+ * (no program the shell starts inherits it), and the first prompt runs it as
+ * a foreground job of the interactive shell — after every startup file, with
+ * job control, and the prompt that follows is the shell's own. Any other shell
+ * is started as `shell -l -i -c '<command>; exec shell -l'`: the command runs
+ * with the user's interactive environment and the pane goes on as a login
+ * shell when it ends. Nothing is typed into the pane either way. */
+static bool local_first_command_script(const char *shell, const char *command,
+                                       char *out, usize cap) {
+    if (!shell || !command || !command[0] || strchr(shell, '\'')) return false;
+    for (const char *c = command; *c; c++)
+        if ((unsigned char)*c < 0x20 || *c == 0x7f) return false;
+    int n = snprintf(out, cap, "%s; exec '%s' -l", command, shell);
+    return n > 0 && (usize)n < cap;
+}
+
+static Session *session_create_local_impl(i32 cols, i32 rows,
+                                          const LocalEnvVar *env, i32 env_count,
+                                          const char *cwd, const char *first_command);
+
 Session *session_create_local_with_env(i32 cols, i32 rows,
                                        const LocalEnvVar *env, i32 env_count,
                                        const char *cwd) {
+    return session_create_local_impl(cols, rows, env, env_count, cwd, NULL);
+}
+
+Session *session_create_local_first(i32 cols, i32 rows, const char *cwd,
+                                    const char *first_command) {
+    return session_create_local_impl(cols, rows, NULL, 0, cwd, first_command);
+}
+
+static Session *session_create_local_impl(i32 cols, i32 rows,
+                                          const LocalEnvVar *env, i32 env_count,
+                                          const char *cwd, const char *first_command) {
     Session *s = calloc(1, sizeof(Session));
     if (!s) return NULL;
     atomic_init(&s->ref_count, 1u);
@@ -2254,6 +2386,25 @@ Session *session_create_local_with_env(i32 cols, i32 rows,
         return s;
     }
 
+    /* A command to run before the first prompt (local_first_command_script). */
+    char first_script[2048];
+    bool first_via_env = false, first_via_argv = false;
+    if (first_command && first_command[0]) {
+        if (g_local_shell_integration[0] && local_shell_is(shell, "zsh")) {
+            first_via_env = local_first_command_script(shell, first_command,
+                                                       first_script, sizeof first_script) &&
+                            local_env_set(&child_env, "LIU_RESUME_COMMAND", first_command);
+        } else {
+            first_via_argv = local_first_command_script(shell, first_command,
+                                                        first_script, sizeof first_script);
+        }
+        if (!first_via_env && !first_via_argv) {
+            local_env_free(&child_env);
+            set_error(s, "could not prepare the pane's first command");
+            return s;
+        }
+    }
+
     struct winsize ws = {
         .ws_row = (unsigned short)rows,
         .ws_col = (unsigned short)cols,
@@ -2273,8 +2424,13 @@ Session *session_create_local_with_env(i32 cols, i32 rows,
          * safely do only chdir/execve/_exit. */
         local_child_hygiene(child_maxfd);
         local_child_chdir(child_cwd, child_fallback);
-        char *argv[] = { shell, (char *)"-l", NULL };
-        execve(shell, argv, child_env.items);
+        if (first_via_argv) {
+            char *argv[] = { shell, (char *)"-l", (char *)"-i", (char *)"-c", first_script, NULL };
+            execve(shell, argv, child_env.items);
+        } else {
+            char *argv[] = { shell, (char *)"-l", NULL };
+            execve(shell, argv, child_env.items);
+        }
         _exit(127);
     }
 
@@ -2295,6 +2451,7 @@ Session *session_create_local_with_env(i32 cols, i32 rows,
     if (session_pty_thread_enabled())
         s->reader = pty_reader_start(s->pty_master, 0 /* default ring */);
     s->status = SESSION_CONNECTED;
+    local_pane_note(s->child_pid, s->instance_id);
     return s;
 }
 
@@ -2468,7 +2625,21 @@ static int ssh_authenticate(Session *s, LIBSSH2_SESSION *session,
  * socketpair fd and a libssh2 direct-tcpip channel.  Used for ProxyJump
  * so the next hop's libssh2 can treat the socketpair fd as a "raw TCP"
  * socket.
+ *
+ * The thread sleeps in poll() on the descriptors that can let it move a
+ * byte: the socketpair end, the socket its libssh2 session runs over, and a
+ * stop pipe. It never puts a descriptor under the main loop's watch — the
+ * main loop does not service this relay.
  * ------------------------------------------------------------------------- */
+
+/* The longest wait with nothing to do. Every way a byte can move has a
+ * descriptor in the wait, so this only bounds a readiness that was missed. */
+#define PROXY_RELAY_BACKSTOP_MS 500
+/* A wait that returned ready and then moved nothing (a side that can be read
+ * while its bytes have nowhere to go yet, or a hang-up) backs off, doubling up
+ * to this long, so the thread cannot spin on it. */
+#define PROXY_RELAY_SPIN_MAX_MS 50
+
 static void *channel_relay_thread(void *arg) {
     ChannelRelay *r = (ChannelRelay *)arg;
     libssh2_session_set_blocking(r->session, 0);
@@ -2477,13 +2648,89 @@ static void *channel_relay_thread(void *arg) {
         .fd = r->local_fd,
         .active = true,
     };
+    bool woke_ready = false;
+    i32 spin_ms = 0;
     while (atomic_load_explicit(&r->running, memory_order_acquire)) {
-        if (!socket_channel_relay_poll(&io)) break;
-        struct timespec idle = { .tv_sec = 0, .tv_nsec = 1000 * 1000 };
-        (void)nanosleep(&idle, NULL);
+        bool moved_any = false, budget_spent = false;
+        for (i32 step = 0; step < SOCKET_RELAY_POLL_STEPS; step++) {
+            bool moved = false;
+            if (!socket_channel_relay_step(&io, &moved)) goto done;
+            if (!moved) break;
+            moved_any = true;
+            if (step + 1 == SOCKET_RELAY_POLL_STEPS) budget_spent = true;
+        }
+        if (budget_spent) { spin_ms = 0; woke_ready = false; continue; }
+        if (moved_any) spin_ms = 0;
+        else if (woke_ready) {
+            spin_ms = spin_ms ? spin_ms * 2 : 1;
+            if (spin_ms > PROXY_RELAY_SPIN_MAX_MS) spin_ms = PROXY_RELAY_SPIN_MAX_MS;
+            struct timespec t = { .tv_sec = 0, .tv_nsec = (long)spin_ms * 1000000L };
+            (void)nanosleep(&t, NULL);
+        }
+
+        /* Each side is asked only for what the next step would do with it:
+         * the socketpair is read when the channel can take its bytes and
+         * written while bytes for it wait; the session's socket is read while
+         * a channel read, write or EOF is pending (a write may wait for the
+         * server's window) and in whatever direction libssh2 last blocked. */
+        struct pollfd p[3];
+        nfds_t n = 0;
+        p[n++] = (struct pollfd){ .fd = r->stop_rd, .events = POLLIN };
+        short local_ev = 0;
+        if (!io.fd_eof && io.to_channel_len == 0) local_ev |= POLLIN;
+        if (io.to_fd_off < io.to_fd_len) local_ev |= POLLOUT;
+        p[n++] = (struct pollfd){ .fd = io.fd, .events = local_ev };
+        int dirs = libssh2_session_block_directions(r->session);
+        short sess_ev = 0;
+        if ((!io.chan_eof && io.to_fd_len == 0) || io.to_channel_len > 0 ||
+            (io.fd_eof && !io.eof_sent) || (dirs & LIBSSH2_SESSION_BLOCK_INBOUND))
+            sess_ev |= POLLIN;
+        if (dirs & LIBSSH2_SESSION_BLOCK_OUTBOUND) sess_ev |= POLLOUT;
+        if (r->session_sock >= 0)
+            p[n++] = (struct pollfd){ .fd = r->session_sock, .events = sess_ev };
+
+        int wait_ms = PROXY_RELAY_BACKSTOP_MS;
+        if (io.shut_wr) {
+            f64 left = io.linger_until - platform_time_sec();
+            int left_ms = left <= 0.0 ? 0 : (int)(left * 1000.0) + 1;
+            if (left_ms < wait_ms) wait_ms = left_ms;
+        }
+        int rc = poll(p, n, wait_ms);
+        woke_ready = rc > 0 && p[0].revents == 0;
     }
+done:
     atomic_store_explicit(&r->running, false, memory_order_release);
     return NULL;
+}
+
+/* A relay for `channel` on `session` (which runs over `session_sock`), with
+ * its stop pipe; the thread is not started. NULL when out of memory or fds. */
+static ChannelRelay *channel_relay_new(int local_fd, LIBSSH2_CHANNEL *channel,
+                                       LIBSSH2_SESSION *session, int session_sock) {
+    ChannelRelay *r = calloc(1, sizeof(ChannelRelay));
+    if (!r) return NULL;
+    int pp[2];
+    if (pipe(pp) != 0) { free(r); return NULL; }
+    if (!fd_set_cloexec_checked(pp[0]) || !fd_set_cloexec_checked(pp[1]) ||
+        !net_set_nonblocking(pp[1])) {
+        close(pp[0]); close(pp[1]); free(r); return NULL;
+    }
+    r->local_fd = local_fd;
+    r->channel = channel;
+    r->session = session;
+    r->session_sock = session_sock;
+    r->stop_rd = pp[0];
+    r->stop_wr = pp[1];
+    atomic_init(&r->running, true);
+    return r;
+}
+
+/* Frees a relay whose thread never started (its local_fd is the caller's). */
+static void channel_relay_discard(ChannelRelay *r) {
+    if (!r) return;
+    close(r->stop_rd);
+    close(r->stop_wr);
+    free(r);
 }
 
 static bool proxy_socketpair(int sv[2]) {
@@ -2509,11 +2756,13 @@ static void proxy_hops_cleanup(Session *s) {
     for (i32 i = 0; i < s->proxy_hop_count; i++) {
         /* Stop relay thread */
         if (s->proxy_relays[i]) {
-            atomic_store_explicit(&s->proxy_relays[i]->running, false,
-                                  memory_order_release);
-            pthread_join(s->proxy_relays[i]->thread, NULL);
-            close(s->proxy_relays[i]->local_fd);
-            free(s->proxy_relays[i]);
+            ChannelRelay *r = s->proxy_relays[i];
+            atomic_store_explicit(&r->running, false, memory_order_release);
+            ssize_t w;
+            do { w = write(r->stop_wr, "x", 1); } while (w < 0 && errno == EINTR);
+            pthread_join(r->thread, NULL);
+            close(r->local_fd);
+            channel_relay_discard(r);
             s->proxy_relays[i] = NULL;
         }
         ProxyHopState *h = &s->proxy_hops[i];
@@ -2711,16 +2960,13 @@ static int ssh_do_connect(Session *s) {
                 if (!proxy_socketpair(sv))
                     FAIL("socketpair failed for proxy relay");
 
-                ChannelRelay *relay = calloc(1, sizeof(ChannelRelay));
+                ChannelRelay *relay = channel_relay_new(sv[0], tunnel, prev_session,
+                                                        s->proxy_hops[hop - 1].sock);
                 if (!relay) { close(sv[0]); close(sv[1]); FAIL("OOM"); }
-                relay->local_fd = sv[0];
-                relay->channel = tunnel;
-                relay->session = prev_session;
-                atomic_init(&relay->running, true);
                 s->proxy_relays[hop - 1] = relay;
 
                 if (pthread_create(&relay->thread, NULL, channel_relay_thread, relay) != 0) {
-                    close(sv[0]); close(sv[1]); free(relay);
+                    close(sv[0]); close(sv[1]); channel_relay_discard(relay);
                     s->proxy_relays[hop - 1] = NULL;
                     FAIL("Failed to spawn proxy relay thread");
                 }
@@ -2784,16 +3030,13 @@ static int ssh_do_connect(Session *s) {
         if (!proxy_socketpair(sv))
             FAIL("socketpair failed for final tunnel relay");
 
-        ChannelRelay *relay = calloc(1, sizeof(ChannelRelay));
+        ChannelRelay *relay = channel_relay_new(sv[0], final_tunnel, prev_session,
+                                                s->proxy_hops[s->proxy_hop_count - 1].sock);
         if (!relay) { close(sv[0]); close(sv[1]); FAIL("OOM"); }
-        relay->local_fd = sv[0];
-        relay->channel = final_tunnel;
-        relay->session = prev_session;
-        atomic_init(&relay->running, true);
         s->proxy_relays[s->proxy_hop_count - 1] = relay;
 
         if (pthread_create(&relay->thread, NULL, channel_relay_thread, relay) != 0) {
-            close(sv[0]); close(sv[1]); free(relay);
+            close(sv[0]); close(sv[1]); channel_relay_discard(relay);
             s->proxy_relays[s->proxy_hop_count - 1] = NULL;
             FAIL("Failed to spawn final tunnel relay thread");
         }
@@ -2854,6 +3097,7 @@ static int ssh_do_connect(Session *s) {
     ssh_auth_peer_set(s, config->username, config->hostname, config->port, true);
 
     int auth_rc = -1;
+    s->auth_refused[0] = '\0';
 
     /* GSSAPI: when gssapi_auth flag is set OR auth_method is AUTH_GSSAPI,
      * try methods in order: agent -> keyboard-interactive (GSSAPI fallback)
@@ -3084,9 +3328,10 @@ static int ssh_do_connect(Session *s) {
         }
     }
     if (auth_rc != 0) {
-        char *errmsg;
+        char *errmsg = NULL;
         libssh2_session_last_error(s->ssh_session, &errmsg, NULL, 0);
-        set_error(s, errmsg);
+        set_error(s, errmsg && errmsg[0] ? errmsg :
+                     s->auth_refused[0] ? s->auth_refused : "Authentication failed");
         return -1;
     }
     if (CANCELLED()) FAIL("cancelled");
@@ -3712,6 +3957,7 @@ static void session_destroy_final(Session *s) {
     if (!s) return;
 
     if (s->type == SESSION_LOCAL) {
+        local_pane_forget(s->instance_id);
         /* Join the gather thread BEFORE the fd it is blocked on is closed:
          * closing an fd out from under a blocking read()/poll() is not a
          * wake-up on macOS, and the number can be recycled underneath it. The
@@ -6424,7 +6670,7 @@ static bool socket_channel_relay_poll(SocketChannelRelay *c) {
  * inside libssh2 (its channel read already emptied the socket) or in the
  * relay's buffers; nothing will announce it, so the loop is told not to sleep
  * (the same latch a pane's drain sets). Not for the ProxyJump thread, which
- * polls on a clock of its own. */
+ * waits on its own descriptors. */
 static void socket_channel_relay_note_more(const SocketChannelRelay *c) {
     if (c && c->active && c->more) pty_reader_note_backlog();
 }

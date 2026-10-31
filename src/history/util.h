@@ -83,6 +83,12 @@ char *hist_cjson_serialize_compact(Arena *a, cJSON *node);
  * anything that needs collision or preimage resistance. */
 void hist_md5_hex(const void *data, usize len, char out[33]);
 
+/* Open a REGULAR file at `path` for reading ("rb"). Opened with O_NONBLOCK, so
+ * a FIFO planted where an agent keeps its files is refused at once instead of
+ * holding the reader until something writes to it. `nofollow` refuses a
+ * symbolic link. NULL for anything that is not a regular file. */
+FILE *hist_fopen_regular(const char *path, bool nofollow);
+
 /* Read a whole regular file into an arena-allocated NUL-terminated buffer.
  * Refuses to read files larger than `max_bytes`. Returns true on success and
  * sets *out_buf / *out_len. */
@@ -161,7 +167,7 @@ bool hist_line_reader_attach(HistLineReader *r, int fd);
 
 /* Open `path` read-only. `nofollow` refuses symlinks (O_NOFOLLOW) — the guard
  * the agent-store readers use so a planted symlink cannot redirect the read.
- * Non-regular files are always refused. */
+ * Non-regular files are always refused, a FIFO without waiting for a writer. */
 bool hist_line_reader_open(HistLineReader *r, const char *path, bool nofollow);
 
 /* Read the next line. One trailing '\n' and then one trailing '\r' are removed

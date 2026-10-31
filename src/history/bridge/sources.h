@@ -49,6 +49,7 @@ bool bridge_parse_droid   (Arena *a, const ChatSessionMeta *m, BridgeHistory *h)
 /* Bridge-native re-reads of stores Liu already parses into ChatEvent, added
  * only where the pairing or the tool arguments cannot survive that model. */
 bool bridge_parse_claude  (Arena *a, const ChatSessionMeta *m, BridgeHistory *h);
+bool bridge_parse_commandcode(Arena *a, const ChatSessionMeta *m, BridgeHistory *h);
 bool bridge_parse_codex   (Arena *a, const ChatSessionMeta *m, BridgeHistory *h);
 bool bridge_parse_grok    (Arena *a, const ChatSessionMeta *m, BridgeHistory *h);
 

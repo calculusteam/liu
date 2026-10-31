@@ -71,6 +71,57 @@ i32 app_side_tab_rows(const AppState *app, SideTabRow *rows, i32 cap) {
     return n;
 }
 
+/* The tabs section of `L`, NULL when the bar has none (undocked, the rail). */
+static const SidebarSectionRect *side_tabs_section(const SidebarLayout *L) {
+    if (!L || L->rail) return NULL;
+    i32 i = sidebar_layout_index(L, SB_SEC_TABS);
+    return i >= 0 ? &L->sec[i] : NULL;
+}
+
+void app_side_jumps(const AppState *app, const SidebarLayout *L, SidebarJump out[2]) {
+    memset(out, 0, 2 * sizeof *out);
+    const SidebarSectionRect *s = side_tabs_section(L);
+    if (!app || !s) return;
+    SideTabRow rows[MAX_TABS + MAX_TAB_GROUPS + 1];
+    i32 n = app_side_tab_rows(app, rows, (i32)(sizeof rows / sizeof rows[0]));
+    if (n > (i32)(sizeof rows / sizeof rows[0])) n = (i32)(sizeof rows / sizeof rows[0]);
+    bool notable[MAX_TABS + MAX_TAB_GROUPS + 1];
+    i32 active_row = -1;
+    for (i32 r = 0; r < n; r++) {
+        notable[r] = false;
+        if (rows[r].kind != SIDE_ROW_TAB) continue;
+        i32 ti = rows[r].index;
+        if (ti < 0 || ti >= app->tab_count) continue;
+        const Tab *t = &app->tabs[ti];
+        if (ti == app->active_tab) active_row = r;
+        notable[r] = ti == app->active_tab || t->has_bell || t->agent_working_count > 0;
+    }
+    sidebar_jumps_compute(s, L->row_h, app->side_tabs_scroll, notable, n, active_row,
+                          0.0f, app->sidebar_width, app->dpi_scale, out);
+    for (i32 d = 0; d < 2; d++)
+        for (i32 k = 0; k < out[d].n_icons; k++)
+            out[d].tabs[k] = rows[out[d].rows[k]].index;
+}
+
+void app_side_tabs_glide_to(AppState *app, i32 tab, f64 now) {
+    if (!app) return;
+    SidebarLayout L;
+    app_sidebar_layout(app, &L);
+    const SidebarSectionRect *s = side_tabs_section(&L);
+    if (!s) return;
+    SideTabRow rows[MAX_TABS + MAX_TAB_GROUPS + 1];
+    i32 n = app_side_tab_rows(app, rows, (i32)(sizeof rows / sizeof rows[0]));
+    if (n > (i32)(sizeof rows / sizeof rows[0])) n = (i32)(sizeof rows / sizeof rows[0]);
+    for (i32 r = 0; r < n; r++) {
+        if (rows[r].kind != SIDE_ROW_TAB || rows[r].index != tab) continue;
+        app->side_tabs_glide = true;
+        app->side_tabs_glide_from = app->side_tabs_scroll;
+        app->side_tabs_glide_to = sidebar_scroll_to_row(s, L.row_h, r);
+        app->side_tabs_glide_t0 = now;
+        return;
+    }
+}
+
 /* Header actions per section. The tab list carries a "+" (new tab); the
  * others have none yet. ICON_* values, as i32 so code linking hittest.c
  * need not pull in the icon table. */

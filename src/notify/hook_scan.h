@@ -174,8 +174,21 @@ static inline bool hook_cmd_legacy_bin(const char *cmd, char *bin, usize cap) {
  * Do not match commands that merely mention `liu-notify` as an argument, such
  * as `say done; echo liu-notify` or `/usr/bin/logger /x/liu-notify`.
  */
+/* The guard Liu puts ahead of a tool hook (PreToolUse / PostToolUse): a pane
+ * that leads no team (Liu keeps `<socket>.lead-<pane>` only while it does)
+ * runs no liu-notify for its agent's tool calls, only the shell's test and a
+ * drain of the payload the agent writes. A command that starts with exactly
+ * this text is read from what follows it. */
+#define HOOK_LEAD_GUARD "[ -e \"$LIU_AGENT_SOCK.lead-${LIU_PANE_ID#*.}\" ] || { /bin/cat >/dev/null; exit 0; }; "
+
+static inline const char *hook_cmd_after_guard(const char *cmd) {
+    if (cmd && !strncmp(cmd, HOOK_LEAD_GUARD, sizeof HOOK_LEAD_GUARD - 1)) return cmd + sizeof HOOK_LEAD_GUARD - 1;
+    return cmd;
+}
+
 static inline bool hook_cmd_liu_bin(const char *cmd, char *bin, usize cap) {
     if (!cmd || !bin || cap == 0) return false;
+    cmd = hook_cmd_after_guard(cmd);
     if (hook_cmd_first_word(cmd, bin, cap) && hook_path_is_notify_bin(bin)) return true;
     if (hook_cmd_legacy_bin(cmd, bin, cap)) return true;
     bin[0] = '\0';

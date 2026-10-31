@@ -387,7 +387,9 @@ static void draw_agent_tile(AppState *app, const PopupStyle *st, i32 tool,
     const u8 *px = agent_icon_rgba_scaled_on((ChatTool)tool,
                                              (i32)(isz + 0.5f), tile, &iw, &ih);
     if (px) {
-        renderer_draw_image(r, px, iw, ih, x + pad, y + pad, isz, isz);
+        /* The tinted path, so the logo fades with the tile under it. */
+        renderer_draw_image_tinted(r, px, 0, px, iw, ih, x + pad, y + pad, isz, isz,
+                                   (Color){1, 1, 1, alpha});
     } else {
         AgentTint tint = agent_icon_tint((ChatTool)tool);
         /* Same inset the icon above uses, so the two are the same size. */

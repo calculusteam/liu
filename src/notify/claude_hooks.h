@@ -49,4 +49,14 @@ ClaudeHookResult commandcode_hooks_install(const char *notify_bin_path);
 ClaudeHookResult commandcode_hooks_uninstall(void);
 bool commandcode_hooks_installed(void);
 
+/* Devin CLI (~/.config/devin/config.json: Stop and UserPromptSubmit) and Qoder
+ * CLI (~/.qoder/settings.json: Claude Code's three events), both in Claude
+ * Code's hook format. */
+ClaudeHookResult devin_hooks_install(const char *notify_bin_path);
+ClaudeHookResult devin_hooks_uninstall(void);
+bool devin_hooks_installed(void);
+ClaudeHookResult qoder_hooks_install(const char *notify_bin_path);
+ClaudeHookResult qoder_hooks_uninstall(void);
+bool qoder_hooks_installed(void);
+
 #endif

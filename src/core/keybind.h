@@ -55,6 +55,17 @@ typedef enum {
     ACT_SPLIT_VERTICAL,
     ACT_SAVE_FILE,
 
+    /* Panes: the keyboard to a neighbour, the next or previous pane in
+     * reading order, and one pane filling its tab (ui/pane_nav.h,
+     * ui/pane_zoom.h). */
+    ACT_FOCUS_PANE_LEFT,
+    ACT_FOCUS_PANE_RIGHT,
+    ACT_FOCUS_PANE_UP,
+    ACT_FOCUS_PANE_DOWN,
+    ACT_NEXT_PANE,
+    ACT_PREV_PANE,
+    ACT_TOGGLE_PANE_ZOOM,
+
     /* Prompt navigation */
     ACT_PREV_PROMPT,
     ACT_NEXT_PROMPT,
