@@ -8,9 +8,10 @@
  *
  * chat_history.jsonl contains system, user, assistant, tool_result, and
  * reasoning records. User records with synthetic_reason contain injected
- * context, not a user turn, so they are imported as CONTEXT. User turns
- * wrapped in <user_query> are unwrapped; the first turn may be preceded by a
- * <user_info> block. Reasoning records are skipped because encrypted_content
+ * context, not a user turn, so they are imported as CONTEXT. A user turn is
+ * one the CLI numbered (`prompt_index`, as 1.0 writes every prompt) or one
+ * wrapped in <user_query>, as earlier releases did, which is unwrapped; the
+ * first turn may be preceded by a <user_info> block. Reasoning records are skipped because encrypted_content
  * is tied to xAI and the summary is private model output.
  */
 #include "history/bridge/sources.h"
@@ -107,13 +108,14 @@ static bool grok_line(void *root_cjson, Arena *scratch, BridgeHistory *h,
         if (!txt) return true;
 
         bool synthetic = cJSON_GetObjectItemCaseSensitive(root, "synthetic_reason") != NULL;
+        bool prompted = cJSON_GetObjectItemCaseSensitive(root, "prompt_index") != NULL;
         usize len = strlen(txt);
         const char *body = unwrap(txt, &len, "user_query");
-        bool was_query = (body != txt) || len != strlen(txt);
+        bool was_query = (body != txt) || len != strlen(txt) || prompted;
 
-        /* A user line that is neither a <user_query> nor marked synthetic is
-         * still harness-injected: the <user_info> environment block arrives
-         * exactly this way. Classify by what it IS, not by the channel. */
+        /* A user line that is neither a prompt nor marked synthetic is still
+         * harness-injected: the <user_info> environment block arrives exactly
+         * this way. Classify by what it IS, not by the channel. */
         BridgeEventType et = (was_query && !synthetic)
                                 ? BRIDGE_EVENT_USER : BRIDGE_EVENT_CONTEXT;
 

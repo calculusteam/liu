@@ -144,6 +144,7 @@ typedef enum {
     ICON_HASH,           /* hash — a Markdown heading */
     ICON_HISTORY,        /* history — connection history */
     ICON_BRUSH,          /* brush — Sketch */
+    ICON_MAXIMIZE,       /* maximize-2 — a pane zoomed to fill its tab */
     ICON_COUNT,
 } IconKind;
 

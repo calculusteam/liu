@@ -99,7 +99,7 @@ static bool claude_reg_read(const char *path, ClaudeReg *out, bool *live) {
     memset(out, 0, sizeof *out);
     *live = false;
     char buf[4096];
-    FILE *f = fopen(path, "rb");
+    FILE *f = hist_fopen_regular(path, false);
     if (!f) return false;
     usize n = fread(buf, 1, sizeof buf - 1, f);
     fclose(f);
@@ -275,7 +275,11 @@ static const CodexHead *codex_head_get(const char *path) {
                 const char *id   = hist_cjson_str(payload, "id");
                 const char *pcwd = hist_cjson_str(payload, "cwd");
                 const char *src  = hist_cjson_str(payload, "thread_source");
-                h.subagent = src && strcmp(src, "subagent") == 0;
+                cJSON *source = cJSON_GetObjectItemCaseSensitive(payload, "source");
+                /* a thread another thread started (a sub-agent's, a guardian's review) */
+                h.subagent = (src && strcmp(src, "subagent") == 0) ||
+                             hist_cjson_str(payload, "parent_thread_id") != NULL ||
+                             (cJSON_IsObject(source) && cJSON_GetObjectItemCaseSensitive(source, "subagent"));
                 if (id && pcwd) {
                     h.path = strdup(path);
                     h.cwd  = strdup(pcwd);
@@ -400,7 +404,7 @@ static bool codex_index_thread_name(const char *id, char *out, usize cap, const 
                  size - memo->searched_end > CODEX_IDX_TAIL))
         memo->valid = false, memo = NULL;       /* replaced, truncated, or far behind */
 
-    FILE *f = fopen(path, "rb");
+    FILE *f = hist_fopen_regular(path, false);
     if (!f) return false;
     char title[256];
     title[0] = '\0';
@@ -772,7 +776,7 @@ static bool live_title_commandcode(const char *cwd, char *out, usize cap, const 
     /* A session that has not been titled yet has no "title" key at all (the
      * sidecar is written on creation with just traceIds), which reads as
      * "no title" and leaves the tab showing the tool name. */
-    FILE *f = fopen(best, "rb");
+    FILE *f = hist_fopen_regular(best, false);
     if (!f) return false;
     char buf[8192];
     usize len = fread(buf, 1, sizeof buf - 1, f);
@@ -890,7 +894,7 @@ static ClineMeta cline_meta_read(const char *path, const char *cwd,
     char *buf = (char *)malloc(sz + 1);
     if (!buf) return CLINE_META_OTHER;
 
-    FILE *f = fopen(path, "rb");
+    FILE *f = hist_fopen_regular(path, false);
     if (!f) { free(buf); return CLINE_META_OTHER; }
     g_cline_meta_reads++;
     usize got = fread(buf, 1, sz, f);
@@ -1067,7 +1071,7 @@ static bool live_title_pi_family(ChatTool tool, const char *cwd, char *out, usiz
     closedir(d);
     if (!best[0] || probe_cancelled(probe)) return false;
 
-    FILE *f = fopen(best, "rb");
+    FILE *f = hist_fopen_regular(best, false);
     if (!f) return false;
     bool ok = false;
     if (tool == CHAT_TOOL_OMP) {

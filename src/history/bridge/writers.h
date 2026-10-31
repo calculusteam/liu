@@ -28,8 +28,13 @@
  * cwd with Claude's own rule (hist_slugify_claude). The scanner compares the
  * same way; it does not try to reverse a directory name — that is lossy. */
 bool bridge_claude_project_dir(const char *cwd, char *out, usize cap);
+/* The directory NAME alone (`-Volumes-Work-liu`), for a projects folder other
+ * than the user's own. */
+bool bridge_claude_project_slug(const char *cwd, char *out, usize cap);
+/* `provenance` opens the transcript with a user turn saying where it came
+ * from; a transcript handed to another agent's importer goes without it. */
 bool bridge_write_claude_session(const BridgeHistory *h, const char *session_id,
-                                 const char *path, u32 *out_warnings);
+                                 const char *path, bool provenance, u32 *out_warnings);
 
 /* CommandCode: ~/.commandcode/projects/<lower-dash-slug>/<uuid>.jsonl. */
 bool bridge_commandcode_project_dir(const char *cwd, char *out, usize cap);
@@ -41,8 +46,15 @@ bool bridge_qwen_chats_dir(const char *cwd, char *out, usize cap);
 bool bridge_write_qwen_session(const BridgeHistory *h, const char *session_id,
                                const char *path, u32 *out_warnings);
 
+/* Pi (CHAT_TOOL_PI) and Oh My Pi (CHAT_TOOL_OMP): the bucket folder and the
+ * file for a new session started at `ts`. */
+bool bridge_pi_session_path(ChatTool tool, const char *cwd, const char *session_id, i64 ts,
+                            char *dir, usize dir_cap, char *path, usize path_cap);
+bool bridge_write_pi_session(const BridgeHistory *h, ChatTool target, const char *session_id,
+                             const char *path, u32 *out_warnings);
+
 /* Grok: a session DIRECTORY. `dir` must already exist; the writer fills in
- * chat_history.jsonl and summary.json. */
+ * chat_history.jsonl, updates.jsonl and summary.json. */
 bool bridge_grok_session_dir(const char *cwd, const char *session_id,
                              char *out, usize cap);
 bool bridge_write_grok_session(const BridgeHistory *h, const char *session_id,

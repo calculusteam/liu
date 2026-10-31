@@ -14,6 +14,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <dirent.h>
 #include <errno.h>
 #include <limits.h>
@@ -410,11 +411,23 @@ i32 sftp_download(void *sftp_ptr, const char *remote_path, const char *local_pat
 static _Atomic unsigned g_sftp_stage_seq = 0;
 
 i32 sftp_upload(void *sftp_ptr, const char *local_path, const char *remote_path) {
-    LIBSSH2_SFTP *sftp = (LIBSSH2_SFTP *)sftp_ptr;
-    if (!sftp || !local_path || !remote_path) return -1;
+    if (!sftp_ptr || !local_path || !remote_path) return -1;
+    /* O_NONBLOCK: a FIFO at the path is refused instead of waiting for a
+     * writer while the caller holds the session's I/O scope. */
+    int fd = open(local_path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return -1;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) { close(fd); return -1; }
+    return sftp_upload_fd(sftp_ptr, fd, local_path, remote_path);
+}
 
-    FILE *f = fopen(local_path, "rb");
-    if (!f) return -1;
+i32 sftp_upload_fd(void *sftp_ptr, int fd, const char *label, const char *remote_path) {
+    LIBSSH2_SFTP *sftp = (LIBSSH2_SFTP *)sftp_ptr;
+    if (fd < 0) return -1;
+    if (!sftp || !remote_path) { close(fd); return -1; }
+
+    FILE *f = fdopen(fd, "rb");
+    if (!f) { close(fd); return -1; }
 
     struct stat local_st;
     bool local_known = fstat(fileno(f), &local_st) == 0;
@@ -464,7 +477,7 @@ i32 sftp_upload(void *sftp_ptr, const char *local_path, const char *remote_path)
     }
 
     u32 xfer_id = 0;
-    transfer_state_begin(local_path, total, true);
+    transfer_state_begin(label ? label : "", total, true);
 
     char buf[SFTP_BUF_SIZE];
     u64 done = 0;

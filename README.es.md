@@ -55,6 +55,14 @@ Pulsa Cmd+K para abrir la paleta de comandos y escribe "agent history" para nave
 
 Liu rastrea el agente de cada panel dividido, no solo el de cada pestaña. La pestaña se nombra por el chat del propio agente, lleva un logotipo por panel con agente y recorre una barra de actividad mientras se produce salida. Deja el puntero encima y un panel lista cada división: agente, tema del chat y una pastilla que dice `working 1m 12s` o `idle 40s`. Cuando un agente termina un tramo de trabajo, cae una tarjeta bajo esa pestaña y suena el aviso de finalización.
 
+### Agentes que lanzan agentes
+
+Un agente en un panel puede pasar trabajo a otro a través de Liu: `liu-agent start codex "port the tests"`. Liu te pregunta primero y luego lo ejecuta como una pequeña pestaña de tarea unida a la derecha de la pestaña que lo pidió: su logotipo sobre una bruma en movimiento que muestra su estado. Deja el puntero encima para ver sus últimas líneas; haz clic para abrir su chat, donde puedes enviar el siguiente turno, detenerlo o continuar su sesión en un panel. Los agentes lanzados juntos trabajan como equipo y reciben aviso cuando dos tocan el mismo archivo.
+
+### Pestañas de subagentes
+
+Cuando un agente lanza subagentes propios (la herramienta Agent de Claude Code, Codex, OpenCode, Copilot CLI, Cursor, Qwen Code, Droid, Crush y más), cada uno se convierte en una pestaña de tarea junto a la pestaña del agente, leída en vivo de los propios registros del agente. Cinco subagentes, cinco pestañas, cada bruma una imagen propia. Deja el puntero en una para ver sus últimas líneas, haz clic para ver su registro completo; al terminar cada una indica hecho o fallido, y se borran con tu siguiente prompt.
+
 ### Prompt por voz
 
 Pulsa **⌘⇧M** y habla. Whisper large-v3-turbo se ejecuta en este Mac (sin red, sin cuenta, sin subir nada) y las palabras se escriben en el panel que tenga el foco, así que funciona en Claude Code, en una shell normal o en un REPL. Una forma de onda en vivo muestra lo que el micrófono está oyendo de verdad; al parar, la traza se congela y un barrido la recorre mientras se transcribe el audio. Elige el micrófono, elige entre los 100 idiomas que conoce Whisper, o apúntalo a una API de voz en la nube.
@@ -85,7 +93,7 @@ Cada nota vive en una sola Bóveda. **⌘K** → Crear nota deja que un agente l
 
 ### Sistema de notificaciones integrado
 
-`liu-notify` solo habla cuando un agente realmente te necesita, y solo entonces: una alerta de voz, una notificación de escritorio o un sonido personalizado. Un servicio en segundo plano independiente que sigue funcionando incluso con Liu cerrado.
+`liu-notify` solo habla cuando un agente realmente te necesita, y solo entonces: una alerta de voz, una notificación de escritorio o un sonido personalizado. Funciona dentro de Liu: al iniciarse añade los hooks a tus agentes, y se eliminan al cerrar Liu, así que los agentes que ejecutes en otro sitio no se ven afectados.
 
 ### Ahorro de tokens
 
@@ -103,6 +111,10 @@ Un único **⌘K** realiza una búsqueda difusa de cada comando, ajuste, host, s
 
 Hasta 32 pestañas, cada una con hasta 8 paneles en cualquier árbol de división H/V. Arrastrar y soltar paneles. **⌘⇧I** transmite la entrada a todos los paneles activos simultáneamente. Arrastra una pestaña fuera para crear una ventana, o sobre la barra de otra ventana para unirla. Al cerrar y volver a abrir, Liu recupera tus pestañas.
 
+### Retoma donde lo dejaste
+
+Liu guarda tus pestañas mientras se ejecuta, así que tras salir, un fallo o un reinicio vuelven las mismas ventanas, pestañas, divisiones y carpetas, y cada panel muestra su pantalla anterior sobre una tenue línea `Restored session`. Un agente que estaba en marcha vuelve a arrancar en su propia sesión, lanzado por el shell (Claude Code, Codex, OpenCode y todo agente con opción de reanudar), sin que se escriba nada en él.
+
 ### Explorador de archivos
 
 Explorador local + SFTP en la barra lateral con apertura de un clic. NSFilePromise arrastra a Finder y transfiere archivos en segundo plano. Caché LRU de imágenes de 32 MiB. Se abre en el directorio de trabajo del panel activo. Suelta un archivo de Finder en un panel y su ruta se escribe en el prompt; si el panel es una sesión SSH, se sube por SFTP.
@@ -113,7 +125,7 @@ Las pestañas inactivas durante N minutos se suspenden automáticamente: CPU y R
 
 ### Grupos de pestañas
 
-Agrupa terminales relacionados en grupos con nombre y color en la barra de pestañas, estilo Chrome. Crea con **⌘⇧G**, arrastrar y soltar, o clic derecho. Contrae un grupo para ocultar sus pestañas y suspenderlas, liberando sus conexiones PTY/SSH. Recolorea desde una paleta de 8 colores, renombra en línea, desagrupa o cierra todo un grupo a la vez. Los grupos con nombre y color sobreviven a los reinicios: hasta 8 a la vez.
+Agrupa terminales relacionados en grupos con nombre y color en la barra de pestañas, estilo Chrome. Crea uno desde el menú de clic derecho de una pestaña o desde la paleta de comandos, y arrastra pestañas para meterlas o sacarlas. Contrae un grupo para ocultar sus pestañas y suspenderlas, liberando sus conexiones PTY/SSH. Recolorea desde una paleta de 8 colores, renombra en línea, desagrupa o cierra todo un grupo a la vez. Los grupos con nombre y color sobreviven a los reinicios: hasta 8 a la vez.
 
 ### Gestor de sitios
 

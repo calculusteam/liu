@@ -19,6 +19,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <pwd.h>
+#include <grp.h>
 
 /* =========================================================================
  * Helpers
@@ -49,11 +51,34 @@ typedef struct {
     bool  keep;
 } KnownHostLine;
 
+/* A group of the user's own: named after the user, with nobody else in it —
+ * what a user-private-group system creates every account with, and the one
+ * group whose write bit lets no other user in. A group that cannot be looked
+ * up is not one. */
+static bool known_hosts_group_is_private(gid_t gid) {
+    char pwbuf[4096], grbuf[16384];
+    struct passwd pw, *pwp = NULL;
+    struct group gr, *grp = NULL;
+    if (getpwuid_r(geteuid(), &pw, pwbuf, sizeof pwbuf, &pwp) != 0 || !pwp || !pwp->pw_name) return false;
+    if (getgrgid_r(gid, &gr, grbuf, sizeof grbuf, &grp) != 0 || !grp || !grp->gr_name) return false;
+    if (strcmp(grp->gr_name, pwp->pw_name) != 0) return false;
+    for (char **m = grp->gr_mem; m && *m; m++)
+        if (strcmp(*m, pwp->pw_name) != 0) return false;
+    return true;
+}
+
+/* Writable by the user alone: not by others, and by the group only when that
+ * group is the user's private one. A store another user can write — directly,
+ * or by renaming a file into its folder — is that user's word on which host
+ * keys are trusted. */
+static bool known_hosts_writable_by_owner_only(const struct stat *st) {
+    if (st->st_mode & S_IWOTH) return false;
+    return !(st->st_mode & S_IWGRP) || known_hosts_group_is_private(st->st_gid);
+}
+
 /* The directory holding the trust store (~/.ssh) has to be the user's own and
- * not writable by other users, or the file check below is a check on whatever
- * somebody else rename()d into place a moment ago. Group bits are tolerated:
- * OpenSSH's own client does not police them on the client side and
- * shared-group home directories exist. */
+ * writable by nobody else, or the file check below is a check on whatever
+ * somebody else rename()d into place a moment ago. */
 static bool known_hosts_dir_safe(const char *path) {
     char dir[4096];
     int n = snprintf(dir, sizeof dir, "%s", path);
@@ -63,7 +88,7 @@ static bool known_hosts_dir_safe(const char *path) {
     *slash = '\0';
     struct stat st;
     if (lstat(dir, &st) != 0) return false;
-    return S_ISDIR(st.st_mode) && st.st_uid == geteuid() && !(st.st_mode & S_IWOTH);
+    return S_ISDIR(st.st_mode) && st.st_uid == geteuid() && known_hosts_writable_by_owner_only(&st);
 }
 
 /* If ~/.ssh is absent, treat the known-hosts store as empty.
@@ -98,8 +123,16 @@ static bool known_hosts_path_safe(const char *path, bool allow_missing) {
         return allow_missing && known_hosts_dir_missing(path);
     struct stat st;
     if (lstat(path, &st) == 0)
-        return S_ISREG(st.st_mode) && st.st_uid == geteuid();
+        return S_ISREG(st.st_mode) && st.st_uid == geteuid() &&
+               known_hosts_writable_by_owner_only(&st);
     return allow_missing && errno == ENOENT;
+}
+
+bool known_hosts_store_unsafe(void) {
+    char path[4096];
+    if (!get_known_hosts_path(path, sizeof path)) return false;
+    if (known_hosts_dir_missing(path)) return false;
+    return !known_hosts_path_safe(path, true);
 }
 
 /* libssh2 needs the key TYPE bit to serialise an entry: with KEY_UNKNOWN and

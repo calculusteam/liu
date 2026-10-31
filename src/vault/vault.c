@@ -448,9 +448,14 @@ static bool meta_set_blob(sqlite3 *db, const char *key,
 static bool meta_get_blob(sqlite3 *db, const char *key,
                           u8 *out, usize cap_out, usize *len_out) {
     sqlite3_stmt *s = NULL;
-    const char *sql = "SELECT value FROM vault_meta WHERE key=?";
+    /* octet_length() reads the stored size, not the value: a value longer
+     * than the caller's buffer comes back NULL and is never loaded. */
+    const char *sql = "SELECT CASE WHEN octet_length(value) <= ?2 THEN value END"
+                      " FROM vault_meta WHERE key=?1";
+    if (cap_out > (usize)INT_MAX) cap_out = (usize)INT_MAX;
     if (sqlite3_prepare_v2(db, sql, -1, &s, NULL) != SQLITE_OK) return false;
     sqlite3_bind_text(s, 1, key, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(s, 2, (sqlite3_int64)cap_out);
     bool ok = false;
     if (sqlite3_step(s) == SQLITE_ROW) {
         const void *v = sqlite3_column_blob(s, 0);
@@ -1127,15 +1132,34 @@ bool vault_secret_delete(Vault *v, const char *id) {
 
 /* ---------- Reveal / release ---------- */
 
+/* The longest envelope any kind's secret can make: the v2 header with the
+ * largest binding, nonce and tag, around the largest plaintext. A stored
+ * value longer than this is no secret Liu wrote. */
+static sqlite3_int64 secret_envelope_max(void) {
+    usize most = 0;
+    for (i32 k = VAULT_SECRET_PASSWORD; k <= VAULT_SECRET_NOTE; k++) {
+        usize n = vault_secret_max_len((VaultSecretKind)k);
+        if (n > most) most = n;
+    }
+    return (sqlite3_int64)(SECRET_ENVELOPE_HEADER + SECRET_BINDING_CAP +
+                           CRYPTO_AEAD_NONCE_LEN + CRYPTO_AEAD_TAG_LEN + most);
+}
+
 static u8 *secret_reveal(Vault *v, const char *id, usize *out_len,
                          SecretBinding *binding) {
     if (!v || !v->unlocked || !id || !out_len) return NULL;
 
     sqlite3_stmt *s = NULL;
+    /* The value is read only when octet_length() — the stored size, read
+     * without the bytes — fits an envelope; a larger one comes back NULL
+     * without ever being loaded. The kind's own maximum is then applied by
+     * decrypt_secret_value before anything is allocated. */
     if (sqlite3_prepare_v2(v->db,
-        "SELECT kind, encrypted_value FROM vault_secrets WHERE id=?",
+        "SELECT kind, CASE WHEN octet_length(encrypted_value) <= ?2"
+        " THEN encrypted_value END FROM vault_secrets WHERE id=?1",
         -1, &s, NULL) != SQLITE_OK) return NULL;
     sqlite3_bind_text(s, 1, id, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(s, 2, secret_envelope_max());
 
     u8 *out = NULL;
     if (sqlite3_step(s) == SQLITE_ROW) {
@@ -1231,13 +1255,18 @@ i32 vault_secret_count_unreviewed(Vault *v) {
     if (!v || !v->db) return -1;
     sqlite3_stmt *s = NULL;
     /* A v2 envelope starts with its magic; other values use the
-     * nonce|tag|ciphertext layout. substr() on a BLOB counts bytes. */
+     * nonce|tag|ciphertext layout. substr() on a BLOB counts bytes, and loads
+     * the whole value: it runs only on a row whose stored size (octet_length,
+     * read without the bytes) is an envelope's. A larger row can never be
+     * revealed, so there is nothing in it to review. */
     if (sqlite3_prepare_v2(v->db,
         "SELECT COUNT(*) FROM vault_secrets"
-        " WHERE encrypted_value IS NOT NULL AND length(encrypted_value) > 0"
-        "   AND substr(encrypted_value,1,8) <> ?",
+        " WHERE encrypted_value IS NOT NULL"
+        "   AND octet_length(encrypted_value) BETWEEN 1 AND ?2"
+        "   AND substr(encrypted_value,1,8) <> ?1",
         -1, &s, NULL) != SQLITE_OK) return -1;
     sqlite3_bind_blob(s, 1, SECRET_ENVELOPE_MAGIC, 8, SQLITE_STATIC);
+    sqlite3_bind_int64(s, 2, secret_envelope_max());
     i32 n = sqlite3_step(s) == SQLITE_ROW ? (i32)sqlite3_column_int(s, 0) : -1;
     sqlite3_finalize(s);
     return n;

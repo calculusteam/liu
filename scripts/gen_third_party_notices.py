@@ -176,7 +176,8 @@ def build():
     w(block(read("third_party/cjson/LICENSE")))
     w(f"\n### stb_truetype {stbtt_v} and stb_image {stbi_v}\n")
     w("https://github.com/nothings/stb — public domain or MIT License, at the user's choice. "
-      "Liu's copy of\nstb_truetype is edited (bounded CFF reader; the edits are marked `Liu:`).\n\n")
+      "Liu's copies of\nstb_truetype (a bounded CFF reader) and stb_image (a PNG data buffer that grows with the bytes "
+      "read)\nare edited; the edits are marked `Liu:`.\n\n")
     w(block(stb_license))
     w("\n### NanoSVG\n")
     w("https://github.com/memononen/nanosvg — zlib License.\n\n")
@@ -245,8 +246,8 @@ def build():
       "under the terms\n  its publisher states on the model's page.\n")
 
     w("\n## Trademarks\n\n")
-    w("The names and logos of the AI coding tools Liu works with — among them Claude, Codex, "
-      "GitHub Copilot, Cursor,\nGemini, Cline, OpenCode, Amazon Q, Aider, Windsurf, Droid, Kiro, Crush, OpenClaw and Hermes — are "
+    w("The names and logos of the AI coding tools Liu works with — among them Claude, Codex, ChatGPT, "
+      "GitHub Copilot, Cursor,\nGemini, Cline, OpenCode, Amazon Q, Windsurf, Droid, Kiro, Crush, OpenClaw and Hermes — are "
       "trademarks of their respective owners. Liu shows\nthem only to identify those tools and "
       "is not affiliated with or endorsed by their owners.\n")
 

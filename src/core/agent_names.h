@@ -48,7 +48,6 @@ static const AgentName g_agent_names[] = {
     { "agy",          "antigravity" },
     { "kimi",         "kimi"        },
     { "qwen",         "qwen"        },
-    { "aider",        "aider"       },
     { "amazon-q",     "amazon-q"    },
     { "amazonq",      "amazon-q"    },
     { "continue",     "continue"    },
@@ -65,6 +64,24 @@ static const AgentName g_agent_names[] = {
     { "omp",          "omp"         },
     { "openclaw",     "openclaw"    },
     { "hermes",       "hermes"      },
+    { "devin",        "devin"       },
+    { "devin-cli",    "devin"       },
+    /* Qoder CLI's binary and the names its installers link. */
+    { "qodercli",     "qoder"       },
+    { "qoder",        "qoder"       },
+    { "qoderclicn",   "qoder"       },
+    { "qodercn",      "qoder"       },
+    { "letta",        "letta"       },
+    { "letta-code",   "letta"       },
+    { "mastracode",   "mastracode"  },
+    { "mastra-code",  "mastracode"  },
+    { "maki",         "maki"        },
+    /* Muse Code's launcher execs a versioned `muse-bin-<version>`, which the
+     * process probe reads by its leading token (ssh_session.c). */
+    { "muse",         "muse"        },
+    { "muse-code",    "muse"        },
+    { "muse-cli",     "muse"        },
+    { "prime-agent",  "prime"       },
 };
 
 static inline bool agent_names_equal(const char *a, const char *b, bool fold_case) {

@@ -1,8 +1,9 @@
 /*
  * liu-history/bridge - the writer-backed target adapters.
  *
- * Six agents with no import API but a session store Liu can write:
- * Claude Code, Command Code, Qwen Code, Grok, Kimi and the Cline CLI. Each is
+ * Eight agents with no import API but a session store Liu can write:
+ * Claude Code, Command Code, Qwen Code, Grok, Kimi, the Cline CLI, Pi and
+ * Oh My Pi. Each is
  * a thin shell around its writer in writers/, and the shell is where all the
  * safety lives:
  *
@@ -27,6 +28,7 @@
  * resume, because after a successful write these ARE native sessions.
  */
 #include "history/bridge/targets.h"
+#include "history/bridge/compatibility.h"
 #include "history/bridge/handoff.h"
 #include "history/bridge/writers.h"
 #include "history/util.h"
@@ -86,7 +88,7 @@ static bool claude_import(const BridgeHistory *h, BridgeImportResult *r) {
     }
 
     u32 warnings = 0;
-    if (!bridge_write_claude_session(h, uuid, path, &warnings)) {
+    if (!bridge_write_claude_session(h, uuid, path, true, &warnings)) {
         snprintf(r->error, sizeof r->error, "Failed writing the Claude session transcript.");
         return false;
     }
@@ -128,6 +130,7 @@ const BridgeTarget g_bridge_target_claude = {
     .supports_full_history = yes,
     .import_history        = claude_import,
     .validate_import       = claude_validate,
+    .handoff_launch        = "claude %s",
 };
 
 /* --------------------------------------------------------- CommandCode --- */
@@ -409,4 +412,75 @@ const BridgeTarget g_bridge_target_cline_cli = {
     .supports_full_history = yes,
     .import_history        = cline_import,
     .validate_import       = cline_validate,
+};
+
+/* ------------------------------------------------------ Pi and Oh My Pi --- */
+
+static bool pi_available(void)  { return bridge_binary_available("pi"); }
+static bool omp_available(void) { return bridge_binary_available("omp"); }
+
+static bool pi_family_import(ChatTool tool, const BridgeHistory *h, BridgeImportResult *r) {
+    const char *bin = tool == CHAT_TOOL_OMP ? "omp" : "pi";
+    if (!writer_preflight(h, r)) return false;
+
+    i64 t0 = 0;
+    for (usize i = 0; i < h->event_count && t0 <= 0; i++) t0 = h->events[i].timestamp_ms;
+    if (t0 <= 0) t0 = bridge_now_ms();
+    char uuid[64], dir[BRIDGE_PATH_CAP], path[BRIDGE_PATH_CAP];
+    bool have = false;
+    for (i32 attempt = 0; attempt < 3 && !have; attempt++) {
+        if (!bridge_new_uuid(uuid, sizeof uuid)) break;
+        if (!bridge_pi_session_path(tool, h->cwd, uuid, t0, dir, sizeof dir, path, sizeof path)) break;
+        if (!bridge_path_exists(path)) have = true;
+    }
+    if (!have || !bridge_mkdir_p(dir)) {
+        snprintf(r->error, sizeof r->error, "Could not allocate a free %s session.",
+                 chat_tool_name(tool));
+        return false;
+    }
+    u32 warnings = 0;
+    if (!bridge_write_pi_session(h, tool, uuid, path, &warnings)) {
+        snprintf(r->error, sizeof r->error, "Failed writing the %s session.", chat_tool_name(tool));
+        return false;
+    }
+    hist_copy_bounded(r->session_id,   sizeof r->session_id,   uuid);
+    hist_copy_bounded(r->session_path, sizeof r->session_path, path);
+    r->warnings += warnings;
+    snprintf(r->launch_cmd, sizeof r->launch_cmd, "%s --session %s", bin, uuid);
+    return true;
+}
+
+static bool pi_import(const BridgeHistory *h, BridgeImportResult *r) {
+    return pi_family_import(CHAT_TOOL_PI, h, r);
+}
+
+static bool omp_import(const BridgeHistory *h, BridgeImportResult *r) {
+    return pi_family_import(CHAT_TOOL_OMP, h, r);
+}
+
+static bool pi_validate(const BridgeImportResult *r) {
+    if (!file_nonempty(r->session_path)) return false;
+    /* The header is the first line (Oh My Pi's title line before it). */
+    return jsonl_first_line_ok(r->session_path, "\"type\":\"session\"") ||
+           jsonl_first_line_ok(r->session_path, "\"type\":\"title\"");
+}
+
+const BridgeTarget g_bridge_target_pi = {
+    .tool                  = CHAT_TOOL_PI,
+    .mode                  = BRIDGE_IMPORT_INTERNAL_WRITER,
+    .available             = pi_available,
+    .supports_full_history = yes,
+    .import_history        = pi_import,
+    .validate_import       = pi_validate,
+    .handoff_launch        = "pi %s",
+};
+
+const BridgeTarget g_bridge_target_omp = {
+    .tool                  = CHAT_TOOL_OMP,
+    .mode                  = BRIDGE_IMPORT_INTERNAL_WRITER,
+    .available             = omp_available,
+    .supports_full_history = yes,
+    .import_history        = omp_import,
+    .validate_import       = pi_validate,
+    .handoff_launch        = "omp %s",
 };

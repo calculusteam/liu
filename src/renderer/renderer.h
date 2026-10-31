@@ -109,6 +109,8 @@ typedef struct {
     f32 ascent;
     f32 descent;
     f32 line_height;
+    /* Height of the face's capitals above the baseline, in atlas pixels. */
+    f32 cap_height;
     /* Decoration geometry from the face, in pixels from the top of the cell:
      * the top of the underline and of the strikeout and their thickness, and
      * the stroke width procedurally drawn lines use (the underline's). */
@@ -1078,6 +1080,27 @@ static inline f32 renderer_ui_glyph_dy(const Renderer *r) {
      * derived from a height the glyph is not actually drawn at. */
     f32 gch = roundf(r->ui_cell_w * (r->font.cell_height / r->font.cell_width));
     return (r->ui_cell_h - gch) * 0.5f;
+}
+
+/* The draw y that centres a label's CAPITALS in the box [box_y, box_y + box_h]:
+ * the band from the cap height down to the baseline. The glyph cell also holds
+ * the room the descenders use below the baseline, so a capitalised word
+ * centred by its cell sits high. The centring push_glyph adds to UI text
+ * (renderer_ui_glyph_dy) is taken off here, and the glyph's top is rounded to
+ * a whole pixel; the extra quarter pixel keeps push_glyph's floor on that
+ * pixel whatever the rounding of a fractional scale. */
+static inline f32 renderer_ui_cap_center_y(const Renderer *r, f32 box_y, f32 box_h) {
+    f32 mid = box_y + box_h * 0.5f;
+    if (!r || r->font.cell_width <= 0.0f || r->font.cell_height <= 0.0f) return mid;
+    f32 gh = r->ui_cell_w > 0.0f
+           ? roundf(r->ui_cell_w * (r->font.cell_height / r->font.cell_width))
+           : r->font.cell_height;
+    f32 s = gh / r->font.cell_height;
+    f32 cap = r->font.cap_height, base = r->font.ascent;
+    f32 band_mid = (cap > 0.0f && base > cap * 0.5f && base <= r->font.cell_height)
+                 ? (base - cap * 0.5f) * s
+                 : gh * 0.5f;
+    return floorf(mid - band_mid + 0.5f) - renderer_ui_glyph_dy(r) + 0.25f;
 }
 
 bool renderer_init(Renderer *r, f32 dpi_scale);

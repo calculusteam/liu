@@ -350,6 +350,7 @@ bool bridge_history_push(BridgeHistory *h, const BridgeEvent *e) {
     out.type         = e->type;
     out.timestamp_ms = e->timestamp_ms;
     out.tool_kind    = e->tool_kind;
+    out.tool_failed  = e->tool_failed;
 
     bool clipped = false;
 
@@ -424,6 +425,26 @@ bool bridge_history_push(BridgeHistory *h, const BridgeEvent *e) {
         case BRIDGE_EVENT_TOOL_RESULT: h->fidelity.tool_results++; break;
         default: break;
     }
+    return true;
+}
+
+bool bridge_history_set_file_change(BridgeHistory *h, usize index,
+                                    const char *patch, bool created) {
+    if (!h || index >= h->event_count) return false;
+    BridgeEvent *e = &h->events[index];
+    if (e->type != BRIDGE_EVENT_TOOL_RESULT) return false;
+    const char *copy = NULL;
+    if (patch && patch[0]) {
+        usize n = strlen(patch);
+        /* An optional extra: past the budget it is left out, so it can never
+         * set `overflowed` and cost the conversation that follows. */
+        if (n > BRIDGE_TOOL_OUTPUT_MAX || h->overflowed ||
+            h->bytes_used + n + 1 > BRIDGE_TOTAL_MAX) return false;
+        copy = dup_capped(h, patch, BRIDGE_TOOL_OUTPUT_MAX, NULL, NULL);
+        if (!copy) return false;
+    }
+    e->tool_patch = copy;
+    e->tool_file_created = created;
     return true;
 }
 

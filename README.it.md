@@ -55,6 +55,14 @@ Premi Cmd+K per aprire la palette comandi, poi digita "agent history" per sfogli
 
 Liu traccia l'agente in ogni pannello diviso, non solo in ogni scheda. La scheda prende il nome dalla chat dell'agente, mostra un logo per ogni pannello con agente e fa scorrere una barra di attività mentre viene prodotto output. Tieni il puntatore sopra e un pannello elenca ogni divisione: agente, argomento della chat e una pillola con `working 1m 12s` oppure `idle 40s`. Quando un agente completa un tratto di lavoro, sotto quella scheda scende una scheda informativa e parte il suono di completamento.
 
+### Agenti che avviano agenti
+
+Un agente in un pannello può passare il lavoro a un altro tramite Liu: `liu-agent start codex "port the tests"`. Liu ti chiede prima il permesso, poi lo esegue come una piccola scheda di lavoro unita a destra della scheda che l'ha chiesto: il suo logo su una foschia in movimento che ne mostra lo stato. Tieni il puntatore sopra per vedere le righe più recenti; fai clic per aprire la sua chat, dove puoi inviare il turno successivo, fermarlo o continuare la sua sessione in un pannello. Gli agenti avviati insieme lavorano in squadra e vengono avvisati quando due toccano lo stesso file.
+
+### Schede dei subagenti
+
+Quando un agente avvia subagenti propri (lo strumento Agent di Claude Code, Codex, OpenCode, Copilot CLI, Cursor, Qwen Code, Droid, Crush e altri), ognuno diventa una scheda di lavoro accanto alla scheda dell'agente, letta in tempo reale dai registri dell'agente stesso. Cinque subagenti, cinque schede, ogni foschia un'immagine a sé. Tieni il puntatore su una per vederne le ultime righe, fai clic per il registro completo; alla fine ciascuna indica completata o fallita e sparisce al prompt successivo.
+
 ### Prompt vocale
 
 Premi **⌘⇧M** e parla. Whisper large-v3-turbo gira su questo Mac (niente rete, niente account, niente caricato) e le parole vengono scritte nel pannello che ha il focus, quindi funziona in Claude Code, in una shell normale, in un REPL. Una forma d'onda dal vivo mostra cosa sta davvero sentendo il microfono; quando ti fermi la traccia si congela e una scansione la attraversa mentre l'audio viene trascritto. Scegli il microfono, scegli fra tutte le 100 lingue che Whisper conosce, oppure puntalo a una API vocale in cloud.
@@ -85,7 +93,7 @@ Ogni nota vive in un unico Vault. **⌘K** → Crea nota fa scrivere il Markdown
 
 ### Sistema di notifiche integrato
 
-`liu-notify` parla solo quando un agente ha davvero bisogno di te, e solo allora: un avviso vocale, una notifica desktop o un suono personalizzato. Un servizio in background indipendente che continua a funzionare anche con Liu chiuso.
+`liu-notify` parla solo quando un agente ha davvero bisogno di te, e solo allora: un avviso vocale, una notifica desktop o un suono personalizzato. Funziona dentro Liu: all'avvio aggiunge gli hook ai tuoi agenti, che vengono rimossi quando chiudi Liu, quindi gli agenti che esegui altrove non ne risentono.
 
 ### Risparmio di token
 
@@ -103,6 +111,10 @@ Un singolo **⌘K** esegue ricerca fuzzy su ogni comando, impostazione, host, sn
 
 Fino a 32 schede, ciascuna con fino a 8 pannelli in qualsiasi albero di divisione H/V. Trascina e rilascia pannelli. **⌘⇧I** trasmette l'input a tutti i pannelli attivi simultaneamente. Trascina una scheda fuori per creare una finestra, o sulla barra di un'altra finestra per unirla. Dopo la chiusura e la riapertura, Liu ripristina le tue schede.
 
+### Riprendi da dove avevi lasciato
+
+Liu salva le tue schede mentre è in esecuzione, così dopo un'uscita, un crash o un riavvio tornano le stesse finestre, schede, divisioni e cartelle, e ogni pannello mostra la schermata precedente sopra una tenue riga `Restored session`. Un agente che era in esecuzione viene riavviato dalla shell sulla propria sessione (Claude Code, Codex, OpenCode e ogni agente con un'opzione di ripresa), senza digitarvi nulla.
+
 ### Esplora file
 
 Browser locale + SFTP nella barra laterale con apertura con un clic. NSFilePromise trascina su Finder e trasferisce file in background. Cache LRU immagini da 32 MiB. Si apre nella directory di lavoro del pannello attivo. Trascina un file dal Finder su un pannello e il suo percorso viene scritto nel prompt, oppure caricato via SFTP se il pannello è una sessione SSH.
@@ -113,7 +125,7 @@ Le schede inattive per N minuti si sospendono automaticamente: CPU e RAM scendon
 
 ### Gruppi di schede
 
-Raggruppa i terminali correlati in gruppi con nome e colore direttamente nella barra delle schede, in stile Chrome. Crea con **⌘⇧G**, trascina e rilascia o clic destro. Comprimi un gruppo per nascondere le sue schede e sospenderle, liberando le loro connessioni PTY/SSH. Ricolora da una palette di 8 colori, rinomina in linea, separa o chiudi un intero gruppo in una volta. I gruppi con nome e colore sopravvivono ai riavvii: fino a 8 alla volta.
+Raggruppa i terminali correlati in gruppi con nome e colore direttamente nella barra delle schede, in stile Chrome. Creane uno dal menu del clic destro di una scheda o dalla palette comandi, e trascina le schede dentro o fuori. Comprimi un gruppo per nascondere le sue schede e sospenderle, liberando le loro connessioni PTY/SSH. Ricolora da una palette di 8 colori, rinomina in linea, separa o chiudi un intero gruppo in una volta. I gruppi con nome e colore sopravvivono ai riavvii: fino a 8 alla volta.
 
 ### Gestore siti
 

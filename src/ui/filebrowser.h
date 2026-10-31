@@ -930,9 +930,26 @@ bool        fb_open_md_path(FileBrowser *fb, const char *abs_path);
  * listing and source loading. True means accepted; poll for the loaded view. */
 bool        fb_open_path(FileBrowser *fb, const char *path, bool edit);
 
-/* Rendering. `bg` is the colour of the surface the list is drawn ON (its
- * header tint and scrollbar track derive from it); the widget paints no fill
- * of its own, the caller owns the surface. */
+/* The explorer list's geometry. The ".." entry is not a row: the header's up
+ * button does what it did, so the rows start at fb_list_first. */
+static inline i32 fb_list_first(const FileBrowser *fb) {
+    const char *n = (fb && fb->entries && fb->entry_count > 0) ? fb->entries[0].name : NULL;
+    return (n && n[0] == '.' && n[1] == '.' && n[2] == '\0') ? 1 : 0;
+}
+static inline f32 fb_list_hdr_h(f32 dpi) { return FB_PANEL_HDR_PT * dpi; }
+static inline f32 fb_list_row_h(f32 dpi) { return FB_PANEL_ROW_PT * dpi; }
+/* The entry under `rel_y`, measured from the top of the explorer's rect
+ * (its header included), or -1 for the header and for space under the rows. */
+static inline i32 fb_list_entry_at(const FileBrowser *fb, f32 rel_y, f32 dpi) {
+    f32 below = rel_y - fb_list_hdr_h(dpi) + fb->scroll_offset_px;
+    if (rel_y < fb_list_hdr_h(dpi) || below < 0.0f) return -1;
+    i32 idx = (i32)(below / fb_list_row_h(dpi)) + fb_list_first(fb);
+    return idx < fb->entry_count ? idx : -1;
+}
+
+/* Rendering. `bg` is the colour of the surface the list is drawn ON: its
+ * tints and its text's coverage derive from it. The widget paints no fill of
+ * its own, the caller owns the surface. */
 void fb_render_sidebar(FileBrowser *fb, Renderer *r, f32 x, f32 y, f32 w, f32 h,
                        const Color *bg, const Color *fg, const Color *sel,
                        const Color *dim, const Color *accent, f32 dpi,
@@ -1230,6 +1247,13 @@ void fb_editor_goto_doc_start(FileBrowser *fb);
 void fb_editor_goto_doc_end(FileBrowser *fb);
 
 /* File operations (in fileops.c) */
+
+/* The stack a thread that runs a paste gets. fileops.c's walkers recurse once
+ * per folder level, up to 65 frames of ~6.5 KiB (a folder upload), with the
+ * file copy's 36 KiB buffer and libssh2 / OpenSSL below the deepest: more
+ * than the 512 KiB a thread gets by default on macOS. */
+#define FB_PASTE_WORKER_STACK ((usize)4 << 20)
+
 bool fb_download_file(FileBrowser *fb, i32 index, const char *local_dir);
 bool fb_upload_file(FileBrowser *fb, const char *local_path);
 bool fb_delete_file(FileBrowser *fb, i32 index);

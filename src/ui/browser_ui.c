@@ -1,11 +1,13 @@
 #include "ui/browser_ui.h"
 #include "ui/ui.h"
+#include "ui/pane_zoom.h"
 #include "ui/chrome_palette.h"
 #include "ui/layout.h"
 #include "ui/icon.h"
 #include "browser/browser.h"
 #include "browser/browser_nav.h"
 #include "browser/browser_viewport.h"
+#include "browser/browser_device.h"
 #include "platform/platform.h"
 #include "core/utf8.h"
 
@@ -75,6 +77,8 @@ bool browser_should_show(const AppState *app) {
     if (!t || !t->browser) return false;
     /* Full-tab browser or terminal tab with embedded browser pane. */
     if (t->kind != TAB_BROWSER && t->browser_pane < 0) return false;
+    /* Another pane of the tab is zoomed over the browser's (ui/pane_zoom.h). */
+    if (t->kind != TAB_BROWSER && tab_zoom_hides_pane(t, t->browser_pane)) return false;
     if (browser_any_metal_overlay(app)) return false;
     return true;
 }
@@ -389,6 +393,396 @@ static void draw_browser_btn(AppState *app, Renderer *r, f32 x, f32 y, f32 s,
     icon_draw(r, kind, ix, iy, icon_s, icon_c);
 }
 
+/* The device around a preset's viewport, laid out in a page area given in
+ * pixels; the layout itself is in points (y down), the unit the web view is
+ * placed in. False for Responsive. */
+static bool device_in_page(const BrowserTab *b, f32 x_px, f32 y_px,
+                           f32 w_px, f32 h_px, f32 dpi,
+                           BrowserDeviceLayout *out) {
+    if (!b || b->viewport_idx == BVP_RESPONSIVE || !(dpi > 0.0f)) {
+        if (out) memset(out, 0, sizeof *out);
+        return false;
+    }
+    return browser_device_layout(b->viewport_idx, b->viewport_landscape,
+                                 x_px / dpi, y_px / dpi, w_px / dpi, h_px / dpi,
+                                 out);
+}
+
+bool browser_device_now(const AppState *app, BrowserDeviceLayout *out) {
+    if (out) memset(out, 0, sizeof *out);
+    if (!app || !out) return false;
+    const Tab *tab = app_active_tab((AppState *)app);
+    if (!tab || !tab->browser) return false;
+    if (tab->kind != TAB_BROWSER && tab->browser_pane < 0) return false;
+    f32 dpi = app->dpi_scale > 0.0f ? app->dpi_scale : 1.0f;
+    BrowserContentRect cr;
+    browser_content_rect(app, &cr);
+    return device_in_page(tab->browser, cr.x_px, cr.page_y_px, cr.w_px,
+                          cr.page_h_px, dpi, out);
+}
+
+static Color dev_rgb(u32 rgb) {
+    return COLOR_RGB((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff);
+}
+
+static bool dev_is_light(Color c) {
+    return 0.2126f * c.r + 0.7152f * c.g + 0.0722f * c.b > 0.5f;
+}
+
+static void dev_shape(Renderer *r, const BrowserDeviceShape *s, f32 dpi,
+                      Color fill, Color edge, f32 edge_w,
+                      f32 shadow, f32 shadow_a, f32 shadow_dy) {
+    if (!(s->w > 0.0f) || !(s->h > 0.0f)) return;
+    renderer_draw_rrect_bordered(r, s->x * dpi, s->y * dpi, s->w * dpi, s->h * dpi,
+                                 fill, edge, edge_w,
+                                 s->r[BDEV_TL] * dpi, s->r[BDEV_TR] * dpi,
+                                 s->r[BDEV_BR] * dpi, s->r[BDEV_BL] * dpi,
+                                 shadow, shadow_a, 0.0f, shadow_dy);
+}
+
+/* Cellular bars, rising left to right. */
+static void dev_signal(Renderer *r, const BrowserDeviceShape *s, f32 dpi, Color ink) {
+    f32 x = s->x * dpi, y = s->y * dpi, w = s->w * dpi, h = s->h * dpi;
+    f32 gap = w * 0.12f, bw = (w - 3.0f * gap) / 4.0f;
+    for (i32 i = 0; i < 4; i++) {
+        f32 bh = h * (0.40f + 0.20f * (f32)i);
+        f32 rr = bw * 0.30f;
+        renderer_draw_rrect(r, x + (f32)i * (bw + gap), y + h - bh, bw, bh, ink,
+                            rr, rr, rr, rr, 0.0f, 0.0f, 0.0f, 0.0f);
+    }
+}
+
+/* Wi-Fi: a dot and two arcs opening upward from it. */
+static void dev_wifi(Renderer *r, const BrowserDeviceShape *s, f32 dpi, Color ink) {
+    f32 w = s->w * dpi, h = s->h * dpi;
+    f32 cx = s->x * dpi + w * 0.5f, cy = s->y * dpi + h * 0.92f;
+    f32 t = fmaxf(1.0f, h * 0.17f);
+    f32 dot = h * 0.30f;
+    renderer_draw_rrect(r, cx - dot * 0.5f, cy - dot, dot, dot, ink,
+                        dot * 0.5f, dot * 0.5f, dot * 0.5f, dot * 0.5f,
+                        0.0f, 0.0f, 0.0f, 0.0f);
+    renderer_flush_rrects(r);
+    const f32 radii[2] = { h * 0.56f, h * 0.90f };
+    for (i32 a = 0; a < 2; a++) {
+        f32 rad = radii[a] - t * 0.5f;
+        const i32 n = 8;
+        for (i32 i = 0; i < n; i++) {
+            f32 a0 = -2.36f + 1.57f * (f32)i / (f32)n;
+            f32 a1 = -2.36f + 1.57f * (f32)(i + 1) / (f32)n;
+            renderer_draw_line(r, cx + rad * cosf(a0), cy + rad * sinf(a0),
+                               cx + rad * cosf(a1), cy + rad * sinf(a1), t, ink);
+        }
+    }
+    renderer_flush_lines(r);
+}
+
+/* Battery. Lying (iOS): a faint outline 25 x 13 of a 27.3 x 13 box, radius
+ * 4.3, its charge 2 in from it, radius 2.5, and a faint terminal 1.33 wide one
+ * point to its right. Upright (Android): a solid body with its terminal on
+ * top. */
+static void dev_battery(Renderer *r, const BrowserDeviceShape *s, f32 dpi, Color ink,
+                        bool upright) {
+    f32 x = s->x * dpi, y = s->y * dpi, w = s->w * dpi, h = s->h * dpi;
+    Color faint = ink; faint.a *= 0.35f;
+    Color tip = ink; tip.a *= 0.40f;
+    Color none = ink; none.a = 0.0f;
+    if (upright) {
+        f32 cap_h = h * 0.10f, cap_w = w * 0.45f;
+        f32 br = w * 0.22f;
+        renderer_draw_rrect(r, x + (w - cap_w) * 0.5f, y, cap_w, cap_h + br, ink,
+                            cap_w * 0.2f, cap_w * 0.2f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+        renderer_draw_rrect(r, x, y + cap_h, w, h - cap_h, ink,
+                            br, br, br, br, 0.0f, 0.0f, 0.0f, 0.0f);
+        return;
+    }
+    f32 u = h / 13.0f;
+    f32 bw = w * (25.0f / 27.3f), cap_w = w * (1.33f / 27.3f), cap_h = 4.0f * u;
+    f32 line = fmaxf(1.0f, u);
+    renderer_draw_rrect_bordered(r, x, y, bw, h, none, faint, line,
+                                 4.3f * u, 4.3f * u, 4.3f * u, 4.3f * u, 0.0f, 0.0f, 0.0f, 0.0f);
+    f32 in = 2.0f * u, cr = 2.5f * u;
+    renderer_draw_rrect(r, x + in, y + in, bw - 2.0f * in, h - 2.0f * in, ink,
+                        cr, cr, cr, cr, 0.0f, 0.0f, 0.0f, 0.0f);
+    renderer_draw_rrect(r, x + w - cap_w, y + (h - cap_h) * 0.5f, cap_w, cap_h, tip,
+                        0.0f, cap_w, cap_w, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+}
+
+/* The time in the terminal's font, for a platform without a system-font
+ * rasteriser: its capitals as tall as the box allows. */
+static void dev_clock_fallback(Renderer *r, const BrowserDeviceLayout *d, f32 dpi, Color ink) {
+    const BrowserDeviceShape *s = &d->clock;
+    const char *text = d->clock_text ? d->clock_text : "9:41";
+    i32 n = (i32)strlen(text);
+    const FontAtlas *f = &r->font;
+    if (n <= 0 || !(f->cell_width > 0.0f) || !(f->cell_height > 0.0f) || !(f->cap_height > 0.0f))
+        return;
+    f32 bw = s->w * dpi, bh = s->h * dpi;
+    f32 cw = bh * 0.72f * f->cell_width / f->cap_height;
+    if (cw * (f32)n > bw) cw = bw / (f32)n;
+    if (cw < 2.0f) return;
+    f32 ch = roundf(cw * f->cell_height / f->cell_width);
+    renderer_set_ui_scale(r, cw, ch);
+    f32 x = s->x * dpi + (d->clock_left ? 0.0f : (bw - (f32)n * cw) * 0.5f);
+    f32 y = renderer_ui_cap_center_y(r, s->y * dpi, bh);
+    draw_text_ex(r, text, x, y, ink, n, cw);
+    renderer_flush_glyphs(r);
+    renderer_reset_ui_scale(r);
+}
+
+static u64 dev_mask_gen(const BrowserMaskSpec *s) {
+    u64 h = 1469598103934665603ull;
+#define DEV_MIX(v) (h = (h ^ (u64)(v)) * 1099511628211ull)
+    DEV_MIX(s->kind);
+    DEV_MIX((u32)s->w_px);
+    DEV_MIX((u32)s->h_px);
+    DEV_MIX((u32)(s->size_px * 64.0f));
+    DEV_MIX((u32)(s->weight * 1000.0f + 1000.0f));
+    for (const char *c = s->text; c && *c; c++) DEV_MIX((u8)*c);
+#undef DEV_MIX
+    return h | 1u;
+}
+
+/* One status bar mark as the platform rasterises it (a system-font line, a
+ * system symbol, a fan or a wedge), tinted `ink`, its top-left on whole
+ * pixels. `key` names the texture it is kept in. */
+static void dev_mask_draw(Renderer *r, const void *key, const BrowserMaskSpec *spec,
+                          const BrowserMask *m, f32 x, f32 y, Color ink) {
+    renderer_draw_image_tinted(r, key, dev_mask_gen(spec), m->pixels, m->w, m->h,
+                               floorf(x + 0.5f), floorf(y + 0.5f), (f32)m->w, (f32)m->h, ink);
+}
+
+/* A glyph (system symbol, fan or wedge) filling `s`. */
+static bool dev_glyph(Renderer *r, const void *key, u8 kind, const char *name,
+                      const BrowserDeviceShape *s, f32 dpi, Color ink) {
+    BrowserMaskSpec spec = { kind, name, 0.0f, 0.30f,
+                             (i32)lroundf(s->w * dpi), (i32)lroundf(s->h * dpi) };
+    BrowserMask m;
+    if (spec.w_px < 1 || spec.h_px < 1 || !browser_native_mask(&spec, &m)) return false;
+    dev_mask_draw(r, key, &spec, &m, s->x * dpi + (s->w * dpi - (f32)m.w) * 0.5f,
+                  s->y * dpi + (s->h * dpi - (f32)m.h) * 0.5f, ink);
+    return true;
+}
+
+/* A line of text in the system font, its capitals centred on the box's
+ * middle: from the box's left edge, centred in it, or ending at its right. */
+enum { DEV_TEXT_LEFT, DEV_TEXT_CENTRE, DEV_TEXT_RIGHT };
+static bool dev_text(Renderer *r, const void *key, const char *text, f32 size_px,
+                     f32 weight, const BrowserDeviceShape *s, i32 align, f32 dpi, Color ink) {
+    BrowserMaskSpec spec = { BROWSER_MASK_TEXT, text, size_px, weight, 0, 0 };
+    BrowserMask m;
+    if (!(size_px >= 4.0f) || !browser_native_mask(&spec, &m)) return false;
+    /* The mask keeps a pixel of room on either side of the line. */
+    f32 x = align == DEV_TEXT_LEFT  ? s->x * dpi - 1.0f
+          : align == DEV_TEXT_RIGHT ? (s->x + s->w) * dpi - (f32)m.w + 1.0f
+          : (s->x + s->w * 0.5f) * dpi - (f32)m.w * 0.5f;
+    f32 y = (s->y + s->h * 0.5f) * dpi - (m.baseline - m.cap * 0.5f);
+    dev_mask_draw(r, key, &spec, &m, x, y, ink);
+    return true;
+}
+
+/* The textures the status bar's marks are kept in, one each. */
+static const char k_dev_clock, k_dev_percent, k_dev_wifi, k_dev_signal;
+
+static void dev_circle(Renderer *r, f32 cx, f32 cy, f32 d, Color c) {
+    f32 h = d * 0.5f;
+    renderer_draw_rrect(r, cx - h, cy - h, d, d, c, h, h, h, h, 0.0f, 0.0f, 0.0f, 0.0f);
+}
+
+/* What shows through the cutout: the front camera's lens and, in a notch,
+ * the earpiece over it. Placed in the cutout's upright frame (u across, v
+ * down) and turned with it; the glint stays at the top-left, where the light
+ * is. */
+static void dev_cutout_detail(Renderer *r, const BrowserDeviceLayout *d, f32 dpi) {
+    const BrowserDeviceShape *c = &d->cutout;
+    if (!(c->w > 0.0f) || !(c->h > 0.0f)) return;
+    f32 x = c->x * dpi, y = c->y * dpi, w = c->w * dpi, h = c->h * dpi;
+    bool turned = d->cut != BDEV_CUT_HOLE && h > w;
+    f32 uw = turned ? h : w, uh = turned ? w : h;
+#define DEV_AT(u, v, ox, oy) do { \
+        if (turned) { ox = x + (v) * w; oy = y + (1.0f - (u)) * h; } \
+        else        { ox = x + (u) * w; oy = y + (v) * h; } } while (0)
+    f32 lu = 0.5f, lv = 0.5f, ld = 0.56f * fminf(uw, uh);
+    Color ring = COLOR_RGB(0x0c, 0x0f, 0x18), core = COLOR_RGB(0x17, 0x20, 0x36);
+    f32 glint = 0.30f;
+    if (d->cut == BDEV_CUT_ISLAND) {
+        lu = 1.0f - uh * 0.5f / uw;
+        ld = 0.40f * uh;
+        ring = COLOR_RGB(0x07, 0x08, 0x0d);
+        core = COLOR_RGB(0x0f, 0x14, 0x22);
+        glint = 0.16f;
+    } else if (d->cut == BDEV_CUT_NOTCH) {
+        lu = 0.74f;
+        ld = 0.34f * uh;
+        f32 len = 0.30f * uw, th = fmaxf(1.0f, 0.10f * uh), sx, sy;
+        DEV_AT(0.5f, 0.20f, sx, sy);
+        f32 sw = turned ? th : len, sh = turned ? len : th, sr = th * 0.5f;
+        renderer_draw_rrect(r, sx - sw * 0.5f, sy - sh * 0.5f, sw, sh, COLOR_RGB(0x1d, 0x1e, 0x23),
+                            sr, sr, sr, sr, 0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    if (ld < 1.5f) return;
+    f32 cx, cy;
+    DEV_AT(lu, lv, cx, cy);
+#undef DEV_AT
+    dev_circle(r, cx, cy, ld, ring);
+    dev_circle(r, cx, cy, ld * 0.56f, core);
+    Color g = COLOR_RGB(255, 255, 255);
+    g.a = glint;
+    dev_circle(r, cx - ld * 0.13f, cy - ld * 0.13f, fmaxf(1.0f, ld * 0.18f), g);
+}
+
+/* The system's strips of the screen: painted in the page's colour as a
+ * phone's browser paints them, the cutout in them, the clock, icons and home
+ * indicator in whichever of black or white reads on it. The clock and the
+ * glyphs are the platform's own (the system font and symbols on macOS); where
+ * it has none they are drawn here. */
+static void draw_device_system(Renderer *r, const BrowserDeviceLayout *d, f32 dpi,
+                               bool tint_known, u32 tint) {
+    const Color black = COLOR_RGB(0, 0, 0), white = COLOR_RGB(255, 255, 255);
+    Color fill = tint_known ? dev_rgb(tint) : black;
+    Color ink = dev_is_light(fill) ? black : white;
+    Color none = black; none.a = 0.0f;
+    dev_shape(r, &d->screen, dpi, fill, none, 0.0f, 0.0f, 0.0f, 0.0f);
+    dev_shape(r, &d->cutout, dpi, black, none, 0.0f, 0.0f, 0.0f, 0.0f);
+    dev_cutout_detail(r, d, dpi);
+    dev_shape(r, &d->indicator, dpi, ink, none, 0.0f, 0.0f, 0.0f, 0.0f);
+    if (d->bar.w <= 0.0f) {
+        renderer_flush_rrects(r);
+        return;
+    }
+    bool ios = d->sys == BDEV_SYS_IOS;
+    if (d->battery.w > 0.0f) dev_battery(r, &d->battery, dpi, ink, !ios);
+    renderer_flush_rrects(r);
+    if (d->signal.w > 0.0f &&
+        !dev_glyph(r, &k_dev_signal, ios ? BROWSER_MASK_SYMBOL : BROWSER_MASK_WEDGE,
+                   ios ? "cellularbars" : NULL, &d->signal, dpi, ink)) {
+        dev_signal(r, &d->signal, dpi, ink);
+        renderer_flush_rrects(r);
+    }
+    if (d->wifi.w > 0.0f &&
+        !dev_glyph(r, &k_dev_wifi, ios ? BROWSER_MASK_SYMBOL : BROWSER_MASK_FAN,
+                   ios ? "wifi" : NULL, &d->wifi, dpi, ink))
+        dev_wifi(r, &d->wifi, dpi, ink);
+    if (d->clock.w > 0.0f &&
+        !dev_text(r, &k_dev_clock, d->clock_text, d->clock_pt * dpi, d->clock_weight,
+                  &d->clock, d->clock_left ? DEV_TEXT_LEFT : DEV_TEXT_CENTRE, dpi, ink))
+        dev_clock_fallback(r, d, dpi, ink);
+    if (d->percent.w > 0.0f)
+        (void)dev_text(r, &k_dev_percent, "100%", d->percent_pt * dpi, 0.30f,
+                       &d->percent, DEV_TEXT_RIGHT, dpi, ink);
+}
+
+/* The textures the painted body is kept in, one per band. */
+static const char k_dev_art[BROWSER_ART_PARTS];
+
+/* The device's shadow on the pane: a wide, faint one and a tight, darker one
+ * where it stands closest. No fill, so only the shadow is laid down; the body
+ * painted over it covers the rest. */
+static void dev_shadow(Renderer *r, const BrowserDeviceShape *s, f32 dpi, f32 k, f32 weight) {
+    if (!(s->w > 0.0f) || !(s->h > 0.0f)) return;
+    Color none = COLOR_RGB(0, 0, 0);
+    none.a = 0.0f;
+    f32 x = s->x * dpi + 1.0f, y = s->y * dpi + 1.0f;
+    f32 w = s->w * dpi - 2.0f, h = s->h * dpi - 2.0f;
+    f32 rr[4];
+    for (i32 i = 0; i < 4; i++) rr[i] = fmaxf(0.0f, s->r[i] * dpi - 1.0f);
+    renderer_draw_rrect(r, x, y, w, h, none, rr[BDEV_TL], rr[BDEV_TR], rr[BDEV_BR], rr[BDEV_BL],
+                        fmaxf(8.0f * dpi, 36.0f * k * dpi), 0.42f * weight,
+                        0.0f, fmaxf(3.0f * dpi, 14.0f * k * dpi));
+    renderer_draw_rrect(r, x, y, w, h, none, rr[BDEV_TL], rr[BDEV_TR], rr[BDEV_BR], rr[BDEV_BL],
+                        fmaxf(2.0f * dpi, 6.0f * k * dpi), 0.50f * weight,
+                        0.0f, fmaxf(1.0f, 2.0f * k * dpi));
+}
+
+/* The body as the platform paints it (browser_native_device_art), over its
+ * shadow, and the screen's strips on it. False where there is no painter. */
+static bool draw_device_painted(Renderer *r, const BrowserDeviceLayout *d, f32 dpi,
+                                bool tint_known, u32 tint) {
+    BrowserDeviceArt art;
+    if (!browser_native_device_art(d, dpi, &art)) return false;
+    dev_shadow(r, &d->body, dpi, d->scale, 1.0f);
+    if (d->kind == BDEV_LAPTOP || d->kind == BDEV_MONITOR)
+        dev_shadow(r, &d->base, dpi, d->scale, 0.8f);
+    renderer_flush_rrects(r);
+    for (i32 i = 0; i < art.n; i++) {
+        const BrowserArtPart *p = &art.part[i];
+        renderer_draw_image_cached(r, &k_dev_art[i], art.generation, p->pixels, p->w, p->h,
+                                   (f32)p->x, (f32)p->y, (f32)p->w, (f32)p->h);
+    }
+    draw_device_system(r, d, dpi, tint_known, tint);
+    renderer_flush_rrects(r);
+    return true;
+}
+
+/* The device's body around the screen. The page itself is the native web
+ * view over the page rect (rounded by browser_native_set_screen_shape); the
+ * strips around it are draw_device_system's. Colours are the hardware's, not
+ * the theme's, with an edge that keeps the outline readable on dark and light
+ * themes alike. Where the platform paints the body, that is drawn; the flat
+ * shapes below are the rest's. */
+static void draw_browser_device(Renderer *r, const BrowserDeviceLayout *d, f32 dpi,
+                                bool tint_known, u32 tint) {
+    if (draw_device_painted(r, d, dpi, tint_known, tint)) return;
+    const Color white = COLOR_RGB(255, 255, 255), black = COLOR_RGB(0, 0, 0);
+    Color frame = dev_rgb(d->frame_rgb);
+    Color glass = dev_rgb(d->glass_rgb);
+    Color base  = dev_rgb(d->base_rgb);
+    f32 k = d->scale;
+    f32 hair = fmaxf(1.0f, 0.6f * k * dpi);
+    f32 shadow = fmaxf(6.0f * dpi, 26.0f * k * dpi);
+    f32 drop = fmaxf(2.0f * dpi, 8.0f * k * dpi);
+    Color frame_edge = dev_is_light(frame) ? color_lerp(frame, black, 0.24f)
+                                           : color_lerp(frame, white, 0.30f);
+    Color mark = dev_is_light(glass) ? color_lerp(glass, black, 0.22f)
+                                     : color_lerp(glass, white, 0.16f);
+    Color none = black; none.a = 0.0f;
+
+    /* What it stands on, behind it: the head hangs in front of its neck. */
+    dev_shape(r, &d->neck, dpi, color_lerp(base, black, 0.14f), none, 0.0f,
+              0.0f, 0.0f, 0.0f);
+    if (d->kind == BDEV_MONITOR)
+        dev_shape(r, &d->base, dpi, base, color_lerp(base, black, 0.22f), hair,
+                  shadow * 0.6f, 0.30f, drop * 0.5f);
+
+    dev_shape(r, &d->body, dpi, frame, frame_edge, hair, shadow, 0.40f, drop);
+    dev_shape(r, &d->glass, dpi, glass, color_lerp(glass, white, 0.10f), hair,
+              0.0f, 0.0f, 0.0f);
+    renderer_flush_rrects(r);
+    draw_device_system(r, d, dpi, tint_known, tint);
+
+    for (i32 i = 0; i < d->n_keys; i++)
+        dev_shape(r, &d->keys[i], dpi, color_lerp(frame, black, 0.10f), none, 0.0f,
+                  0.0f, 0.0f, 0.0f);
+
+    dev_shape(r, &d->speaker, dpi, mark, none, 0.0f, 0.0f, 0.0f, 0.0f);
+    dev_shape(r, &d->hinge, dpi, COLOR_RGB(0x26, 0x26, 0x26), none, 0.0f, 0.0f, 0.0f, 0.0f);
+    for (i32 i = 0; i < 2; i++)
+        dev_shape(r, &d->knuckles[i], dpi, COLOR_RGB(0x8a, 0x8a, 0x86),
+                  COLOR_RGB(0x3a, 0x3a, 0x38), hair * 0.5f, 0.0f, 0.0f, 0.0f);
+    dev_shape(r, &d->flash, dpi, COLOR_RGB(0xe6, 0xe2, 0xd0), COLOR_RGB(0x2a, 0x2a, 0x28),
+              fmaxf(1.0f, 1.2f * k * dpi), 0.0f, 0.0f, 0.0f);
+    if (d->lens.w > 0.0f) {
+        dev_shape(r, &d->lens, dpi, COLOR_RGB(0x1b, 0x1f, 0x2a),
+                  color_lerp(mark, black, 0.2f), hair * 0.5f, 0.0f, 0.0f, 0.0f);
+        BrowserDeviceShape glint = d->lens;
+        glint.w = glint.h = d->lens.w * 0.28f;
+        glint.x += d->lens.w * 0.24f;
+        glint.y += d->lens.h * 0.24f;
+        for (i32 i = 0; i < 4; i++) glint.r[i] = glint.w * 0.5f;
+        Color g = white; g.a = 0.28f;
+        dev_shape(r, &glint, dpi, g, none, 0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    dev_shape(r, &d->home, dpi, glass, mark, fmaxf(1.0f, 1.6f * k * dpi),
+              0.0f, 0.0f, 0.0f);
+
+    if (d->kind == BDEV_LAPTOP && d->base.w > 0.0f) {
+        dev_shape(r, &d->base, dpi, base, color_lerp(base, black, 0.20f), hair,
+                  shadow * 0.7f, 0.35f, drop * 0.6f);
+        dev_shape(r, &d->scoop, dpi, color_lerp(base, black, 0.16f), none, 0.0f,
+                  0.0f, 0.0f, 0.0f);
+    }
+    renderer_flush_rrects(r);
+}
+
 void browser_ui_render(AppState *app, f32 ox, f32 oy, f32 w, f32 h) {
     if (!app) return;
     Tab *tab = app_active_tab(app);
@@ -675,48 +1069,39 @@ void browser_ui_render(AppState *app, f32 ox, f32 oy, f32 w, f32 h) {
         anim_register_soft_until(now + 0.1);
     }
 
-    /* Device frame. With a preset active the WebView is smaller than the pane
-     * and the surrounding area is bare theme background — an outline plus a
-     * size caption makes that read as a device rather than a layout bug. */
-    if (b->viewport_idx != BVP_RESPONSIVE) {
-        i32 vw = 0, vh = 0;
-        if (browser_viewport_size(b->viewport_idx, b->viewport_landscape,
-                                  &vw, &vh)) {
-            f32 page_y = oy + ch;
-            f32 page_h = h - ch;
-            BrowserViewportFit fit =
-                browser_viewport_fit(vw, vh, ox, page_y, w, page_h);
-            Color edge = accent; edge.a = 0.42f;
-            f32 t1 = fmaxf(1.0f, dpi);
-            renderer_draw_rect(r, fit.x - t1, fit.y - t1,
-                               fit.w + 2.0f * t1, t1, edge);
-            renderer_draw_rect(r, fit.x - t1, fit.y + fit.h,
-                               fit.w + 2.0f * t1, t1, edge);
-            renderer_draw_rect(r, fit.x - t1, fit.y, t1, fit.h, edge);
-            renderer_draw_rect(r, fit.x + fit.w, fit.y, t1, fit.h, edge);
-            renderer_flush_rects(r);
-
-            /* Caption above the frame when there is room for it. */
-            f32 cap_h = 14.0f * dpi;
-            if (fit.y - page_y >= cap_h + 2.0f * dpi) {
-                f32 ui_cw = 6.5f * dpi, ui_ch = 12.0f * dpi;
-                renderer_set_ui_scale(r, ui_cw, ui_ch);
-                const BrowserViewportPreset *p =
-                    browser_viewport_get(b->viewport_idx);
-                char cap[96];
-                if (fit.scale < 0.999f)
-                    snprintf(cap, sizeof cap, "%s  %d x %d  (%d%%)",
-                             p ? p->name : "", vw, vh,
-                             (i32)(fit.scale * 100.0f + 0.5f));
-                else
-                    snprintf(cap, sizeof cap, "%s  %d x %d",
-                             p ? p->name : "", vw, vh);
-                i32 clen = (i32)strlen(cap);
-                Color cc = fg; cc.a = 0.50f;
-                draw_text_ex(r, cap, fit.x, fit.y - cap_h, cc, clen, ui_cw);
-                renderer_flush_glyphs(r);
-                renderer_reset_ui_scale(r);
-            }
+    /* The device the preset stands for, around the page: with a preset the
+     * WebView is smaller than the pane, and the phone, tablet or laptop it
+     * sits in says why. */
+    BrowserDeviceLayout dev;
+    if (device_in_page(b, ox, oy + ch, w, h - ch, dpi, &dev)) {
+        draw_browser_device(r, &dev, dpi, b->page_tint_known, b->page_tint);
+        if (dev.cap_room) {
+            f32 ui_cw = 6.5f * dpi, ui_ch = 12.0f * dpi;
+            renderer_set_ui_scale(r, ui_cw, ui_ch);
+            const BrowserViewportPreset *p = browser_viewport_get(b->viewport_idx);
+            /* The screen's size, and the page's when the system keeps part of
+             * the screen. */
+            char size[48], pct[16] = "";
+            if (dev.vw != dev.sw || dev.vh != dev.sh)
+                snprintf(size, sizeof size, "%d x %d, page %d x %d",
+                         dev.sw, dev.sh, dev.vw, dev.vh);
+            else
+                snprintf(size, sizeof size, "%d x %d", dev.sw, dev.sh);
+            if (dev.scale < 0.999f)
+                snprintf(pct, sizeof pct, "  (%d%%)", (i32)(dev.scale * 100.0f + 0.5f));
+            char cap[128];
+            snprintf(cap, sizeof cap, "%s  %s%s", p ? p->name : "", size, pct);
+            i32 clen = (i32)strlen(cap);
+            f32 cap_w = (f32)clen * ui_cw;
+            f32 cx = (dev.ext_x + dev.ext_w * 0.5f) * dpi - cap_w * 0.5f;
+            if (cx + cap_w > ox + w) cx = ox + w - cap_w;
+            if (cx < ox) cx = ox;
+            i32 maxc = (i32)(w / ui_cw);
+            if (clen > maxc) clen = maxc;
+            Color cc = fg; cc.a = 0.50f;
+            draw_text_ex(r, cap, cx, dev.cap_y * dpi, cc, clen, ui_cw);
+            renderer_flush_glyphs(r);
+            renderer_reset_ui_scale(r);
         }
     }
 
@@ -775,27 +1160,43 @@ void browser_apply_visibility_and_frame(AppState *app, PlatformWindow *window) {
         browser_native_set_clip_pt(t->browser->native, clipped,
                                    0.0f, 0.0f, clip_w_pt, clip_h_pt);
         if (is_active) {
-            /* A device preset shrinks the view to the emulated viewport and
-             * centres it; the surrounding letterbox is painted by the Metal
-             * chrome so the pane still reads as one surface. */
-            i32 vw = 0, vh = 0;
-            if (browser_viewport_size(t->browser->viewport_idx,
-                                      t->browser->viewport_landscape,
-                                      &vw, &vh)) {
-                BrowserViewportFit fit = browser_viewport_fit(
-                    vw, vh, cr.page_x_pt, cr.page_y_pt,
-                    cr.page_w_pt, cr.page_h_pt);
-                t->browser->viewport_scale = fit.scale;
+            /* A device preset puts the page on the device's screen, below
+             * its status bar and above its home indicator, at the emulated
+             * viewport scaled to fit; the device around it is painted by the
+             * Metal chrome from the same layout. */
+            BrowserDeviceLayout dev;
+            if (device_in_page(t->browser, cr.x_px, cr.page_y_px, cr.w_px,
+                               cr.page_h_px, dpi, &dev)) {
+                t->browser->viewport_scale = dev.scale;
+                /* The layout is y down from the window's top; AppKit's
+                 * points run up from its bottom. */
+                f32 view_h_pt = (f32)app->fb_height / dpi;
+                f32 py = view_h_pt - (dev.page.y + dev.page.h);
                 browser_native_set_viewport_pt(t->browser->native,
-                    fit.x, fit.y, fit.w, fit.h, vw, vh);
+                    dev.page.x, py, dev.page.w, dev.page.h, dev.vw, dev.vh);
+                BrowserScreenShape shape;
+                for (i32 c = 0; c < 4; c++) shape.r[c] = dev.page.r[c];
+                browser_native_set_screen_shape(t->browser->native, &shape);
             } else {
                 t->browser->viewport_scale = 1.0f;
                 browser_native_set_frame_pt(t->browser->native,
                     cr.page_x_pt, cr.page_y_pt, cr.page_w_pt, cr.page_h_pt);
+                browser_native_set_screen_shape(t->browser->native, NULL);
             }
         }
     }
     (void)window;
+}
+
+void app_browser_pick_arrived(AppState *app, BrowserTab *browser,
+                              const BrowserPick *pick) {
+    if (!app || !browser || !pick) return;
+    browser->last_pick = *pick;
+    browser->has_pick = true;
+    browser->pick_mode = false;
+    /* Auto-attach the pick to the focused agent. */
+    app_browser_inject_pick(app, pick,
+        browser->site_path[0] ? browser->site_path : NULL, false);
 }
 
 bool app_browser_tick(AppState *app) {
@@ -822,13 +1223,7 @@ bool app_browser_tick(AppState *app) {
         if (t->browser->pending_pick) {
             BrowserPick pick;
             if (browser_native_take_pick(t->browser->native, &pick)) {
-                t->browser->last_pick = pick;
-                t->browser->has_pick = true;
-                t->browser->pick_mode = false;
-                /* Auto-attach the pick to the focused agent. */
-                app_browser_inject_pick(app, &pick,
-                    t->browser->site_path[0] ? t->browser->site_path : NULL,
-                    false);
+                app_browser_pick_arrived(app, t->browser, &pick);
                 dirty = true;
             } else {
                 /* cancel */
@@ -892,6 +1287,48 @@ bool app_browser_tick(AppState *app) {
 #define BVP_MENU_HDR_PT     20.0f
 #define BVP_MENU_PAD_PT      8.0f
 #define BVP_MENU_FOOT_PT    30.0f
+#define BVP_MENU_CELL_PT     7.0f   /* the menu's text cell */
+#define BVP_MENU_PADX_PT    12.0f
+#define BVP_MENU_DPR_GAP_PT  6.0f   /* between "853 x 1280" and "@1.5x" */
+#define BVP_MENU_NAME_GAP_PT 14.0f  /* the least room between a name and its size */
+
+/* A preset row's right-hand labels, "853 x 1280" and "@1.5x". */
+static void bvp_row_labels(const BrowserViewportPreset *p, bool landscape,
+                           char *res, usize res_cap, char *dprs, usize dpr_cap) {
+    i32 vw = p->w, vh = p->h;
+    if (landscape) { i32 sw = vw; vw = vh; vh = sw; }
+    snprintf(res, res_cap, "%d x %d", vw, vh);
+    f32 fr = p->dpr;
+    if (fr == (f32)(i32)fr) snprintf(dprs, dpr_cap, "@%dx", (i32)fr);
+    else                    snprintf(dprs, dpr_cap, "@%.1fx", (double)fr);
+}
+
+static i32 bvp_cols(const char *s) {
+    return (i32)utf8_display_cols((const u8 *)s, strlen(s));
+}
+
+/* The popover's width: its longest row with the least gap, never narrower
+ * than BVP_MENU_W_PT, and no wider than the pane once past that. A row that
+ * still does not fit has its name cut where the size column starts. */
+static f32 bvp_menu_w(const BrowserContentRect *cr, f32 dpi) {
+    i32 cols = 0;
+    i32 n = browser_viewport_count();
+    for (i32 i = 0; i < n; i++) {
+        const BrowserViewportPreset *p = browser_viewport_get(i);
+        if (!p || i == BVP_RESPONSIVE) continue;
+        char res[32], dprs[12];
+        bvp_row_labels(p, false, res, sizeof res, dprs, sizeof dprs);
+        i32 c = bvp_cols(p->name) + bvp_cols(res) + bvp_cols(dprs);
+        if (c > cols) cols = c;
+    }
+    f32 want = (2.0f * BVP_MENU_PADX_PT + (f32)cols * BVP_MENU_CELL_PT +
+                BVP_MENU_DPR_GAP_PT + BVP_MENU_NAME_GAP_PT) * dpi;
+    f32 least = BVP_MENU_W_PT * dpi;
+    if (want < least) want = least;
+    f32 room = cr->w_px - 8.0f * dpi;
+    if (want > room) want = room > least ? room : least;
+    return want;
+}
 
 /* Row geometry for the popover. `out_y` receives the top of row `idx` (in the
  * preset table's own indexing) and the function returns the menu's total
@@ -939,9 +1376,9 @@ static f32 bvp_menu_max_scroll(f32 dpi, f32 avail_h) {
 }
 
 /* Preset index at a point inside the popover, or -1. Mirrors bvp_menu_layout. */
-static i32 bvp_menu_hit(f32 dpi, f32 menu_x, f32 menu_y, f32 list_h,
-                        f32 scroll, f32 mx, f32 my) {
-    if (mx < menu_x || mx >= menu_x + BVP_MENU_W_PT * dpi) return -1;
+static i32 bvp_menu_hit(f32 dpi, f32 menu_x, f32 menu_y, f32 menu_w,
+                        f32 list_h, f32 scroll, f32 mx, f32 my) {
+    if (mx < menu_x || mx >= menu_x + menu_w) return -1;
     if (my < menu_y || my >= menu_y + list_h) return -1;   /* footer / outside */
     f32 row = BVP_MENU_ROW_PT * dpi;
     i32 n = browser_viewport_count();
@@ -958,7 +1395,7 @@ static i32 bvp_menu_hit(f32 dpi, f32 menu_x, f32 menu_y, f32 list_h,
  * but kept inside the pane. */
 static void bvp_menu_origin(const BrowserTab *b, const BrowserContentRect *cr,
                             f32 dpi, f32 *out_x, f32 *out_y) {
-    f32 mw = BVP_MENU_W_PT * dpi;
+    f32 mw = bvp_menu_w(cr, dpi);
     f32 x = b->layout.device_x + b->layout.btn_s - mw;
     if (x < cr->x_px + 4.0f * dpi) x = cr->x_px + 4.0f * dpi;
     if (x + mw > cr->x_px + cr->w_px - 4.0f * dpi)
@@ -989,7 +1426,7 @@ void browser_render_viewport_menu(AppState *app, Renderer *r) {
 
     f32 mx, my;
     bvp_menu_origin(b, &cr, dpi, &mx, &my);
-    f32 mw = BVP_MENU_W_PT * dpi;
+    f32 mw = bvp_menu_w(&cr, dpi);
     f32 avail = bvp_menu_avail_h(&cr, dpi);
     f32 mh = bvp_menu_panel_h(dpi, avail);
     f32 list_h = mh - BVP_MENU_FOOT_PT * dpi;
@@ -1006,7 +1443,7 @@ void browser_render_viewport_menu(AppState *app, Renderer *r) {
                                  18.0f * dpi, 0.34f, 0.0f, 2.0f * dpi);
     renderer_flush_rrects(r);
 
-    f32 ui_cw = 7.0f * dpi;
+    f32 ui_cw = BVP_MENU_CELL_PT * dpi;
     f32 ui_ch = 13.0f * dpi;
     renderer_set_ui_scale(r, ui_cw, ui_ch);
 
@@ -1016,7 +1453,7 @@ void browser_render_viewport_menu(AppState *app, Renderer *r) {
     Color faint   = fg; faint.a = 0.36f;
     f32 row = BVP_MENU_ROW_PT * dpi;
     f32 hdr = BVP_MENU_HDR_PT * dpi;
-    f32 padx = 12.0f * dpi;
+    f32 padx = BVP_MENU_PADX_PT * dpi;
 
     /* The list scrolls; the footer does not. */
     renderer_flush_rects(r);
@@ -1055,26 +1492,34 @@ void browser_render_viewport_menu(AppState *app, Renderer *r) {
 
         Color name_c = active ? accent : fg;
         f32 ty = my + ry + (row - ui_ch) * 0.5f;
-        draw_text_ex(r, p->name, mx + padx, ty, name_c,
-                     (i32)strlen(p->name), ui_cw);
+        f32 name_end = mx + mw - padx;
 
         if (i != BVP_RESPONSIVE) {
             /* Resolution is right-aligned so the column scans vertically —
              * the whole reason this menu isn't a plain list of names. */
-            i32 vw = p->w, vh = p->h;
-            if (b->viewport_landscape) { i32 sw = vw; vw = vh; vh = sw; }
-            char res[32];
-            snprintf(res, sizeof res, "%d x %d", vw, vh);
-            char dprs[12];
-            f32 fr = p->dpr;
-            if (fr == (f32)(i32)fr) snprintf(dprs, sizeof dprs, "@%dx", (i32)fr);
-            else                    snprintf(dprs, sizeof dprs, "@%.1fx", (double)fr);
+            char res[32], dprs[12];
+            bvp_row_labels(p, b->viewport_landscape, res, sizeof res,
+                           dprs, sizeof dprs);
             i32 dlen = (i32)strlen(dprs);
-            f32 dx = mx + mw - padx - (f32)dlen * ui_cw;
+            f32 dx = mx + mw - padx - (f32)bvp_cols(dprs) * ui_cw;
             draw_text_ex(r, dprs, dx, ty, faint, dlen, ui_cw);
             i32 rlen = (i32)strlen(res);
-            draw_text_ex(r, res, dx - 6.0f * dpi - (f32)rlen * ui_cw, ty,
-                         dim, rlen, ui_cw);
+            f32 rx = dx - BVP_MENU_DPR_GAP_PT * dpi - (f32)bvp_cols(res) * ui_cw;
+            draw_text_ex(r, res, rx, ty, dim, rlen, ui_cw);
+            name_end = rx - BVP_MENU_NAME_GAP_PT * dpi;
+        }
+
+        /* A name longer than its room ends in an ellipsis before the size
+         * column instead of running under it. */
+        i32 fit = (i32)floorf((name_end - (mx + padx)) / ui_cw);
+        i32 ncols = bvp_cols(p->name);
+        if (ncols <= fit) {
+            draw_text_ex(r, p->name, mx + padx, ty, name_c,
+                         (i32)strlen(p->name), ui_cw);
+        } else if (fit >= 2) {
+            draw_text_ex(r, p->name, mx + padx, ty, name_c, fit - 1, ui_cw);
+            draw_text_ex(r, "\xE2\x80\xA6", mx + padx + (f32)(fit - 1) * ui_cw,
+                         ty, name_c, 1, ui_cw);
         }
     }
 
@@ -1135,9 +1580,10 @@ bool browser_viewport_menu_click(AppState *app, f32 mx, f32 my) {
     bvp_menu_origin(b, &cr, dpi, &menu_x, &menu_y);
 
     f32 avail = bvp_menu_avail_h(&cr, dpi);
+    f32 mw = bvp_menu_w(&cr, dpi);
     f32 mh = bvp_menu_panel_h(dpi, avail);
     f32 list_h = mh - BVP_MENU_FOOT_PT * dpi;
-    i32 idx = bvp_menu_hit(dpi, menu_x, menu_y, list_h,
+    i32 idx = bvp_menu_hit(dpi, menu_x, menu_y, mw, list_h,
                            b->viewport_menu_scroll, mx, my);
     if (idx >= 0) {
         /* Re-picking the active preset rotates it — the orientation toggle
@@ -1151,7 +1597,6 @@ bool browser_viewport_menu_click(AppState *app, f32 mx, f32 my) {
     }
     /* Any click inside the popover but not on a row is swallowed; outside
      * closes it. */
-    f32 mw = BVP_MENU_W_PT * dpi;
     bool inside = (mx >= menu_x && mx < menu_x + mw &&
                    my >= menu_y && my < menu_y + mh);
     if (!inside) b->viewport_menu_open = false;
@@ -1170,7 +1615,7 @@ bool browser_viewport_menu_scroll(AppState *app, f32 mx, f32 my,
     f32 menu_x, menu_y;
     bvp_menu_origin(b, &cr, dpi, &menu_x, &menu_y);
     f32 avail = bvp_menu_avail_h(&cr, dpi);
-    f32 mw = BVP_MENU_W_PT * dpi;
+    f32 mw = bvp_menu_w(&cr, dpi);
     f32 mh = bvp_menu_panel_h(dpi, avail);
     if (mx < menu_x || mx >= menu_x + mw || my < menu_y || my >= menu_y + mh)
         return false;
@@ -1198,13 +1643,54 @@ bool browser_viewport_menu_hover(AppState *app, f32 mx, f32 my) {
     bvp_menu_origin(b, &cr, dpi, &menu_x, &menu_y);
     f32 avail = bvp_menu_avail_h(&cr, dpi);
     f32 list_h = bvp_menu_panel_h(dpi, avail) - BVP_MENU_FOOT_PT * dpi;
-    i32 idx = bvp_menu_hit(dpi, menu_x, menu_y, list_h,
+    i32 idx = bvp_menu_hit(dpi, menu_x, menu_y, bvp_menu_w(&cr, dpi), list_h,
                            b->viewport_menu_scroll, mx, my);
     if (idx != b->viewport_menu_hover) {
         b->viewport_menu_hover = idx;
         return true;
     }
     return false;
+}
+
+bool browser_viewport_menu_row_center(const AppState *app, i32 idx,
+                                      f32 *cx, f32 *cy) {
+    if (!app) return false;
+    Tab *tab = app_active_tab((AppState *)app);
+    if (!tab || !tab->browser || !tab->browser->viewport_menu_open) return false;
+    if (idx < 0 || idx >= browser_viewport_count()) return false;
+    const BrowserTab *b = tab->browser;
+    f32 dpi = app->dpi_scale > 0.0f ? app->dpi_scale : 1.0f;
+    BrowserContentRect cr;
+    browser_content_rect(app, &cr);
+    f32 menu_x, menu_y;
+    bvp_menu_origin(b, &cr, dpi, &menu_x, &menu_y);
+    f32 avail = bvp_menu_avail_h(&cr, dpi);
+    f32 list_h = bvp_menu_panel_h(dpi, avail) - BVP_MENU_FOOT_PT * dpi;
+    f32 ry = 0.0f;
+    (void)bvp_menu_layout(dpi, idx, &ry);
+    ry -= b->viewport_menu_scroll;
+    f32 row = BVP_MENU_ROW_PT * dpi;
+    if (ry < 0.0f || ry + row > list_h) return false;
+    if (cx) *cx = menu_x + bvp_menu_w(&cr, dpi) * 0.5f;
+    if (cy) *cy = menu_y + ry + row * 0.5f;
+    return true;
+}
+
+bool browser_viewport_menu_rect(const AppState *app, f32 *x, f32 *y,
+                                f32 *w, f32 *h) {
+    if (!app) return false;
+    Tab *tab = app_active_tab((AppState *)app);
+    if (!tab || !tab->browser || !tab->browser->viewport_menu_open) return false;
+    f32 dpi = app->dpi_scale > 0.0f ? app->dpi_scale : 1.0f;
+    BrowserContentRect cr;
+    browser_content_rect(app, &cr);
+    f32 mx, my;
+    bvp_menu_origin(tab->browser, &cr, dpi, &mx, &my);
+    if (x) *x = mx;
+    if (y) *y = my;
+    if (w) *w = bvp_menu_w(&cr, dpi);
+    if (h) *h = bvp_menu_panel_h(dpi, bvp_menu_avail_h(&cr, dpi));
+    return true;
 }
 
 i32 browser_chrome_hit(const AppState *app, f32 mx, f32 my) {

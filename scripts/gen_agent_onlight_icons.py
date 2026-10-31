@@ -11,8 +11,8 @@ the background's luminance.
 
 Where the vendor publishes both cuts Liu ships theirs verbatim — OpenCode does,
 and Command Code's pair comes out of the `command-code` npm package's own VSIX
-(`extension/icons/icon-{dark,light}.svg`). Kimi, Continue, Codex, Droid, xAI, Pi, Oh My Pi and
-Hermes publish one cut each, so theirs are derived here rather than by hand, so the
+(`extension/icons/icon-{dark,light}.svg`). Kimi, Continue, Droid, xAI, Pi, Oh My Pi,
+Hermes, Qoder and Mastra Code publish one cut each, so theirs are derived here rather than by hand, so the
 transformation is inspectable and can be re-run when the source logo changes.
 
     python3 scripts/gen_agent_onlight_icons.py           # write the PNGs
@@ -77,7 +77,7 @@ def invert_plated(src):
     """A PLATED greyscale logo: a filled badge in one tone, the mark cut out
     of it in the other. Five of these ship in the tree and they fail in two
     mirror-image ways — Continue's badge is white and vanishes into a light
-    panel, while Codex, Droid and xAI are black and vanish into a dark one.
+    panel, while Droid and xAI are black and vanish into a dark one.
 
     Matting the badge away is the wrong fix for both. The mark is a small
     fraction of the artwork (13% for Continue, 11% for xAI), so dissolving the
@@ -163,7 +163,7 @@ def relight_omp(src):
 #
 # The direction differs per logo because the vendor artwork does. Kimi and
 # Continue are drawn for a dark surface, so what is missing is the light one.
-# Codex, Droid and xAI are the opposite: their black badge already reads on
+# Droid and xAI are the opposite: their black badge already reads on
 # white and it is the DARK panel that swallows it, so the derived cut is the
 # dark-surface one and the vendor file keeps serving light surfaces. The
 # filename says which, and agent_icons.c wires them accordingly.
@@ -200,12 +200,13 @@ def lighten_flat(src):
 DERIVED = [
     ("kimi.png",     "kimi-on-light.png",     kimi_on_light,  "light"),
     ("continue.png", "continue-on-light.png", invert_plated,  "light"),
-    ("codex.png",    "codex-on-dark.png",     invert_plated,  "dark"),
     ("droid.png",    "droid-on-dark.png",     invert_plated,  "dark"),
     ("xai.png",      "xai-on-dark.png",       invert_plated,  "dark"),
     ("pi.png",       "pi-on-dark.png",        invert_plated,  "dark"),
     ("omp.png",      "omp-on-dark.png",       relight_omp,    "dark"),
     ("hermes.png",   "hermes-on-dark.png",    lighten_flat,   "dark"),
+    ("qoder.png",    "qoder-on-light.png",    invert_plated,  "light"),
+    ("mastracode.png", "mastracode-on-dark.png", invert_plated, "dark"),
 ]
 
 

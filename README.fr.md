@@ -55,6 +55,14 @@ Appuyez sur Cmd+K pour ouvrir la palette de commandes, puis tapez "agent history
 
 Liu suit l'agent de chaque volet divisé, pas seulement de chaque onglet. L'onglet porte le nom du chat de l'agent, affiche un logo par volet doté d'un agent et fait défiler une barre d'activité pendant que de la sortie est produite. Posez le pointeur dessus : un panneau liste chaque volet; agent, sujet du chat et une pastille indiquant `working 1m 12s` ou `idle 40s`. Quand un agent termine une phase de travail, une carte descend sous cet onglet et le son de fin est joué.
 
+### Des agents qui lancent des agents
+
+Un agent dans un volet peut confier du travail à un autre via Liu : `liu-agent start codex "port the tests"`. Liu vous le demande d'abord, puis le lance sous forme d'un petit onglet de tâche accolé à droite de l'onglet demandeur : son logo sur une brume animée qui montre son état. Posez le pointeur dessus pour voir ses dernières lignes ; cliquez pour ouvrir son chat, où vous pouvez envoyer le tour suivant, l'arrêter ou poursuivre sa session dans un volet. Les agents lancés ensemble travaillent en équipe et sont prévenus quand deux d'entre eux touchent le même fichier.
+
+### Onglets des sous-agents
+
+Quand un agent lance ses propres sous-agents (l'outil Agent de Claude Code, Codex, OpenCode, Copilot CLI, Cursor, Qwen Code, Droid, Crush et d'autres), chacun devient un onglet de tâche à côté de l'onglet de l'agent, lu en direct dans les propres enregistrements de l'agent. Cinq sous-agents, cinq onglets, chaque brume une image à part. Posez le pointeur sur l'un pour voir ses dernières lignes, cliquez pour son journal complet ; à la fin, chacun indique terminé ou échoué et disparaît à votre prochain prompt.
+
 ### Prompt vocal
 
 Appuyez sur **⌘⇧M** et parlez. Whisper large-v3-turbo tourne sur ce Mac (pas de réseau, pas de compte, rien d'envoyé) et les mots sont tapés dans le volet qui a le focus : dans Claude Code, dans un shell simple, dans un REPL. Une forme d'onde en direct montre ce que le micro entend vraiment ; quand vous arrêtez, la trace se fige et un balayage la parcourt pendant la transcription. Choisissez le micro, choisissez parmi les 100 langues que connaît Whisper, ou pointez-le vers une API vocale hébergée.
@@ -85,7 +93,7 @@ Chaque note vit dans un seul Coffre. **⌘K** → Créer une note laisse un agen
 
 ### Système de notification intégré
 
-`liu-notify` ne parle que lorsqu'un agent a vraiment besoin de vous, et seulement à ce moment-là : une alerte vocale, une bannière de bureau ou un son personnalisé. Un service en arrière-plan autonome qui continue de fonctionner même lorsque Liu est fermé.
+`liu-notify` ne parle que lorsqu'un agent a vraiment besoin de vous, et seulement à ce moment-là : une alerte vocale, une bannière de bureau ou un son personnalisé. Il tourne dans Liu : les hooks sont ajoutés à vos agents au lancement et retirés quand Liu se ferme ; les agents que vous lancez ailleurs ne sont pas concernés.
 
 ### Économie de jetons
 
@@ -103,6 +111,10 @@ Un seul **⌘K** effectue une recherche floue sur chaque commande, paramètre, h
 
 Jusqu'à 32 onglets, chacun avec jusqu'à 8 panneaux dans un arbre de division H/V. Glisser-déposer de panneaux. **⌘⇧I** diffuse l'entrée à tous les panneaux actifs simultanément. Faites glisser un onglet hors de la barre pour créer une fenêtre, ou sur la barre d'une autre fenêtre pour l'y joindre. Après un redémarrage, Liu rouvre vos onglets.
 
+### Reprenez là où vous en étiez
+
+Liu enregistre vos onglets pendant qu'il tourne : après une fermeture, un plantage ou un redémarrage, les mêmes fenêtres, onglets, divisions et dossiers reviennent, chaque volet affichant son écran précédent au-dessus d'une ligne estompée `Restored session`. Un agent qui tournait est relancé sur sa propre session par le shell (Claude Code, Codex, OpenCode et tout agent doté d'une option de reprise), sans rien y taper.
+
 ### Explorateur de fichiers
 
 Navigateur local + SFTP dans la barre latérale, ouverture en un clic. NSFilePromise glisse vers le Finder et transfère les fichiers en arrière-plan. Cache d'images LRU de 32 Mio. Il s'ouvre dans le répertoire de travail du volet actif. Déposez un fichier du Finder sur un volet : son chemin est saisi dans l'invite, ou envoyé par SFTP si le volet est une session SSH.
@@ -113,7 +125,7 @@ Les onglets inactifs pendant N minutes se suspendent automatiquement : CPU et RA
 
 ### Grouper les onglets
 
-Regroupez les terminaux liés en groupes nommés et colorés directement dans la barre d'onglets, façon Chrome. Créez avec **⌘⇧G**, glisser-déposer ou clic droit. Réduisez un groupe pour masquer ses onglets et les mettre en veille, libérant leurs connexions PTY/SSH. Recolorez depuis une palette de 8 couleurs, renommez en ligne, dissociez ou fermez tout un groupe d'un coup. Les groupes nommés et colorés survivent aux redémarrages : jusqu'à 8 à la fois.
+Regroupez les terminaux liés en groupes nommés et colorés directement dans la barre d'onglets, façon Chrome. Créez-en un depuis le menu du clic droit d'un onglet ou la palette de commandes, et faites glisser les onglets pour les y ajouter ou les en retirer. Réduisez un groupe pour masquer ses onglets et les mettre en veille, libérant leurs connexions PTY/SSH. Recolorez depuis une palette de 8 couleurs, renommez en ligne, dissociez ou fermez tout un groupe d'un coup. Les groupes nommés et colorés survivent aux redémarrages : jusqu'à 8 à la fois.
 
 ### Gestionnaire de sites
 

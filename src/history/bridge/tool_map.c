@@ -118,6 +118,10 @@ static const ToolAlias kSnake[] = {
     { "browse_page",         BRIDGE_TOOL_WEB_FETCH   },
     { "browser_action",      BRIDGE_TOOL_WEB_FETCH   },
     { "todo_write",          BRIDGE_TOOL_TASK        },
+    /* Grok CLI 1.0 */
+    { "run_terminal_command", BRIDGE_TOOL_SHELL      },
+    { "search_replace",      BRIDGE_TOOL_FILE_PATCH  },
+    { "spawn_subagent",      BRIDGE_TOOL_SUBAGENT    },
     { "update_plan",         BRIDGE_TOOL_TASK        },
     { "save_memory",         BRIDGE_TOOL_TASK        },
     { "task",                BRIDGE_TOOL_SUBAGENT    },

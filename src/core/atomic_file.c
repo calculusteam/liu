@@ -296,7 +296,7 @@ bool atomic_file_commit(AtomicFileWriter *writer) {
         in_place = (writer->keep & ATOMIC_KEEP_LINKS) && (old.st_nlink > 1 || !owner_kept);
     }
 
-    if (ok && fsync(fd) != 0) ok = false;
+    if (ok && !writer->no_sync && fsync(fd) != 0) ok = false;
 
     /* Identity of the bytes written, read off the descriptor while it is
      * still open. Taking it from the destination PATH after the rename
@@ -342,7 +342,7 @@ bool atomic_file_commit(AtomicFileWriter *writer) {
      * already-visible rename, but it still tells the caller durability was not
      * guaranteed. */
     char parent[ATOMIC_FILE_PATH_CAP];
-    int n = snprintf(parent, sizeof(parent), "%s", writer->final_path);
+    int n = writer->no_sync ? -1 : snprintf(parent, sizeof(parent), "%s", writer->final_path);
     if (n > 0 && (usize)n < sizeof(parent)) {
         char *slash = strrchr(parent, '/');
         if (slash) {
@@ -365,4 +365,53 @@ bool atomic_file_commit(AtomicFileWriter *writer) {
         writer->committed_valid = true;
     }
     return ok;
+}
+
+bool atomic_file_holds_private(const char *path, const void *data, usize len) {
+    if (!path || !path[0] || (!data && len > 0)) return false;
+    /* O_NONBLOCK: a FIFO at the path opens at once and fails the S_ISREG test
+     * instead of holding the caller until something writes to it. */
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return false;
+    struct stat st;
+    bool same = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_uid == geteuid() &&
+                (st.st_mode & 0777) == 0600 && st.st_size >= 0 && (u64)st.st_size == (u64)len;
+    const u8 *want = (const u8 *)data;
+    usize at = 0;
+    u8 chunk[16384];
+    while (same && at < len) {
+        usize ask = len - at < sizeof chunk ? len - at : sizeof chunk;
+        ssize_t n = read(fd, chunk, ask);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0 || memcmp(chunk, want + at, (usize)n) != 0) { same = false; break; }
+        at += (usize)n;
+    }
+    /* Nothing past `len`: a file that grew after the fstat is not the same. */
+    if (same) {
+        u8 extra;
+        ssize_t n;
+        do { n = read(fd, &extra, 1); } while (n < 0 && errno == EINTR);
+        if (n != 0) same = false;
+    }
+    close(fd);
+    return same;
+}
+
+FILE *atomic_file_open_regular(const char *path) {
+    if (!path || !path[0]) { errno = ENOENT; return NULL; }
+    int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return NULL;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        errno = EINVAL;
+        return NULL;
+    }
+    FILE *f = fdopen(fd, "rb");
+    if (!f) {
+        int e = errno;
+        close(fd);
+        errno = e;
+    }
+    return f;
 }

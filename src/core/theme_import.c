@@ -590,6 +590,8 @@ bool theme_save_user(const Theme *theme) {
      * emitting it anyway is what makes an export round-trip. */
     write_color_json(f, "voice_record", theme->voice_record, false);
     write_color_json(f, "voice_accent", theme->voice_accent, false);
+    /* The open tab's pill; zero RGBA means tab_active_bg (theme_tab_pill). */
+    write_color_json(f, "tab_pill_bg", theme->tab_pill_bg, false);
     f32 opacity = isfinite(theme->opacity_override)
                 ? CLAMP(theme->opacity_override, 0.0f, 1.0f) : 0.0f;
     fprintf(f, "    \"opacity\": %.4f,\n", opacity);
@@ -780,6 +782,7 @@ static bool load_user_theme_json(const char *filepath, Theme *out) {
      * theme_voice_record() / theme_voice_accent(). */
     parse_color_array(data, "voice_record", &out->voice_record);
     parse_color_array(data, "voice_accent", &out->voice_accent);
+    parse_color_array(data, "tab_pill_bg", &out->tab_pill_bg);    /* theme_tab_pill() */
 
     /* Tab title text is never allowed to vanish — fill/repair tab_active_fg and
      * tab_inactive_fg if the JSON omitted them (zero-init) or chose a colour

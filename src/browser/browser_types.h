@@ -97,6 +97,11 @@ typedef struct BrowserTab {
     i32      viewport_idx;
     bool     viewport_landscape;
     f32      viewport_scale;
+    /* The colour the page asks to be framed in (its theme-color, else the
+     * colour under it), 0xRRGGBB: a device's status bar is painted in it, as a
+     * phone's browser does. False while the page gives none. */
+    u32      page_tint;
+    bool     page_tint_known;
     /* Viewport picker popover state. */
     bool     viewport_menu_open;
     i32      viewport_menu_hover;   /* preset index, -1 = none */

@@ -55,6 +55,14 @@ Drücke Cmd+K, um die Befehlspalette zu öffnen, und tippe "agent history", um j
 
 Liu verfolgt den Agenten in jedem geteilten Bereich, nicht nur in jedem Tab. Ein Tab benennt sich nach dem Chat des Agenten, trägt ein Logo je Agenten-Bereich und lässt einen Aktivitätsbalken laufen, während Ausgabe entsteht. Ruht der Zeiger darauf, listet ein Panel jeden Bereich: Agent, Chat-Thema und eine Pille mit `working 1m 12s` oder `idle 40s`. Beendet ein Agent einen Arbeitsabschnitt, fällt unter dem Tab eine Karte ein und der Abschlusston erklingt.
 
+### Agenten starten Agenten
+
+Ein Agent in einem Bereich kann über Liu Arbeit an einen anderen abgeben: `liu-agent start codex "port the tests"`. Liu fragt dich zuerst und führt ihn dann als kleinen Job-Tab aus, rechts an den anfragenden Tab angefügt: sein Logo über einem bewegten Dunst, der seinen Zustand zeigt. Ruht der Zeiger darauf, siehst du seine neuesten Zeilen; ein Klick öffnet seinen Chat, in dem du die nächste Runde sendest, ihn anhältst oder seine Sitzung in einem Bereich fortsetzt. Gemeinsam gestartete Agenten arbeiten als Team und erfahren es, wenn zwei dieselbe Datei anfassen.
+
+### Subagenten-Tabs
+
+Startet ein Agent eigene Subagenten (das Agent-Tool von Claude Code, Codex, OpenCode, Copilot CLI, Cursor, Qwen Code, Droid, Crush und mehr), wird jeder zu einem Job-Tab neben dem Tab des Agenten, live aus dessen eigenen Aufzeichnungen gelesen. Fünf Subagenten, fünf Tabs, jeder Dunst ein eigenes Bild. Ruht der Zeiger auf einem, siehst du seine neuesten Zeilen, ein Klick zeigt das ganze Protokoll; am Ende steht jeder auf erledigt oder fehlgeschlagen und verschwindet mit deinem nächsten Prompt.
+
 ### Sprach-Prompt
 
 Drücke **⌘⇧M** und sprich. Whisper large-v3-turbo läuft auf diesem Mac (kein Netz, kein Konto, nichts wird hochgeladen) und die Wörter werden in den Bereich getippt, der den Fokus hat: in Claude Code, in einer normalen Shell, in einem REPL. Eine Live-Wellenform zeigt, was das Mikrofon tatsächlich hört; beim Stoppen friert die Spur ein und ein Scan läuft darüber, während das Audio transkribiert wird. Mikrofon wählen, aus allen 100 Sprachen wählen, die Whisper kennt, oder stattdessen eine gehostete Sprach-API ansteuern.
@@ -85,7 +93,7 @@ Jede Notiz lebt in einem Vault. **⌘K** → Notiz erstellen lässt einen lokale
 
 ### Integriertes Benachrichtigungssystem
 
-`liu-notify` meldet sich nur, wenn ein Agent Sie wirklich braucht, und nur dann: per Sprachhinweis, Desktop-Banner oder einem eigenen Sound. Ein eigenständiger Hintergrunddienst, der auch bei geschlossenem Liu weiterläuft.
+`liu-notify` meldet sich nur, wenn ein Agent Sie wirklich braucht, und nur dann: per Sprachhinweis, Desktop-Banner oder einem eigenen Sound. Der Dienst läuft in Liu: Beim Start erhalten Ihre Agenten die Hooks, beim Beenden von Liu werden sie entfernt, Agenten, die Sie anderswo ausführen, sind also nicht betroffen.
 
 ### Token-Einsparung
 
@@ -103,6 +111,10 @@ Ein einziges **⌘K** durchsucht jeden Befehl, jede Einstellung, jeden Host, jed
 
 Bis zu 32 Tabs, jeder mit bis zu 8 Panes in einem H/V-Split-Baum. Pane-Drag-and-Drop. **⌘⇧I** sendet Eingaben gleichzeitig an alle aktiven Panes. Zieh einen Tab heraus, um ein Fenster zu erzeugen, oder auf die Tab-Leiste eines anderen Fensters, um ihm beizutreten. Nach einem Neustart öffnet Liu deine Tabs wieder.
 
+### Weiter, wo du aufgehört hast
+
+Liu speichert deine Tabs, während es läuft, sodass nach Beenden, Absturz oder Neustart dieselben Fenster, Tabs, Teilungen und Ordner zurückkommen, jeder Bereich mit seinem früheren Bildschirm über einer gedämpften `Restored session`-Zeile. Ein Agent, der lief, wird von der Shell auf seiner eigenen Sitzung neu gestartet (Claude Code, Codex, OpenCode und jeder Agent mit Fortsetzen-Option), ohne dass etwas hineingetippt wird.
+
 ### Datei-Browser
 
 Sidebar lokal + SFTP-Browser mit Ein-Klick-Öffnen. NSFilePromise zieht und überträgt Dateien im Hintergrund zum Finder. 32 MiB LRU-Bild-Cache. Er öffnet sich im Arbeitsverzeichnis des fokussierten Bereichs. Ziehst du eine Finder-Datei auf einen Bereich, wird ihr Pfad in den Prompt geschrieben oder per SFTP hochgeladen, wenn der Bereich eine SSH-Sitzung ist.
@@ -113,7 +125,7 @@ Tabs, die N Minuten inaktiv sind, werden automatisch ausgesetzt: CPU und RAM sin
 
 ### Tab-Gruppen
 
-Bündeln Sie zusammengehörige Terminals in benannte, farbcodierte Gruppen direkt in der Tab-Leiste, im Chrome-Stil. Erstellen Sie mit **⌘⇧G**, Drag-and-drop oder Rechtsklick. Klappen Sie eine Gruppe zu, um ihre Tabs auszublenden und in den Schlafmodus zu versetzen, wodurch deren PTY/SSH-Verbindungen freigegeben werden. Umfärben aus einer 8-Farben-Palette, inline umbenennen, Gruppierung aufheben oder eine ganze Gruppe auf einmal schließen. Benannte, farbige Gruppen überstehen Neustarts: bis zu 8 gleichzeitig.
+Bündeln Sie zusammengehörige Terminals in benannte, farbcodierte Gruppen direkt in der Tab-Leiste, im Chrome-Stil. Erstellen Sie eine Gruppe über das Rechtsklickmenü eines Tabs oder die Befehlspalette, und ziehen Sie Tabs hinein oder heraus. Klappen Sie eine Gruppe zu, um ihre Tabs auszublenden und in den Schlafmodus zu versetzen, wodurch deren PTY/SSH-Verbindungen freigegeben werden. Umfärben aus einer 8-Farben-Palette, inline umbenennen, Gruppierung aufheben oder eine ganze Gruppe auf einmal schließen. Benannte, farbige Gruppen überstehen Neustarts: bis zu 8 gleichzeitig.
 
 ### Site-Manager
 

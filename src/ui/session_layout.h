@@ -187,6 +187,10 @@ static inline bool session_layout_format(const SessionLayout *l, char *out, usiz
 typedef enum {
     SPK_NONE = 0,
     SPK_TYPE, SPK_CWD, SPK_HOSTNAME, SPK_PORT, SPK_USERNAME, SPK_AUTH, SPK_KEYPATH,
+    /* The agent a local pane was running and the session it was writing. */
+    SPK_AGENT, SPK_AGENT_SESSION, SPK_AGENT_SESSION_PATH,
+    /* The file holding the pane's screen and history as it was. */
+    SPK_SCREEN,
 } SessionPaneField;
 
 /* "pane3_hostname" -> pane index 2, field SPK_HOSTNAME. Panes are numbered
@@ -205,6 +209,10 @@ static inline bool session_pane_key(const char *key, i32 *pane, SessionPaneField
     else if (strcmp(f, "username") == 0)    fld = SPK_USERNAME;
     else if (strcmp(f, "auth_method") == 0) fld = SPK_AUTH;
     else if (strcmp(f, "key_path") == 0)    fld = SPK_KEYPATH;
+    else if (strcmp(f, "agent") == 0)       fld = SPK_AGENT;
+    else if (strcmp(f, "agent_session") == 0)      fld = SPK_AGENT_SESSION;
+    else if (strcmp(f, "agent_session_path") == 0) fld = SPK_AGENT_SESSION_PATH;
+    else if (strcmp(f, "screen") == 0)      fld = SPK_SCREEN;
     else return false;
     if (pane) *pane = idx;
     if (field) *field = fld;

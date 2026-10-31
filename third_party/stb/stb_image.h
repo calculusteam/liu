@@ -5181,18 +5181,29 @@ static int stbi__parse_png_file(stbi__png *z, int scan, int req_comp)
             }
             if (c.length > (1u << 30)) return stbi__err("IDAT size limit", "IDAT section larger than 2^30 bytes");
             if ((int)(ioff + c.length) < (int)ioff) return 0;
-            if (ioff + c.length > idata_limit) {
-               stbi__uint32 idata_limit_old = idata_limit;
-               stbi_uc *p;
-               if (idata_limit == 0) idata_limit = c.length > 4096 ? c.length : 4096;
-               while (ioff + c.length > idata_limit)
-                  idata_limit *= 2;
-               STBI_NOTUSED(idata_limit_old);
-               p = (stbi_uc *) STBI_REALLOC_SIZED(z->idata, idata_limit_old, idata_limit); if (p == NULL) return stbi__err("outofmem", "Out of memory");
-               z->idata = p;
+            // Liu: the buffer grows as the chunk's bytes arrive, at most 1 MiB
+            // ahead of them, not to the length the chunk declares: a PNG of a
+            // few dozen bytes that declares a 1 GiB IDAT reserved 1-2 GiB
+            // before the read found nothing behind it.
+            {
+               stbi__uint32 left = c.length;
+               while (left > 0) {
+                  stbi__uint32 step = left < (1u << 20) ? left : (1u << 20);
+                  if (ioff + step > idata_limit) {
+                     stbi__uint32 idata_limit_old = idata_limit;
+                     stbi_uc *p;
+                     if (idata_limit == 0) idata_limit = step > 4096 ? step : 4096;
+                     while (ioff + step > idata_limit)
+                        idata_limit *= 2;
+                     STBI_NOTUSED(idata_limit_old);
+                     p = (stbi_uc *) STBI_REALLOC_SIZED(z->idata, idata_limit_old, idata_limit); if (p == NULL) return stbi__err("outofmem", "Out of memory");
+                     z->idata = p;
+                  }
+                  if (!stbi__getn(s, z->idata+ioff,step)) return stbi__err("outofdata","Corrupt PNG");
+                  ioff += step;
+                  left -= step;
+               }
             }
-            if (!stbi__getn(s, z->idata+ioff,c.length)) return stbi__err("outofdata","Corrupt PNG");
-            ioff += c.length;
             break;
          }
 

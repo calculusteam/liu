@@ -9,6 +9,7 @@
 #define BROWSER_H
 
 #include "browser/browser_types.h"
+#include "browser/browser_device.h"
 #include "browser/browser_nav.h"
 #include "platform/platform.h"
 
@@ -75,6 +76,87 @@ void browser_native_set_clip_pt(BrowserNative *n, bool clipped,
 void browser_native_set_viewport_pt(BrowserNative *n,
                                     f32 x_pt, f32 y_pt, f32 w_pt, f32 h_pt,
                                     i32 vw, i32 vh);
+
+/* The page's corners where it meets a device's rounded display
+ * (browser/browser_device.h): a radius per corner in points, top-left,
+ * top-right, bottom-right, bottom-left. NULL, or all zero, is a plain
+ * rectangle. A layer has one radius, so the rounded corners share the largest
+ * asked for; corners the clip rect cuts away (set_clip_pt) are left square. */
+typedef struct {
+    f32 r[4];
+} BrowserScreenShape;
+void browser_native_set_screen_shape(BrowserNative *n, const BrowserScreenShape *shape);
+
+/* A device's status bar marks drawn the way its system draws them: rasterised
+ * by the platform as a white premultiplied coverage mask, tinted at draw time.
+ *   TEXT    `text` in the system UI font at `size_px`, `weight` (-1..1, the
+ *           system's font weights: 0 regular, 0.23 medium, 0.3 semibold); the
+ *           mask is the line's typographic box and `baseline` / `cap` say
+ *           where its baseline and capitals are.
+ *   SYMBOL  the system symbol named `text` at `weight`, its drawn extent
+ *           fitted to w_px x h_px and centred.
+ *   FAN     a filled quarter fan opening upward from a rounded tip at the
+ *           bottom centre, w_px x h_px.
+ *   WEDGE   a filled right triangle, its right angle at the bottom right,
+ *           corners rounded, w_px x h_px.
+ * False where the platform has no rasteriser (the caller draws its own). The
+ * pixels are the platform's and stay valid until a later call misses its
+ * cache. */
+typedef enum {
+    BROWSER_MASK_TEXT = 0,
+    BROWSER_MASK_SYMBOL,
+    BROWSER_MASK_FAN,
+    BROWSER_MASK_WEDGE,
+} BrowserMaskKind;
+typedef struct {
+    u8          kind;      /* BrowserMaskKind */
+    const char *text;      /* TEXT: the string; SYMBOL: the symbol's name */
+    f32         size_px;   /* TEXT */
+    f32         weight;    /* TEXT, SYMBOL */
+    i32         w_px, h_px;/* SYMBOL, FAN, WEDGE */
+} BrowserMaskSpec;
+typedef struct {
+    const u8 *pixels;      /* w * h RGBA, premultiplied white */
+    i32       w, h;
+    f32       baseline;    /* TEXT: from the top, pixels */
+    f32       cap;         /* TEXT: cap height, pixels */
+} BrowserMask;
+bool browser_native_mask(const BrowserMaskSpec *spec, BrowserMask *out);
+
+/* The device's body painted as hardware (browser_device_art.c): the frame
+ * with its light and edges, the front glass, side buttons, the camera,
+ * earpiece and home button in the bezel, a laptop's deck, a monitor's stand.
+ * Only the ring around the screen is painted, as up to four bands; the
+ * screen's middle is the Metal painter's and the web view's. Each part is
+ * w x h premultiplied RGBA in sRGB, drawn 1:1 at (x, y) in the layout's
+ * pixels (the layout's points times `dpi`). `generation` changes whenever any
+ * part's pixels do. False where the platform has no painter, or for a device
+ * too large to paint (the caller draws its own); the pixels stay valid until
+ * a later call misses its cache. */
+#define BROWSER_ART_PARTS 4
+typedef struct {
+    const u8 *pixels;
+    i32       x, y, w, h;
+} BrowserArtPart;
+typedef struct {
+    u64            generation;
+    i32            n;
+    BrowserArtPart part[BROWSER_ART_PARTS];
+} BrowserDeviceArt;
+bool browser_native_device_art(const BrowserDeviceLayout *d, f32 dpi, BrowserDeviceArt *out);
+
+/* What the native view holds now, read back for the driver: the corner radius
+ * the page is masked with and which corners carry it (bit 0 top-left, 1
+ * top-right, 2 bottom-right, 3 bottom-left), and the page's rect in the window
+ * (points, AppKit's bottom-left origin; `have_page` false before the first
+ * placement). */
+typedef struct {
+    f32  radius;
+    u32  corners;
+    bool have_page;
+    f32  page_x, page_y, page_w, page_h;
+} BrowserScreenProbe;
+bool browser_native_screen_probe(BrowserNative *n, BrowserScreenProbe *out);
 
 /* Navigation */
 bool browser_native_navigate(BrowserNative *n, const char *url);

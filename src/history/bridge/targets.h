@@ -10,7 +10,7 @@
 
 #include "history/bridge/bridge.h"
 
-extern const BridgeTarget g_bridge_target_codex;        /* thread/inject_items */
+extern const BridgeTarget g_bridge_target_codex;        /* codex session import */
 extern const BridgeTarget g_bridge_target_opencode;     /* opencode import     */
 
 /* Version-gated writers into other agents' session stores. */
@@ -33,5 +33,7 @@ extern const BridgeTarget g_bridge_target_pi;
 extern const BridgeTarget g_bridge_target_omp;
 extern const BridgeTarget g_bridge_target_openclaw;
 extern const BridgeTarget g_bridge_target_hermes;
+extern const BridgeTarget g_bridge_target_mastracode;
+extern const BridgeTarget g_bridge_target_maki;
 
 #endif /* HISTORY_BRIDGE_TARGETS_H */

@@ -13,6 +13,11 @@
  * every branch, or the call fails. */
 bool notify_socket_path(char *out, usize out_sz);
 
+/* The owner-only folder the socket lives in ($LIU_NOTIFY_RUN_DIR, the
+ * per-user temporary folder, or ~/.liu/run), verified 0700 and this user's.
+ * Other per-user sockets of Liu's (agent control) live there too. */
+bool notify_run_dir(char *out, usize out_sz);
+
 /* Fill `out` with the PID/lock file path (socket_path + ".pid"). */
 bool notify_pid_path(char *out, usize out_sz);
 

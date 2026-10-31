@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 
 root = Path(__file__).resolve().parents[1] / "src/browser"
-for name in ("pick_element", "browser_chrome", "browser_gesture"):
+for name in ("pick_element", "browser_chrome", "browser_gesture", "browser_tint"):
     symbol = "BROWSER_" + name.upper() + "_JS" if name == "pick_element" else name.upper() + "_JS"
     guard = symbol + "_H"
     lines = (root / (name + ".js")).read_text().splitlines(keepends=True)

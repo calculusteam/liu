@@ -307,20 +307,20 @@ static const char *path_basename(const char *path) {
  * Fields are addressed by offset rather than pointer because the table is file
  * scope and the TranslateConfig it applies to only exists per call.
  * ------------------------------------------------------------------------- */
-typedef struct { const char *label; usize flag_off; } TranslateAgentRow;
+typedef struct { const char *label; usize flag_off; ChatTool tool; } TranslateAgentRow;
 
 static const TranslateAgentRow g_translate_agents[] = {
-    { "Claude:",      offsetof(TranslateConfig, active_in_claude)      },
-    { "Codex:",       offsetof(TranslateConfig, active_in_codex)       },
-    { "OpenCode:",    offsetof(TranslateConfig, active_in_opencode)    },
-    { "Grok:",        offsetof(TranslateConfig, active_in_grok)        },
-    { "Antigravity:", offsetof(TranslateConfig, active_in_antigravity) },
-    { "Cline:",       offsetof(TranslateConfig, active_in_cline)       },
-    { "Command Code:",offsetof(TranslateConfig, active_in_commandcode) },
-    { "Pi:",          offsetof(TranslateConfig, active_in_pi)          },
-    { "Oh My Pi:",    offsetof(TranslateConfig, active_in_omp)         },
-    { "OpenClaw:",    offsetof(TranslateConfig, active_in_openclaw)    },
-    { "Hermes:",      offsetof(TranslateConfig, active_in_hermes)      },
+    { "Claude:",      offsetof(TranslateConfig, active_in_claude),      CHAT_TOOL_CLAUDE      },
+    { "Codex:",       offsetof(TranslateConfig, active_in_codex),       CHAT_TOOL_CODEX       },
+    { "OpenCode:",    offsetof(TranslateConfig, active_in_opencode),    CHAT_TOOL_OPENCODE    },
+    { "Grok:",        offsetof(TranslateConfig, active_in_grok),        CHAT_TOOL_XAI         },
+    { "Antigravity:", offsetof(TranslateConfig, active_in_antigravity), CHAT_TOOL_ANTIGRAVITY },
+    { "Cline:",       offsetof(TranslateConfig, active_in_cline),       CHAT_TOOL_CLINE       },
+    { "Command Code:",offsetof(TranslateConfig, active_in_commandcode), CHAT_TOOL_COMMANDCODE },
+    { "Pi:",          offsetof(TranslateConfig, active_in_pi),          CHAT_TOOL_PI          },
+    { "Oh My Pi:",    offsetof(TranslateConfig, active_in_omp),         CHAT_TOOL_OMP         },
+    { "OpenClaw:",    offsetof(TranslateConfig, active_in_openclaw),    CHAT_TOOL_OPENCLAW    },
+    { "Hermes:",      offsetof(TranslateConfig, active_in_hermes),      CHAT_TOOL_HERMES      },
 };
 #define TRANSLATE_AGENT_ROW_COUNT \
     ((i32)(sizeof g_translate_agents / sizeof g_translate_agents[0]))
@@ -1141,6 +1141,37 @@ static inline f32 s_edit_field(Renderer *r, struct AppState *app,
                               mask, show_caret);
 }
 
+/* An agent's logo before its name in a list: on the tile every other agent
+ * list draws it on (agent_icon_backdrop), centred on a text line that starts
+ * at `text_y` and is `ch` high, a little taller than the text. Its letter
+ * where no logo ships. Returns where the name starts.
+ *
+ * The tile, the logo and the letter all carry the panel's alpha. The logo goes
+ * through the tinted image path, whose tint.a scales the premultiplied texel,
+ * keyed on its pixels: agent_icon_rgba_scaled_on's buffers live as long as
+ * the process. */
+static f32 settings_agent_icon(Renderer *r, ChatTool tool, const Theme *theme,
+                               f32 x, f32 text_y, f32 ch, f32 dpi) {
+    f32 sz = roundf(ch * 1.25f);
+    f32 y = roundf(text_y + (ch - sz) * 0.5f);
+    Color tile = agent_icon_backdrop(tool, theme);
+    s_rrect_simple(r, x, y, sz, sz, tile, 4.0f * dpi);
+    renderer_flush_rrects(r);
+    f32 pad = roundf(sz * 0.16f);
+    f32 isz = sz - 2.0f * pad;
+    i32 iw = 0, ih = 0;
+    const u8 *px = agent_icon_rgba_scaled_on(tool, (i32)(isz + 0.5f), tile, &iw, &ih);
+    if (px) {
+        renderer_draw_image_tinted(r, px, 0, px, iw, ih, x + pad, y + pad, isz, isz,
+                                   s_tint((Color){ 1, 1, 1, 1 }));
+    } else {
+        AgentTint tint = agent_icon_tint(tool);
+        agent_icon_draw_letter(r, tool, x + pad, y + pad, isz, isz,
+                               s_tint((Color){ tint.r, tint.g, tint.b, 1.0f }));
+    }
+    return x + sz + roundf(8.0f * dpi);
+}
+
 /* Every draw below this line must carry the panel's alpha; one that does not
  * shows only during a close. The wrappers above are the whole vocabulary;
  * these macros make the alternatives fail to compile rather than fail on
@@ -1153,6 +1184,8 @@ static inline f32 s_edit_field(Renderer *r, struct AppState *app,
 #define icon_draw(...)                   use_s_icon_instead(__VA_ARGS__)
 #define ui_draw_edit_field(...)          use_s_edit_field_instead(__VA_ARGS__)
 #define renderer_draw_image_cached(...)  use_renderer_draw_image_tinted_instead(__VA_ARGS__)
+#define renderer_draw_image(...)         use_renderer_draw_image_tinted_instead(__VA_ARGS__)
+#define agent_icon_draw_letter(...)      use_settings_agent_icon_instead(__VA_ARGS__)
 
 /* One chip width for a whole section.
  *
@@ -1810,6 +1843,13 @@ static const KeysRow g_keys_rows[] = {
     { ACT_NONE, "Panes & session", NULL },
     { ACT_SPLIT_HORIZONTAL, NULL, NULL },
     { ACT_SPLIT_VERTICAL,   NULL, NULL },
+    { ACT_FOCUS_PANE_LEFT,  NULL, NULL },
+    { ACT_FOCUS_PANE_RIGHT, NULL, NULL },
+    { ACT_FOCUS_PANE_UP,    NULL, NULL },
+    { ACT_FOCUS_PANE_DOWN,  NULL, NULL },
+    { ACT_NEXT_PANE,        NULL, NULL },
+    { ACT_PREV_PANE,        NULL, NULL },
+    { ACT_TOGGLE_PANE_ZOOM, NULL, NULL },
     { ACT_BROADCAST_TOGGLE, NULL, NULL },
     { ACT_SAVE_FILE,        NULL, NULL },
 
@@ -1844,7 +1884,12 @@ static const KeysRow g_keys_rows[] = {
      * pressed: "Cmd" is wrong wherever MOD_SUPER is the Super key. */
     { ACT_NONE, "Snap window half / maximize",  "Ctrl+" UI_MOD_PRIMARY "+Arrows" },
     { ACT_NONE, "Snap window quadrant",         "Ctrl+" UI_MOD_PRIMARY "+Shift+Arrows" },
+#ifdef PLATFORM_MACOS
+    /* Cmd+Alt+Arrows is the keyboard's way between panes (ACT_FOCUS_PANE_*). */
+    { ACT_NONE, "Resize split divider",         "Ctrl+Alt+" UI_MOD_PRIMARY "+Arrows" },
+#else
     { ACT_NONE, "Resize split divider",         UI_MOD_PRIMARY "+Alt+Arrows" },
+#endif
     { ACT_NONE, "Command history",              "Alt+Up" },
     { ACT_NONE, "Close item under cursor",      UI_MOD_PRIMARY "+R" },
 #ifdef PLATFORM_LINUX
@@ -4061,6 +4106,26 @@ void settings_render(SettingsPanel *sp, struct AppState *app, Renderer *r,
                              value_fg, label_fg, cw, ch, dpi);
         y += row_h;
 
+        /* When Liu reopens its tabs (after a quit or a crash): an agent that
+         * was running in a pane is started on its session again, and each
+         * pane shows its earlier screen. Same row order as the click handler
+         * below. */
+        draw_label_limited(r, "Resume agents:", content_x, y, label_fg, (i32)(fmaxf(0, value_off - 8 * dpi) / cw));
+        settings_draw_switch(r, value_x, y - 2.0f * dpi,
+                             sp->config->resume_agents, control_active,
+                             control_bg, control_border,
+                             value_fg, label_fg, cw, ch, dpi);
+        y += row_h;
+        draw_label_limited(r, "Restore screens:", content_x, y, label_fg, (i32)(fmaxf(0, value_off - 8 * dpi) / cw));
+        settings_draw_switch(r, value_x, y - 2.0f * dpi,
+                             sp->config->restore_screen, control_active,
+                             control_bg, control_border,
+                             value_fg, label_fg, cw, ch, dpi);
+        y += row_h;
+        draw_label(r, "When Liu reopens its tabs after a quit or a crash.",
+                   value_x, y, dim_fg);
+        y += row_h;
+
         /* Prompt Recall — the "what did I ask this agent?" chip in an agent
          * pane's top-right corner. Off / a chip that opens on click / the panel
          * open from the start. Kept in step with the click handler below, which
@@ -4082,6 +4147,96 @@ void settings_render(SettingsPanel *sp, struct AppState *app, Renderer *r,
         }
         y += row_h;
         draw_label(r, "Shows the last prompt you sent to an agent pane.",
+                   value_x, y, dim_fg);
+        y += row_h;
+
+        /* The subagents an agent starts itself, shown as job tabs beside its
+         * tab (agentctl/agentctl_subagents.h). */
+        draw_label_limited(r, "Subagent tabs:", content_x, y, label_fg, (i32)(fmaxf(0, value_off - 8 * dpi) / cw));
+        settings_draw_switch(r, value_x, y - 2.0f * dpi,
+                             sp->config->agent_subagent_tabs, control_active,
+                             control_bg, control_border,
+                             value_fg, label_fg, cw, ch, dpi);
+        y += row_h;
+
+        /* How a tab's job tabs start: open, or folded into the count chip in
+         * front of them (ui/agentctl_card.h, AgcFoldPolicy). */
+        {
+            const char *fold_names[] = {"Auto", "Always", "Never"};
+            f32 fold_seg_w = 8.0f * cw;
+            if (value_room > 0.0f && fold_seg_w * 3.0f > value_room) fold_seg_w = value_room / 3.0f;
+            if (fold_seg_w < 1.0f) fold_seg_w = 1.0f;
+            draw_label_limited(r, "Fold job tabs:", content_x, y, label_fg, (i32)(fmaxf(0, value_off - 8 * dpi) / cw));
+            settings_draw_segmented(r, value_x, y - 4.0f * dpi,
+                                    fold_names, 3, (i32)sp->config->agent_jobs_fold,
+                                    fold_seg_w, control_h,
+                                    control_active, control_bg,
+                                    control_border, value_fg,
+                                    value_fg, cw, ch, dpi);
+        }
+        y += row_h;
+        draw_label(r, "Auto folds them into their count once they do not all fit.",
+                   value_x, y, dim_fg);
+        y += row_h;
+
+        /* Agents that start agents (agentctl): the switch, how many may work
+         * at once, and the most a request may ask for. Same row order as the
+         * click handler below. */
+        draw_label_limited(r, "Agents start agents:", content_x, y, label_fg, (i32)(fmaxf(0, value_off - 8 * dpi) / cw));
+        settings_draw_switch(r, value_x, y - 2.0f * dpi,
+                             sp->config->agent_orchestration, control_active,
+                             control_bg, control_border,
+                             value_fg, label_fg, cw, ch, dpi);
+        y += row_h;
+        {
+            static const char *ao_names[] = {"1", "2", "3", "5", "8"};
+            static const i32 ao_vals[] = {1, 2, 3, 5, 8};
+            i32 sel = 0;
+            for (i32 i = 0; i < 5; i++) if (sp->config->agent_orchestration_max >= ao_vals[i]) sel = i;
+            f32 seg_w = 5.0f * cw;
+            if (value_room > 0.0f && seg_w * 5.0f > value_room) seg_w = value_room / 5.0f;
+            if (seg_w < 1.0f) seg_w = 1.0f;
+            draw_label_limited(r, "Working at once:", content_x, y, label_fg, (i32)(fmaxf(0, value_off - 8 * dpi) / cw));
+            settings_draw_segmented(r, value_x, y - 4.0f * dpi, ao_names, 5, sel, seg_w, control_h,
+                                    control_active, control_bg, control_border, value_fg,
+                                    value_fg, cw, ch, dpi);
+        }
+        y += row_h;
+        {
+            static const char *ap_names[] = {"Read", "Write", "Full"};
+            i32 sel = !strcmp(sp->config->agent_orchestration_permission, "read") ? 0
+                    : !strcmp(sp->config->agent_orchestration_permission, "full") ? 2 : 1;
+            f32 seg_w = 8.0f * cw;
+            if (value_room > 0.0f && seg_w * 3.0f > value_room) seg_w = value_room / 3.0f;
+            if (seg_w < 1.0f) seg_w = 1.0f;
+            draw_label_limited(r, "They may at most:", content_x, y, label_fg, (i32)(fmaxf(0, value_off - 8 * dpi) / cw));
+            settings_draw_segmented(r, value_x, y - 4.0f * dpi, ap_names, 3, sel, seg_w, control_h,
+                                    control_active, control_bg, control_border, value_fg,
+                                    value_fg, cw, ch, dpi);
+        }
+        y += row_h;
+        /* what a delegated agent may do without the user, and what happens
+         * to one at work when Liu quits */
+        draw_label_limited(r, "Ask before tools:", content_x, y, label_fg, (i32)(fmaxf(0, value_off - 8 * dpi) / cw));
+        settings_draw_switch(r, value_x, y - 2.0f * dpi, sp->config->agent_orchestration_ask_tools, control_active,
+                             control_bg, control_border, value_fg, label_fg, cw, ch, dpi);
+        y += row_h;
+        draw_label_limited(r, "Guard job files:", content_x, y, label_fg, (i32)(fmaxf(0, value_off - 8 * dpi) / cw));
+        settings_draw_switch(r, value_x, y - 2.0f * dpi, sp->config->agent_orchestration_guard, control_active,
+                             control_bg, control_border, value_fg, label_fg, cw, ch, dpi);
+        y += row_h;
+        {
+            static const char *aq_names[] = {"Finish", "Stop"};
+            f32 seg_w = 8.0f * cw;
+            if (value_room > 0.0f && seg_w * 2.0f > value_room) seg_w = value_room / 2.0f;
+            if (seg_w < 1.0f) seg_w = 1.0f;
+            draw_label_limited(r, "When Liu quits:", content_x, y, label_fg, (i32)(fmaxf(0, value_off - 8 * dpi) / cw));
+            settings_draw_segmented(r, value_x, y - 4.0f * dpi, aq_names, 2, sp->config->agent_orchestration_keep ? 0 : 1,
+                                    seg_w, control_h, control_active, control_bg, control_border, value_fg,
+                                    value_fg, cw, ch, dpi);
+        }
+        y += row_h;
+        draw_label(r, "An agent asks with liu-agent; you are asked before each one starts.",
                    value_x, y, dim_fg);
         y += row_h;
 
@@ -4717,7 +4872,8 @@ void settings_render(SettingsPanel *sp, struct AppState *app, Renderer *r,
         for (i32 i = 0; i < TRANSLATE_AGENT_ROW_COUNT; i++) {
             bool *flag = translate_agent_flag(tc, i);
             if (!flag) continue;
-            draw_label(r, g_translate_agents[i].label, content_x, y, label_fg);
+            f32 name_x = settings_agent_icon(r, g_translate_agents[i].tool, theme, content_x, y, ch, dpi);
+            draw_label(r, g_translate_agents[i].label, name_x, y, label_fg);
             settings_draw_switch(r, value_x, y - 2.0f * dpi,
                                  *flag, control_active,
                                  control_bg, control_border,
@@ -5609,9 +5765,10 @@ void settings_render(SettingsPanel *sp, struct AppState *app, Renderer *r,
 
             f32 hook_w = (f32)strlen(lbl) * cw + 24.0f * dpi;
             f32 hook_x = content_x + content_w - hook_w;
-            /* Agent display name on the left, action button on the right. */
-            draw_label(r, a->display, content_x, y + (btn_h - ch) * 0.5f,
-                       value_fg);
+            /* The agent's logo and name on the left, its button on the right. */
+            f32 name_x = settings_agent_icon(r, chat_tool_from_agent_id(a->id), theme, content_x,
+                                             y + (btn_h - ch) * 0.5f, ch, dpi);
+            draw_label(r, a->display, name_x, y + (btn_h - ch) * 0.5f, value_fg);
             Color row_bg = has_hook ? btn_bg : cp.surface_neutral;
             Color row_border = btn_border;
             if (!has_hook) row_border.a *= 0.5f;
@@ -7387,6 +7544,21 @@ static bool settings_handle_click_impl(SettingsPanel *sp, f32 x, f32 y, f32 sw, 
         }
         ry += row_h;
 
+        /* Resume agents / Restore screens, then their line of explanation. */
+        if (y >= ry && y < ry + row_h &&
+            x >= value_x && x < value_x + settings_switch_w(cw, dpi)) {
+            sp->config->resume_agents = !sp->config->resume_agents;
+            return true;
+        }
+        ry += row_h;
+        if (y >= ry && y < ry + row_h &&
+            x >= value_x && x < value_x + settings_switch_w(cw, dpi)) {
+            sp->config->restore_screen = !sp->config->restore_screen;
+            return true;
+        }
+        ry += row_h;
+        ry += row_h;
+
         /* Prompt recall — mirrors the 3-up segmented control drawn above */
         if (y >= ry && y < ry + row_h) {
             f32 seg_w = 8.0f * cw;
@@ -7405,6 +7577,90 @@ static bool settings_handle_click_impl(SettingsPanel *sp, f32 x, f32 y, f32 sw, 
         ry += row_h;
         /* Caption row (no-op) */
         ry += row_h;
+
+        /* Subagent tabs */
+        if (y >= ry && y < ry + row_h &&
+            x >= value_x && x < value_x + settings_switch_w(cw, dpi)) {
+            sp->config->agent_subagent_tabs = !sp->config->agent_subagent_tabs;
+            return true;
+        }
+        ry += row_h;
+
+        /* Fold job tabs — the 3-up segmented control drawn above */
+        if (y >= ry && y < ry + row_h) {
+            f32 seg_w = 8.0f * cw;
+            if (value_room > 0.0f && seg_w * 3.0f > value_room) seg_w = value_room / 3.0f;
+            if (seg_w < 1.0f) seg_w = 1.0f;
+            if (x >= value_x && x < value_x + seg_w * 3.0f) {
+                sp->config->agent_jobs_fold = (u8)((x - value_x) / seg_w);
+                return true;
+            }
+            return false;   /* empty space beside the control is inert */
+        }
+        ry += row_h;
+        /* Caption row (no-op) */
+        ry += row_h;
+
+        /* Agents start agents: switch, working at once, at most */
+        if (y >= ry && y < ry + row_h &&
+            x >= value_x && x < value_x + settings_switch_w(cw, dpi)) {
+            sp->config->agent_orchestration = !sp->config->agent_orchestration;
+            return true;
+        }
+        ry += row_h;
+        if (y >= ry && y < ry + row_h) {
+            static const i32 ao_vals[] = {1, 2, 3, 5, 8};
+            f32 seg_w = 5.0f * cw;
+            if (value_room > 0.0f && seg_w * 5.0f > value_room) seg_w = value_room / 5.0f;
+            if (seg_w < 1.0f) seg_w = 1.0f;
+            if (x >= value_x && x < value_x + seg_w * 5.0f) {
+                i32 i = (i32)((x - value_x) / seg_w);
+                if (i < 0) i = 0;
+                if (i > 4) i = 4;
+                sp->config->agent_orchestration_max = ao_vals[i];
+                return true;
+            }
+            return false;
+        }
+        ry += row_h;
+        if (y >= ry && y < ry + row_h) {
+            static const char *ap_vals[] = {"read", "write", "full"};
+            f32 seg_w = 8.0f * cw;
+            if (value_room > 0.0f && seg_w * 3.0f > value_room) seg_w = value_room / 3.0f;
+            if (seg_w < 1.0f) seg_w = 1.0f;
+            if (x >= value_x && x < value_x + seg_w * 3.0f) {
+                i32 i = (i32)((x - value_x) / seg_w);
+                if (i < 0) i = 0;
+                if (i > 2) i = 2;
+                snprintf(sp->config->agent_orchestration_permission,
+                         sizeof sp->config->agent_orchestration_permission, "%s", ap_vals[i]);
+                return true;
+            }
+            return false;
+        }
+        ry += row_h;
+        if (y >= ry && y < ry + row_h && x >= value_x && x < value_x + settings_switch_w(cw, dpi)) {
+            sp->config->agent_orchestration_ask_tools = !sp->config->agent_orchestration_ask_tools;
+            return true;
+        }
+        ry += row_h;
+        if (y >= ry && y < ry + row_h && x >= value_x && x < value_x + settings_switch_w(cw, dpi)) {
+            sp->config->agent_orchestration_guard = !sp->config->agent_orchestration_guard;
+            return true;
+        }
+        ry += row_h;
+        if (y >= ry && y < ry + row_h) {
+            f32 seg_w = 8.0f * cw;
+            if (value_room > 0.0f && seg_w * 2.0f > value_room) seg_w = value_room / 2.0f;
+            if (seg_w < 1.0f) seg_w = 1.0f;
+            if (x >= value_x && x < value_x + seg_w * 2.0f) {
+                sp->config->agent_orchestration_keep = (x - value_x) < seg_w;
+                return true;
+            }
+            return false;
+        }
+        ry += row_h;
+        ry += row_h;   /* caption */
 
         /* Tab sleep preset chips */
         if (y >= ry && y < ry + row_h) {

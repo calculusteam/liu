@@ -74,6 +74,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <string>Liu</string>
     <key>LSMinimumSystemVersion</key>
     <string>11.0</string>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>Liu uses the microphone when you dictate a prompt with Voice Input, and when you record a custom notification sound. Speech is transcribed on this Mac by default; if you choose a hosted speech service in the Voice settings, your audio is sent to that service.</string>
     <key>NSLocalNetworkUsageDescription</key>

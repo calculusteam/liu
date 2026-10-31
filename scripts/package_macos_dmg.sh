@@ -225,6 +225,8 @@ cat > "${APP_DIR}/Contents/Info.plist" <<EOF
     <string>public.app-category.developer-tools</string>
     <key>NSHumanReadableCopyright</key>
     <string>Copyright © 2026 calculus.team. Apache License 2.0.</string>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>Liu uses the microphone when you dictate a prompt with Voice Input, and when you record a custom notification sound. Speech is transcribed on this Mac by default; if you choose a hosted speech service in the Voice settings, your audio is sent to that service.</string>
     <key>NSLocalNetworkUsageDescription</key>

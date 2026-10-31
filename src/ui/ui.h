@@ -7,6 +7,9 @@
 
 #include "core/types.h"
 #include "ui/paste_confirm.h"
+#include "ui/agentctl_prompt.h"
+#include "ui/agentctl_card.h"
+#include "agentctl/agentctl.h"
 #include <time.h>
 #include "core/poll_budget.h"
 #include "core/poll_gate.h"
@@ -99,6 +102,9 @@ typedef enum {
     MODAL_TRANSCRIPT,
     MODAL_AGENT_PICKER,
     MODAL_SIDEBAR_CUSTOMIZE,   /* the "Customize sidebar" popover */
+    MODAL_AGENT_SPAWN,         /* "start another agent?" — see ui/agentctl_prompt.h */
+    MODAL_AGENT_LOG,           /* a delegated agent's log — see ui/agentctl_card.h */
+    MODAL_AGENT_TEAM,          /* every delegated agent of the window — see ui/agentctl_card.h */
     MODAL_COUNT
 } ModalId;
 
@@ -525,6 +531,36 @@ typedef struct {
      * CONTINUES, not by one repaint: the first change seen while dark, 0 when
      * none is pending. See agent_busy_hook_change(). */
     f64   hook_probe;
+
+    /* The stored session this pane's agent is writing, so that the agent can
+     * be started on it again after Liu quits or crashes (sessions.json,
+     * app_restore_sessions). Named by the agent's own hook payload when it
+     * has one (`session_from_hook`), otherwise found in its store by
+     * history/agent_session_async.h. Cleared with the rest of the pane's
+     * state when its agent changes or exits. `session_path` is the session's
+     * file, for an agent that resumes by path. */
+    char  session_id[128];
+    char  session_path[512];
+    bool  session_from_hook;
+    i64   agent_since_ms;       /* wall clock, ms: when this agent took the pane */
+    f64   session_next_probe;   /* loop clock; throttles the store lookup */
+    f64   session_eager_until;  /* loop clock; frequent lookups until then (ui/agent_session_pace.h) */
+    u32   session_same_looks;   /* looks in a row that found the known session unchanged */
+    u64   session_request;      /* one agent_session_async reference */
+    /* A restored pane that was started on a session: the agent expected to
+     * come up in it. When that agent is seen in the pane it keeps
+     * session_id / session_path instead of starting empty. */
+    i32   resume_tool;
+    /* A pane that leads a team of agents: its screen as agent control last
+     * read it (Terminal.content_writes) and when it may read it again. */
+    u64   lead_writes;
+    f64   lead_screen_at;
+    /* The session agent control was last told this pane's agent runs on
+     * (agentctl_pane_identity): its jobs are filed under it for a restart. */
+    char  ident_told[128];
+    /* What the subagent watcher was last told of this pane (its agent,
+     * session, work and tab, hashed): it is told again when that changes. */
+    u64   subs_told;
 } PaneAgent;
 
 /* Tab content kind. The default value (0) represents a terminal backed
@@ -620,6 +656,19 @@ typedef struct {
     Terminal  *extra_terminals[MAX_SPLIT_PANES - 2];
     Session   *extra_sessions[MAX_SPLIT_PANES - 2];
     i32        active_pane;    /* 0 = first, 1 = second */
+    /* Pane zoom (ui/pane_zoom.h): `zoomed_pane` fills the tab while it is the
+     * focused pane; the others keep running at their layout size. */
+    bool       zoomed;
+    i32        zoomed_pane;
+    /* A zoom going in or out moves `zoom_anim_pane` from split_move_from[] to
+     * its new rect over the other panes, which stay where the layout puts them. */
+    bool       zoom_anim;
+    i32        zoom_anim_pane;
+    /* The session of the terminal pane that last had the keyboard
+     * (app_note_keyboard_pane), so text for an agent sent while the browser
+     * pane has it reaches the agent the user was working with. Only compared
+     * with the panes' sessions, never dereferenced: its pane may be gone. */
+    const Session *keyboard_session;
 
     /* Terminal profile override (-1 = use global config) */
     i32        profile_index;
@@ -773,6 +822,10 @@ typedef struct {
     /* Open animation: a new tab fades + slides in. anim_start'd in app_new_tab;
      * the pill render multiplies alpha + offsets x by its eased progress. */
     Anim       tab_open;
+    /* AgcTabFold: whether the user folded this tab's job tabs into their
+     * count chip or opened them (ui/agentctl_card.h); UNSET follows the
+     * setting. Cleared once the tab has no job tab left. */
+    u8         jobs_fold;
 } Tab;
 
 
@@ -1307,6 +1360,13 @@ typedef struct AppState {
      * remote output nobody sees does not hold ProMotion at 120 Hz. */
     bool      visible_session_data_this_frame;
     bool      poll_ui_changed; /* asynchronous metadata changed this window's chrome */
+    /* Something sessions.json records changed in this window (a tab, a
+     * split, a pane's agent session): the loop writes the file again soon,
+     * so that a crash restores the state the user had and not the last
+     * quit's. */
+    bool      sessions_dirty;
+    /* Panes app_restore_sessions started on their agent's session again. */
+    i32       restore_resumed_agents;
     /* A local shell exited and its pane is to be closed: found by the session
      * poll, carried out by main.c right after it (closing a pane shifts the
      * indices the poll is walking). One at a time; the next is found on the
@@ -2072,6 +2132,97 @@ typedef struct AppState {
     const Terminal *paste_confirm_term;
     const Session  *paste_confirm_sess;
     PasteSummary paste_confirm_sum;
+
+    /* "Start another agent?" (ui/agentctl_prompt.h): an agent in a pane of
+     * this window asked Liu to start one (agentctl). One prompt at a time;
+     * the others wait here by job number and are asked for again in turn. */
+    bool               agentctl_prompt_active;
+    f64                agentctl_prompt_shown_at;    /* arms on it (ui/hostkey_prompt.h) */
+    f64                agentctl_prompt_quiet_since; /* ...or the last key it swallowed */
+    AgentctlPromptView agentctl_prompt;
+    u32                agentctl_prompt_queue[AGENTCTL_PROMPT_QUEUE];
+    i32                agentctl_prompt_queued;
+
+    /* Delegated agents' tabs (ui/agentctl_card.h): the jobs each tab's panes
+     * started, as render_toolbar found them this frame, and the part of the
+     * tab's slot they take (inside _tab_extra_w). The hit test and the click
+     * read these. The jobs come from a copy taken when agentctl_jobs_gen()
+     * moves, so a frame takes no lock. */
+    AgentctlJobBrief   jobs_brief[AGENTCTL_MAX_SHOWN];
+    i32                jobs_brief_n;
+    u64                jobs_brief_gen;
+    AgcTabJob          tab_jobs[MAX_TABS][AGC_TAB_JOBS_MAX];
+    u8                 tab_jobs_n[MAX_TABS];      /* job tabs shown */
+    u8                 tab_jobs_more[MAX_TABS];   /* agentctl_job_tabs_more() */
+    u8                 tab_jobs_folded[MAX_TABS]; /* its job tabs are folded into their chip */
+    f32                _tab_jobs_w[MAX_TABS];     /* fb px */
+    f32                _tab_job_w;                /* one job tab, fb px */
+    /* Every job tab as painted this frame (the strip or the docked list),
+     * for the script driver's state report. */
+    struct { i32 tab, k; f32 x, y, w, h, band_y, band_h, rr; i32 edges[4]; } jobtab_rect[64];
+                                  /* band: the haze's rows; rr: its right corners' radius;
+                                   * edges: lit cells in its first column, its last between
+                                   * the rounded corners, its first and last row short of them */
+    i32                jobtab_rect_n;
+    /* The job tab under the pointer this frame, and where its hover hangs
+     * (fb px, under the strip); 0 = none. Drawn after the panes. */
+    u32                agentctl_tip_job;
+    f32                agentctl_tip_x, agentctl_tip_y;
+    /* The hover as drawn: the job it shows (kept through its fade-out), where
+     * it is going and where it is, and its open / close clock. */
+    u32                agentctl_tip_shown;
+    f32                agentctl_tip_to_x, agentctl_tip_to_y, agentctl_tip_draw_x;
+    bool               agentctl_tip_opening;
+    f64                agentctl_tip_turn_t;      /* platform clock: began opening / closing */
+    f64                agentctl_tip_glide_t;
+    f32                agentctl_tip_alpha;       /* as last drawn; 0 = not shown */
+    AgcTipGeom         agentctl_tip_drawn;       /* the hover's window as last drawn */
+    i32                agentctl_tip_screen_rows; /* rows of lines it showed */
+    u8                 agentctl_tip_cursor_kind; /* AgcTipCursor */
+    f32                agentctl_tip_cursor_at[4];/* x, y, w, h; zero size = none */
+    f64                agentctl_next_edge;  /* platform clock: a working job tab's next changed haze
+                                                * frame, or the hover's next minute; 0 = none */
+    AgcHazeMemo        agentctl_haze_memo[AGC_HAZE_MEMO];   /* one per job drawn, found by id */
+    u64                agentctl_gen_seen;        /* agentctl_cards_gen() at the last frame */
+    u64                agentctl_jobs_gen_seen;   /* agentctl_jobs_gen() at the last frame */
+
+    /* A job's log (ui/agentctl_card.h), drawn from a copy taken when the
+     * job changes. Rows are the copy's lines wrapped to the panel's width. */
+    bool               agentctl_panel_open;
+    u32                agentctl_panel_job;
+    AgentctlSnapshot   agentctl_panel_snap;
+    u64                agentctl_panel_gen;
+    AgcRow            *agentctl_panel_rows;
+    i32                agentctl_panel_row_count, agentctl_panel_row_cap, agentctl_panel_cols;
+    i32                agentctl_panel_scroll;    /* rows above the end; 0 = follow it */
+    f32                agentctl_panel_wheel;     /* trackpad pixels not yet a row */
+    char               agentctl_msg[2048];       /* the chat's next message, being written */
+    i32                agentctl_msg_len;
+    u32                agentctl_msg_job;         /* the job it is written to */
+    char               agentctl_msg_note[96];    /* why the last Enter sent nothing; "" = none */
+    bool               agentctl_msg_queued;      /* Enter was pressed while the job worked: it goes once idle */
+    f64                agentctl_close_armed_at;  /* the first Ctrl+D that ends the job; 0 = none */
+    /* Find in the job's log (Cmd+F): the query, and the row of the match shown */
+    bool               agentctl_find_on;
+    char               agentctl_find[96];
+    i32                agentctl_find_len;
+    i32                agentctl_find_row;        /* -1 = none */
+    /* Rows of the log picked with the pointer (Cmd+C copies them); -1 = none */
+    i32                agentctl_sel_a, agentctl_sel_b;
+    bool               agentctl_selecting;
+    /* A job being written from Liu itself (the palette's Delegate rows): the
+     * panel opens on no job, and Enter starts one with this agent; -1 = not */
+    i32                agentctl_compose_agent;
+    u64                agentctl_compose_pane;    /* the pane it will belong to */
+    /* A job tab's context menu (right-click): its rows follow the job */
+    bool               job_ctx_menu_active;
+    u32                job_ctx_menu_job;
+    f32                job_ctx_menu_x, job_ctx_menu_y;
+    i32                job_ctx_menu_selected;    /* -1 = none */
+    /* Every job of the window's tabs at a glance (the palette's Agent team) */
+    bool               agentctl_team_open;
+    u32                agentctl_team_jobs[AGC_TEAM_ROWS_MAX];
+    i32                agentctl_team_n;
     i32       close_confirm_tab;
     i32       close_confirm_pane;      /* -1 = whole tab */
     i32       close_confirm_group;     /* -1 = single tab */
@@ -2240,6 +2391,21 @@ typedef struct AppState {
     bool      sidebar_sec_inited;
     bool      sidebar_dock_prev;       /* config.sidebar_tabs last frame (edge → open) */
     f32       side_tabs_scroll;        /* px, the tab list's own scroll */
+    /* The list gliding to a jump pill's tab (sidebar_glide_at); a wheel
+     * scroll ends it. */
+    bool      side_tabs_glide;
+    f32       side_tabs_glide_from, side_tabs_glide_to;
+    f64       side_tabs_glide_t0;
+    /* A section header pressed for a reorder drag (app_side_drag_*). */
+    bool      side_drag_armed;
+    bool      side_drag_live;          /* past the slop: a drag, not a click */
+    bool      side_drag_toggles;       /* a still release folds / opens it */
+    bool      side_drag_rail;          /* a rail button, not a header */
+    i32       side_drag_id;            /* the SidebarSection pressed */
+    f32       side_drag_x0, side_drag_y0;   /* the press */
+    f32       side_drag_grab;          /* press y − the header's top */
+    f32       side_drag_x, side_drag_y;     /* the pointer now */
+    SidebarSlide side_slide;           /* sections gliding to a new order */
     /* Notes section: the vault's most recent .md files, rescanned on a TTL
      * because the list is painted every frame the sidebar is. */
     struct {
@@ -2284,7 +2450,7 @@ typedef struct AppState {
  *   app_destroy_window()  — everything owned by ONE AppState: its tabs,
  *                           renderer, vault handle, per-app buffers, its
  *                           dev-server registry, its dialog state. Safe on a
- *                           half-built AppState (app_init memsets first).
+ *                           half-built AppState (app_init takes zeroed memory).
  *   app_shutdown_process() — the module-level singletons that outlive any
  *                           single window (palette tables, shared host list,
  *                           model catalog/download, local-LLM worker, the
@@ -2295,6 +2461,7 @@ typedef struct AppState {
  * Config + keybindings are written by whichever window is torn down LAST:
  * every AppState holds its own copy, so saving from a window that merely
  * closed would publish its stale copy over settings another window changed. */
+/* `app` must be zeroed memory (calloc); app_init does not clear it. */
 bool app_init(AppState *app, i32 width, i32 height, f32 dpi_scale);
 void app_destroy_window(AppState *app);
 void app_shutdown_process(void);
@@ -2637,6 +2804,9 @@ i32       app_tab_pane_count(const Tab *tab);
 Terminal *app_tab_pane_terminal(const Tab *tab, i32 pane);
 void      app_tab_pane_layout(const Tab *tab, f32 x, f32 y, f32 w, f32 h,
                               f32 dpi, PaneRect out[MAX_SPLIT_PANES]);
+/* The grid pane `pane` of `tab` fits in the rectangle it is drawn in, in this
+ * window's current layout: what its terminal and its pty should measure. */
+void      app_tab_pane_fit(AppState *app, const Tab *tab, i32 pane, i32 *cols, i32 *rows);
 void app_close_tab(AppState *app, i32 index);
 void app_switch_tab(AppState *app, i32 index);
 /* Move the live sidebar/file-browser state into tab `index`'s stow, leaving
@@ -2690,6 +2860,12 @@ void app_show_toast_kind(AppState *app, NotificationKind kind, const char *messa
  * stacked under (ui/toast_stack.h). */
 void app_show_toast_about(AppState *app, const void *about, NotificationKind kind,
                           const char *message);
+/* A delegated job's tool request is a notice about that job's request: it
+ * is posted under app_agentctl_ask_about(job), and app_agentctl_asks_settle
+ * sends it away once the job no longer asks (answered from the chat, the job
+ * tab, a stop or the end of its turn). */
+const void *app_agentctl_ask_about(u32 job);
+void app_agentctl_asks_settle(AppState *app);
 /* Whether any floating notice is up or on its way out (the loop's gates). */
 bool app_toast_active(const AppState *app, f64 now);
 /* A click at (x, y) in framebuffer pixels: dismisses the notice under it and
@@ -2822,6 +2998,19 @@ void app_move_tab(AppState *app, i32 from, i32 to);
 /* Split pane */
 void app_split_tab(AppState *app, SplitType dir);
 void app_resize_tab_panes(AppState *app, Tab *tab);
+/* The keyboard to the pane beside the focused one of the active tab, `dir` a
+ * PaneNavDir (ui/pane_nav.h); a zoomed tab shows its layout first. False when
+ * nothing lies that way. */
+bool app_focus_pane_dir(AppState *app, i32 dir);
+/* The keyboard to the next (`step` 1) or previous (-1) pane in reading order,
+ * wrapping; false on a tab with one pane. */
+bool app_focus_pane_cycle(AppState *app, i32 step);
+/* Fill the active tab with its focused pane, or show its layout again
+ * (ui/pane_zoom.h). False, with a notice, on a tab with one pane. */
+bool app_pane_zoom_toggle(AppState *app);
+/* End a zoom whose pane no longer has the keyboard, and size the panes for
+ * the layout; called every loop turn. */
+void app_pane_zoom_settle(AppState *app);
 /* Reconcile every tab whose grid was left behind by a deferred layout pass.
  * Cheap no-op when nothing is pending. */
 void app_flush_pending_resizes(AppState *app);
@@ -2978,6 +3167,16 @@ Terminal *app_focused_terminal(AppState *app);
  * connected SSH tab, the local ladder otherwise (ui.c). */
 void app_explorer_open_for_active_tab(AppState *app);
 Session  *app_focused_session(AppState *app);
+/* Record the active tab's active pane as the one that last had the keyboard
+ * when it is a terminal (Tab.keyboard_session); called every loop turn. */
+void app_note_keyboard_pane(AppState *app);
+/* The pane Tab.keyboard_session names now, -1 when it names none. */
+i32  app_tab_keyboard_pane(const Tab *tab);
+/* The pane of tab `tab_index` that text meant for an agent goes to
+ * (ui/agent_target.h): the active pane, the terminal pane that last had the
+ * keyboard, then the first pane running an agent. -1 when none runs one;
+ * `*tool_out` gets its agent (a ChatTool value). */
+i32  app_tab_agent_target_pane(AppState *app, i32 tab_index, i32 *tool_out);
 void      app_extract_cmd_history(AppState *app);
 
 /* Best-effort working directory of the active tab's focused LOCAL pane, for a
@@ -3020,17 +3219,97 @@ bool app_save_sessions(AppState *app);
  * is safe to call while the app is running (window close, Cmd+Q atexit).
  * Returns false and leaves the existing file alone when no window has tabs. */
 bool app_save_sessions_multi(AppState **apps, i32 app_count);
+void app_sessions_persist_off(void);   /* LIU_NO_SESSIONS: write neither file */
 
 /* Web views alive in this PROCESS — browser tabs plus browser panes, across
  * every window. See ui/browser_budget.h. */
 i32  app_browser_view_count(void);
 bool app_restore_sessions(AppState *app);
+/* Each pane's agent session (what a relaunch resumes): once a loop turn. */
+void app_agent_sessions_tick(AppState *app, f64 now);
+/* Before a quit's last save: the agent panes whose session is not known yet,
+ * looked up in place, within `budget_sec` for the window. */
+void app_agent_sessions_settle(AppState *app, f64 budget_sec);
+/* Between saves: the one pane of this window whose history gained lines and
+ * whose screen stream is the most out of date (and at least ten seconds old)
+ * is rewritten in place. True when one was written. */
+bool app_screens_refresh_one(AppState *app, f64 now);
+/* While on, a save names a pane's stream as it is when this process wrote it
+ * less than ten seconds ago (the periodic saves); off, every changed stream is
+ * written (the saves that end a window or the session). */
+void app_screens_lazy_save(bool on);
+/* A prompt was just sent in the pane that `t` draws: an agent there whose
+ * session is not known yet is looked up shortly (agents write their session
+ * with the first message). */
+void app_agent_session_prompt_sent(AppState *app, const Terminal *t, f64 now);
 /* Move the saved session aside (sessions.not-restored.json) instead of
  * restoring it; false when nothing was saved. See core/launch_guard.h. */
 bool app_sessions_set_aside(char *kept, usize kept_cap);
 
 /* Tab title: returns custom_title if set, otherwise auto title */
 const char *tab_effective_title(const Tab *tab);
+/* A banner for the agent start prompt, posted only when this window is not
+ * in front (ui/agentctl_prompt.h). */
+void app_agentctl_prompt_banner(AppState *app, const char *title, const char *body);
+
+/* Delegated agents' tabs and log (ui/agentctl_card.h). */
+/* The job behind job tab `k` of tab `tab` as last painted; 0 for none (the
+ * "+N" tab answers the first job it stands for). */
+u32  app_tab_job_at(const AppState *app, i32 tab, i32 k);
+bool app_tab_job_is_chip(const AppState *app, i32 tab, i32 k);   /* the slot is the jobs' count chip */
+void app_tab_jobs_toggle_fold(AppState *app, i32 tab);           /* a click on it: fold or open them */
+/* One job tab's width in a docked tab row of height `row_h`. */
+f32  app_side_job_w(const AppState *app, f32 row_h);
+/* Whether any tab of this window shows a job tab, or its log or hover is up. */
+bool app_window_shows_jobs(const AppState *app);
+void app_agentctl_panel_open(AppState *app, u32 job);
+void app_agentctl_panel_close(AppState *app);
+/* Takes a new copy of the job when it changed; true when it did. */
+bool app_agentctl_panel_refresh(AppState *app);
+/* The panel's geometry and the buttons the job's state allows: the one
+ * layout the renderer and the click handler share. */
+void app_agentctl_panel_layout(AppState *app, AgentctlPanelGeom *g);
+const char *app_agentctl_button_label(const AppState *app, AgcButton b);
+/* Rows to move the log by (positive = back), clamped. */
+void app_agentctl_panel_scroll(AppState *app, i32 rows);
+/* Enter in the chat's field: sends what it holds as the job's next message
+ * (agentctl_request_send), or, while the job works, queues it for when it is
+ * idle. False with app->agentctl_msg_note saying why when it was refused. */
+bool app_agentctl_panel_send(AppState *app);
+/* A queued message goes once its job is idle: called when a job's state
+ * changes (agentctl_jobs_gen). */
+void app_agentctl_msg_try_queued(AppState *app);
+/* A new job from Liu itself: the chat opens empty for `agent`, and Enter
+ * starts it in the focused local pane's folder, owned by that pane. False
+ * with a toast when there is no local pane to belong to. */
+bool app_agentctl_compose_open(AppState *app, i32 agent);
+/* The log row under a point of the open chat, -1 for none. */
+i32  app_agentctl_panel_row_at(AppState *app, f32 x, f32 y);
+/* The picked rows (or, with none, the whole log) to the clipboard. */
+void app_agentctl_panel_copy(AppState *app, bool all);
+/* Find: the next (`dir` 1) or previous (-1) row that holds the query,
+ * scrolled into view. */
+void app_agentctl_find_step(AppState *app, i32 dir);
+/* The word under a point of the log as a file of the job's folder, opened
+ * in Liu's explorer. False when it names no file. */
+bool app_agentctl_panel_open_path_at(AppState *app, f32 x, f32 y);
+/* A job tab's context menu: its rows (what the job's state allows), where
+ * they are, which one is under a point, and what a row does. */
+typedef enum {
+    JOB_MENU_OPEN = 0, JOB_MENU_STOP, JOB_MENU_REVIEW, JOB_MENU_MERGE, JOB_MENU_DISCARD,
+    JOB_MENU_COPY, JOB_MENU_TEAM, JOB_MENU_CLOSE, JOB_MENU_KIND_COUNT
+} JobMenuKind;
+#define JOB_MENU_MAX_ROWS JOB_MENU_KIND_COUNT
+i32  app_job_menu_layout(AppState *app, CtxMenuBox *box, i32 kinds[JOB_MENU_MAX_ROWS], CtxMenuRow rows[JOB_MENU_MAX_ROWS]);
+i32  app_job_menu_row_at(AppState *app, f32 x, f32 y);
+void app_job_menu_run(AppState *app, i32 row);
+
+/* The team panel: every job of this window's tabs. */
+void app_agentctl_team_open(AppState *app);
+void app_agentctl_team_layout(AppState *app, AgcTeamGeom *g);
+/* Opens `command` (one line) in `cwd` as a new pane beside the active one in
+ * the active tab. */
+bool app_split_tab_run(AppState *app, const char *cwd, const char *command);
 /* Display name for a ChatTool passed as i32 ("Claude Code", "Codex", …).
  * "Terminal" for anything unrecognised. Exposed for the tab popup, which
  * names the agent that just finished. */
@@ -3069,6 +3348,36 @@ void app_sidebar_layout(const AppState *app, SidebarLayout *out);
 enum { SIDE_RAIL_SECTION = 3 };
 typedef struct { u8 kind; i32 index; f32 y, h; } SideRailItem;
 i32  app_side_rail_items(const AppState *app, f32 y, f32 h, SideRailItem *out, i32 cap);
+/* The docked list's jump pills (ui/sidebar_layout.h, sidebar_jumps_compute)
+ * for the layout `L`: the rows that matter are the open tab's, a tab that
+ * rang, and a tab whose agent is at work. Painter and hit test both ask. */
+void app_side_jumps(const AppState *app, const SidebarLayout *L, SidebarJump out[2]);
+/* Glide the docked list so `tab`'s row stands in its middle. */
+void app_side_tabs_glide_to(AppState *app, i32 tab, f64 now);
+/* Reordering the sections by dragging a header, or on the rail a section
+ * button (ui/sidebar_reorder.c). A press arms; past the slop it is a drag; a
+ * still release on a press that `toggles` is its click — a header folds or
+ * opens its section, a rail button names the section the caller unfolds the
+ * bar on (`*rail_open`, else -1). The explorer is dragged by its breadcrumb,
+ * and only a drop inside the bar reorders it (outside, the breadcrumb's own
+ * drag detaches the explorer into a tab). */
+void app_side_drag_press(AppState *app, i32 section, f32 x, f32 y, bool toggles);
+bool app_side_drag_move(AppState *app, f32 x, f32 y);      /* true: repaint */
+bool app_side_drag_release(AppState *app, f32 x, f32 y, i32 *rail_open);   /* true: repaint */
+void app_side_drag_cancel(AppState *app);
+/* Esc while a press is held: forgotten — no fold, no move, and for the
+ * explorer no detach. True when there was one. */
+bool app_side_drag_escape(AppState *app);
+/* What a drag is measured against: the bar's sections, or on the rail its
+ * section buttons as a stack of headers with no bodies. */
+void app_side_drag_stack(const AppState *app, SidebarLayout *out);
+/* While a drag is live: the slot it would drop into (sidebar_drop_slot) in
+ * `stack`, or -1 where a release would not reorder. */
+i32  app_side_drag_slot(const AppState *app, const SidebarLayout *stack);
+/* Glide every section of the current stack from where it is drawn now to
+ * its next place, `lead` drawn over the rest (sidebar_slide_begin). Called
+ * before an order changes. */
+void app_side_slide_begin(AppState *app, i32 lead, f32 lead_y);
 
 /* Start inline rename for a tab */
 void app_start_tab_rename(AppState *app, i32 tab_index);

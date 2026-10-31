@@ -50,16 +50,16 @@ typedef struct {
 typedef bool (*chat_session_cb)(const ChatSessionMeta *meta, void *user);
 
 /* Enumerate sessions from all known agents on the local machine.
- *   tools_mask: bitwise OR of (1 << ChatTool). 0 → all.
+ *   tools_mask: CHAT_TOOL_BIT()s OR-ed together. 0 → all.
  *   arena is used for transient allocations during enumeration. */
-void chat_scan(Arena *arena, u32 tools_mask,
+void chat_scan(Arena *arena, ChatToolMask tools_mask,
                chat_session_cb cb, void *user);
 
 /* As chat_scan, with a cancel flag checked between the per-tool stores: a
  * scan a worker was asked to abandon stops at the next store boundary rather
  * than walking every directory it was going to. NULL = never cancelled.
  * A cancelled scan still calls `cb` for nothing and returns normally. */
-bool chat_scan_cancellable(Arena *arena, u32 tools_mask,
+bool chat_scan_cancellable(Arena *arena, ChatToolMask tools_mask,
                            chat_session_cb cb, void *user,
                            const _Atomic bool *cancel);
 
@@ -77,7 +77,13 @@ Arena *chat_scan_arena_borrow(void);
 
 /* chat_scan using the borrowed scan arena. Meta string fields are only
  * valid during `cb` (copy what you need) or until the next borrow. */
-void chat_scan_with_arena(u32 tools_mask, chat_session_cb cb, void *user);
+void chat_scan_with_arena(ChatToolMask tools_mask, chat_session_cb cb, void *user);
+
+/* Frees the borrowed scan arena when nothing borrowed it for `idle_sec`: its
+ * pages stay written after a scan (a reset only rewinds it), up to
+ * CHAT_SCAN_ARENA_BYTES, and the next borrow maps a fresh one. For a caller
+ * whose borrowers use what they got only until they return. */
+void chat_scan_arena_trim_idle(f64 idle_sec);
 
 /* Free process-lifetime scanner state (reusable scan arena, etc.). Call
  * once at shutdown; idempotent. */

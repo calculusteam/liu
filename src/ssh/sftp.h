@@ -107,6 +107,12 @@ i32 sftp_download_at(void *sftp, const char *remote_path, int parent,
  * replaced file's permission bits are carried over to the new one. */
 i32 sftp_upload(void *sftp, const char *local_path, const char *remote_path);
 
+/* sftp_upload of a regular file the caller has already opened: `fd` is taken
+ * (closed on every path), so what is sent is the file that was checked, not
+ * whatever the path names by the time it is read. `label` names the transfer
+ * in its progress line. */
+i32 sftp_upload_fd(void *sftp, int fd, const char *label, const char *remote_path);
+
 /* Human-readable reason for the last failed SFTP operation on this handle
  * ("Permission denied", "No space left on the server", …). Never NULL.
  * Valid only inside the caller's SFTP scope, right after the failure. */

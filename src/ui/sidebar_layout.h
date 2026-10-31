@@ -15,12 +15,17 @@
  * - Agents and notes request their natural height, capped at a few rows.
  * - The Customize popover opens from Cmd+K or Settings and does not reserve a
  *   row. `bottom` is the lower boundary for sections.
+ * - A section is also moved by dragging its header: the drop slot, the line
+ *   drawn for it and the change to the configured order are computed here.
  * - Rail mode is laid out separately as one column of icons.
  */
 #ifndef UI_SIDEBAR_LAYOUT_H
 #define UI_SIDEBAR_LAYOUT_H
 
 #include "core/types.h"
+
+#include <math.h>
+#include <string.h>
 
 typedef enum {
     SB_SEC_TABS = 0,
@@ -33,17 +38,18 @@ typedef enum {
 /* Points. Mirrored nowhere else — the render and the hit test both come here. */
 #define SIDEBAR_RAIL_PT            44.0f   /* collapsed: one column of 28pt buttons */
 #define SIDEBAR_RAIL_BTN_PT        28.0f
-#define SIDEBAR_ROW_PT             30.0f   /* tab row: 28pt pill + 1pt above and below */
-#define SIDEBAR_ROW_COMPACT_PT     26.0f
-#define SIDEBAR_GROUP_HDR_PT       26.0f
-#define SIDEBAR_SEC_HDR_PT         28.0f   /* == SIDEBAR_HEADER_PT: same band as the explorer's */
+#define SIDEBAR_ROW_PT             35.0f   /* tab row: 33pt pill + 1pt above and below */
+#define SIDEBAR_ROW_COMPACT_PT     30.0f
+#define SIDEBAR_GROUP_HDR_PT       30.0f
+#define SIDEBAR_SEC_HDR_PT         32.0f
 #define SIDEBAR_SEC_GAP_PT          6.0f
-#define SIDEBAR_AGENT_ROW_PT       44.0f
-#define SIDEBAR_NOTE_ROW_PT        28.0f
+#define SIDEBAR_AGENT_ROW_PT       51.0f
+#define SIDEBAR_NOTE_ROW_PT        32.0f
 #define SIDEBAR_AGENTS_MAX_ROWS     4
 #define SIDEBAR_NOTES_MAX_ROWS      6
 #define SIDEBAR_TABS_MAX_FRAC       0.45f
 #define SIDEBAR_TABS_MIN_ROWS       3      /* the cap never hides the active tab's neighbours */
+#define SIDEBAR_DRAG_SLOP_PT        5.0f   /* a header press moves this far before it is a drag */
 
 typedef struct {
     f32  x, y, w, h;         /* the sidebar's rect, framebuffer px */
@@ -200,6 +206,306 @@ static inline f32 sidebar_scroll_clamp(const SidebarSectionRect *s, f32 scroll) 
     if (scroll < 0.0f) scroll = 0.0f;
     if (scroll > max) scroll = max;
     return scroll;
+}
+
+/* ---- reordering by dragging a header ------------------------------------
+ *
+ * A section is dragged by its header (the explorer by its breadcrumb) and
+ * dropped between two others. The drop is a SLOT: the display index of the
+ * section it lands in front of, or one past the last drawn section. Sections
+ * parked at the bottom with nothing drawn are no target. */
+
+/* Display index of the laid-out section `id`, -1 when it is not laid out. */
+static inline i32 sidebar_layout_index(const SidebarLayout *L, i32 id) {
+    for (i32 i = 0; i < L->n; i++)
+        if ((i32)L->sec[i].id == id) return i;
+    return -1;
+}
+
+/* A section that has pixels: neither parked nor empty. */
+static inline bool sidebar_sec_drawn(const SidebarSectionRect *s) {
+    return s->hdr_h + s->body_h > 0.0f;
+}
+
+/* The display index of the last drawn section, -1 when none is. Its next
+ * index is the END slot. */
+static inline i32 sidebar_drawn_last(const SidebarLayout *L) {
+    i32 last = -1;
+    for (i32 i = 0; i < L->n; i++)
+        if (sidebar_sec_drawn(&L->sec[i])) last = i;
+    return last;
+}
+
+/* Whether `slot` is one a drop can name: a drawn section, or the end. */
+static inline bool sidebar_slot_valid(const SidebarLayout *L, i32 slot) {
+    i32 last = sidebar_drawn_last(L);
+    if (last < 0 || slot < 0 || slot > last + 1) return false;
+    return slot == last + 1 || sidebar_sec_drawn(&L->sec[slot]);
+}
+
+/* The slot just behind display index `i`: the next drawn section, or the end. */
+static inline i32 sidebar_slot_after(const SidebarLayout *L, i32 i) {
+    for (i32 k = i + 1; k < L->n; k++)
+        if (sidebar_sec_drawn(&L->sec[k])) return k;
+    return sidebar_drawn_last(L) + 1;
+}
+
+/* The slot under a pointer at `y`: the section the pointer is over, in front
+ * of it in its upper half and behind it in its lower half. */
+static inline i32 sidebar_drop_slot(const SidebarLayout *L, f32 y) {
+    for (i32 i = 0; i < L->n; i++) {
+        const SidebarSectionRect *s = &L->sec[i];
+        if (!sidebar_sec_drawn(s)) continue;
+        if (y < s->hdr_y + (s->hdr_h + s->body_h) * 0.5f) return i;
+    }
+    return sidebar_drawn_last(L) + 1;
+}
+
+/* Whether dropping the section at display index `from` into `slot` moves it:
+ * the slots on either side of it leave it where it is. */
+static inline bool sidebar_drop_moves(const SidebarLayout *L, i32 from, i32 slot) {
+    if (from < 0 || from >= L->n || !sidebar_sec_drawn(&L->sec[from])) return false;
+    if (!sidebar_slot_valid(L, slot)) return false;
+    return slot != from && slot != sidebar_slot_after(L, from);
+}
+
+/* Where the drop line for `slot` is drawn: centred in the gap above the
+ * section it lands in front of, or below the last drawn section; never
+ * outside the bar. */
+static inline f32 sidebar_drop_line_y(const SidebarLayout *L, i32 slot, f32 top, f32 gap) {
+    i32 last = sidebar_drawn_last(L);
+    f32 y = top;
+    if (last < 0 || !sidebar_slot_valid(L, slot)) return y;
+    if (slot <= last) {
+        y = L->sec[slot].hdr_y;
+        if (y > top) y -= gap * 0.5f;
+    } else {
+        const SidebarSectionRect *s = &L->sec[last];
+        y = s->body_y + s->body_h + gap * 0.5f;
+    }
+    if (y < top) y = top;
+    if (y > L->bottom) y = L->bottom;
+    return y;
+}
+
+/* Apply a drop to the configured order, which also holds the sections that
+ * are switched off or not laid out (the tab list while undocked): `id` is
+ * moved in front of the section at `slot`, or just behind the last drawn one
+ * for the end slot. Every other section keeps its place relative to the
+ * rest. Returns whether the order changed. */
+static inline bool sidebar_order_drop(u8 order[SB_SEC_COUNT], const SidebarLayout *L, i32 id, i32 slot) {
+    if (id < 0 || id >= SB_SEC_COUNT) return false;
+    if (!sidebar_drop_moves(L, sidebar_layout_index(L, id), slot)) return false;
+    i32 last = sidebar_drawn_last(L);
+    i32 anchor = slot <= last ? (i32)L->sec[slot].id : (i32)L->sec[last].id;
+    bool behind = slot > last;
+
+    u8 rest[SB_SEC_COUNT];
+    i32 n = 0;
+    for (i32 k = 0; k < SB_SEC_COUNT; k++)
+        if ((i32)order[k] != id) rest[n++] = order[k];
+    if (n != SB_SEC_COUNT - 1) return false;   /* `id` was not in the order once */
+    i32 at = -1;
+    for (i32 k = 0; k < n; k++)
+        if ((i32)rest[k] == anchor) { at = behind ? k + 1 : k; break; }
+    if (at < 0) return false;
+
+    u8 next[SB_SEC_COUNT];
+    for (i32 k = 0, j = 0; k < SB_SEC_COUNT; k++)
+        next[k] = (k == at) ? (u8)id : rest[j++];
+    bool changed = memcmp(next, order, SB_SEC_COUNT) != 0;
+    memcpy(order, next, SB_SEC_COUNT);
+    return changed;
+}
+
+/* ---- the jump pills over the docked tab list ----------------------------
+ *
+ * When the list scrolls, a tab that matters — the open one, one that rang,
+ * one whose agent is at work — can end up out of sight above or below. A
+ * pill then floats at that edge of the list: the icons of the nearest such
+ * tabs (up to SIDEBAR_JUMP_MAX_ICONS, then "+N") and an arrow; a click goes
+ * to the nearest. A row counts as out of sight once less than half of it
+ * shows. When the list fits, or is too short to carry a pill, there is none;
+ * when both would not fit, the one toward the open tab stays, else the lower
+ * one. */
+#define SIDEBAR_JUMP_H_PT         28.0f
+#define SIDEBAR_JUMP_ICON_PT      16.0f
+#define SIDEBAR_JUMP_ICON_GAP_PT   4.0f
+#define SIDEBAR_JUMP_ARROW_PT     14.0f
+#define SIDEBAR_JUMP_PAD_PT       10.0f   /* inside the pill, each end */
+#define SIDEBAR_JUMP_ARROW_GAP_PT  6.0f   /* last icon → arrow */
+#define SIDEBAR_JUMP_MARGIN_PT     8.0f   /* from the list's edge */
+#define SIDEBAR_JUMP_CELL_PT       8.0f   /* a cell of the "+N" text */
+#define SIDEBAR_JUMP_MAX_ICONS     3
+#define SIDEBAR_GLIDE_S            0.22f  /* the list's scroll to a jump's tab */
+
+enum { SIDEBAR_JUMP_UP = 0, SIDEBAR_JUMP_DOWN = 1 };
+
+typedef struct {
+    bool shown;
+    i32  rows[SIDEBAR_JUMP_MAX_ICONS];   /* row indexes shown as icons, nearest first */
+    i32  tabs[SIDEBAR_JUMP_MAX_ICONS];   /* their tabs (filled by app_side_jumps) */
+    i32  n_icons;
+    i32  more;                           /* rows that matter past those */
+    f32  x, y, w, h;                     /* px */
+} SidebarJump;
+
+/* The pills for a list of `n` rows of `row_h` in section `s`, scrolled by
+ * `scroll`, laid in [x0, x0 + w). `notable[r]` marks the rows that matter;
+ * `active_row` is the open tab's row (-1 none). */
+static inline void sidebar_jumps_compute(const SidebarSectionRect *s, f32 row_h, f32 scroll,
+                                         const bool *notable, i32 n, i32 active_row,
+                                         f32 x0, f32 w, f32 dpi, SidebarJump out[2]) {
+    memset(out, 0, 2 * sizeof *out);
+    f32 h = SIDEBAR_JUMP_H_PT * dpi;
+    f32 margin = SIDEBAR_JUMP_MARGIN_PT * dpi;
+    if (!s || !s->open || row_h <= 0.0f || n <= 0) return;
+    if (s->content_h <= s->body_h + 0.5f) return;
+    if (s->body_h < h + 2.0f * margin) return;
+    f32 top = s->body_y, bottom = s->body_y + s->body_h;
+    /* Above: the nearest is the LAST hidden row; below: the first. */
+    for (i32 r = n - 1; r >= 0; r--) {
+        if (!notable[r]) continue;
+        f32 mid = top - scroll + ((f32)r + 0.5f) * row_h;
+        if (mid >= top) continue;
+        SidebarJump *j = &out[SIDEBAR_JUMP_UP];
+        if (j->n_icons < SIDEBAR_JUMP_MAX_ICONS) j->rows[j->n_icons++] = r;
+        else j->more++;
+    }
+    for (i32 r = 0; r < n; r++) {
+        if (!notable[r]) continue;
+        f32 mid = top - scroll + ((f32)r + 0.5f) * row_h;
+        if (mid <= bottom) continue;
+        SidebarJump *j = &out[SIDEBAR_JUMP_DOWN];
+        if (j->n_icons < SIDEBAR_JUMP_MAX_ICONS) j->rows[j->n_icons++] = r;
+        else j->more++;
+    }
+    for (i32 d = 0; d < 2; d++) {
+        SidebarJump *j = &out[d];
+        if (j->n_icons == 0) continue;
+        f32 cw = 0.0f;
+        if (j->more > 0) {
+            i32 cells = 2 + (j->more >= 10) + (j->more >= 100);   /* "+N" */
+            cw = (f32)cells * SIDEBAR_JUMP_CELL_PT * dpi + SIDEBAR_JUMP_ICON_GAP_PT * dpi;
+        }
+        f32 pw = 2.0f * SIDEBAR_JUMP_PAD_PT * dpi
+               + (f32)j->n_icons * SIDEBAR_JUMP_ICON_PT * dpi
+               + (f32)(j->n_icons - 1) * SIDEBAR_JUMP_ICON_GAP_PT * dpi
+               + cw + SIDEBAR_JUMP_ARROW_GAP_PT * dpi + SIDEBAR_JUMP_ARROW_PT * dpi;
+        if (pw > w - 2.0f * margin) pw = w - 2.0f * margin;
+        j->shown = true;
+        j->w = floorf(pw);
+        j->h = h;
+        j->x = floorf(x0 + (w - j->w) * 0.5f);
+        j->y = d == SIDEBAR_JUMP_UP ? floorf(top + margin) : floorf(bottom - margin - h);
+    }
+    SidebarJump *up = &out[SIDEBAR_JUMP_UP], *dn = &out[SIDEBAR_JUMP_DOWN];
+    if (up->shown && dn->shown && up->y + up->h + margin > dn->y) {
+        bool active_up = false;
+        for (i32 k = 0; k < up->n_icons; k++) if (up->rows[k] == active_row) active_up = true;
+        if (active_up) dn->shown = false; else up->shown = false;
+    }
+}
+
+/* Whether (px, py) is on a shown pill; its direction, else -1. */
+static inline i32 sidebar_jump_at(const SidebarJump jumps[2], f32 px, f32 py) {
+    for (i32 d = 0; d < 2; d++) {
+        const SidebarJump *j = &jumps[d];
+        if (j->shown && px >= j->x && px < j->x + j->w && py >= j->y && py < j->y + j->h) return d;
+    }
+    return -1;
+}
+
+/* The scroll that brings row `r` to the middle of the list, as far as the
+ * list lets it. */
+static inline f32 sidebar_scroll_to_row(const SidebarSectionRect *s, f32 row_h, i32 r) {
+    f32 want = ((f32)r + 0.5f) * row_h - s->body_h * 0.5f;
+    return sidebar_scroll_clamp(s, want);
+}
+
+/* The list's scroll on its way from `from` to `to`, started at `t0`, at
+ * `now`, eased out over SIDEBAR_GLIDE_S. */
+static inline f32 sidebar_glide_at(f32 from, f32 to, f64 t0, f64 now) {
+    f32 t = (f32)((now - t0) / (f64)SIDEBAR_GLIDE_S);
+    if (t >= 1.0f) return to;
+    if (t <= 0.0f) return from;
+    f32 u = 1.0f - t;
+    return from + (to - from) * (1.0f - u * u * u);
+}
+
+/* Top of the lifted copy that follows the pointer: where the pointer took it
+ * (`grab` below its top), kept inside [top, bottom]. */
+static inline f32 sidebar_lift_top(f32 pointer_y, f32 grab, f32 lift_h, f32 top, f32 bottom) {
+    if (grab < 0.0f) grab = 0.0f;
+    if (grab > lift_h - 1.0f) grab = lift_h - 1.0f;
+    f32 y = pointer_y - grab;
+    if (y > bottom - lift_h) y = bottom - lift_h;
+    if (y < top) y = top;
+    return y;
+}
+
+/* ---- the slide after a reorder ------------------------------------------
+ *
+ * A new order changes where sections are, never how tall: every height comes
+ * from the bar's size and the sections' content, not from their places. So
+ * each section glides from the top it was drawn at to the top it has now,
+ * eased out over SIDEBAR_SLIDE_S. The section that was moved (the LEAD)
+ * starts where its lifted copy was let go and is drawn over the others, which
+ * it crosses; the rest shift by its height and never cross each other. The
+ * same holds for the rail's section buttons (`rail`). */
+#define SIDEBAR_SLIDE_S 0.20f
+
+typedef struct {
+    bool active;
+    bool rail;                      /* measured on the rail's buttons */
+    i32  lead;                      /* the section that moved, -1 none */
+    f64  t0;
+    bool has[SB_SEC_COUNT];         /* a section had a place to slide from */
+    f32  from_y[SB_SEC_COUNT];      /* its top then, px */
+} SidebarSlide;
+
+static inline f32 sidebar_slide_ease(f32 t) {
+    if (t <= 0.0f) return 0.0f;
+    if (t >= 1.0f) return 1.0f;
+    f32 u = 1.0f - t;
+    return 1.0f - u * u * u;
+}
+
+static inline bool sidebar_slide_running(const SidebarSlide *sl, f64 now) {
+    return sl->active && now - sl->t0 < (f64)SIDEBAR_SLIDE_S;
+}
+
+/* How far above (negative: below) its place section `id` is drawn at `now`,
+ * its place being `to_y`. Zero once the slide is over, for a section it did
+ * not record, and for the other kind of stack. */
+static inline f32 sidebar_slide_dy(const SidebarSlide *sl, bool rail, i32 id, f32 to_y, f64 now) {
+    if (!sidebar_slide_running(sl, now) || sl->rail != rail) return 0.0f;
+    if (id < 0 || id >= SB_SEC_COUNT || !sl->has[id]) return 0.0f;
+    f32 t = (f32)((now - sl->t0) / (f64)SIDEBAR_SLIDE_S);
+    return (sl->from_y[id] - to_y) * (1.0f - sidebar_slide_ease(t));
+}
+
+/* Start a slide from what `stack` shows at `now` — its places plus whatever a
+ * slide still running adds, so a second reorder mid-slide carries on from
+ * where each section is drawn rather than jumping. `lead_y` (< 0: none) is
+ * where the lead starts instead of its own place. */
+static inline void sidebar_slide_begin(SidebarSlide *sl, const SidebarLayout *stack, i32 lead,
+                                       f32 lead_y, f64 now) {
+    SidebarSlide next;
+    memset(&next, 0, sizeof next);
+    next.active = true;
+    next.rail = stack->rail;
+    next.lead = lead;
+    next.t0 = now;
+    for (i32 i = 0; i < stack->n; i++) {
+        const SidebarSectionRect *s = &stack->sec[i];
+        if (!sidebar_sec_drawn(s) || (i32)s->id < 0 || s->id >= SB_SEC_COUNT) continue;
+        next.has[s->id] = true;
+        next.from_y[s->id] = s->hdr_y + sidebar_slide_dy(sl, stack->rail, s->id, s->hdr_y, now);
+    }
+    if (lead >= 0 && lead < SB_SEC_COUNT && next.has[lead] && lead_y >= 0.0f)
+        next.from_y[lead] = lead_y;
+    *sl = next;
 }
 
 #endif /* UI_SIDEBAR_LAYOUT_H */

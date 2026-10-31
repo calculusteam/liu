@@ -15,6 +15,10 @@ typedef enum {
     HIT_TAB_CLOSE,
     HIT_TAB_NEW,
     HIT_TAB_GROUP_HEADER,  /* clicked a tab group header chip */
+    HIT_TAB_JOB,           /* a delegated agent's tab beside tab `index`;
+                            * sub_index = which of them (ui/agentctl_card.h) */
+    HIT_JOB_TIP,           /* the hover a job tab shows, while it is open:
+                            * index = its job (a click opens the job's chat) */
     HIT_TOOLBAR_BTN,
     HIT_TERMINAL,
     HIT_SIDEBAR,
@@ -25,6 +29,8 @@ typedef enum {
                             * 1/2 the header's actions, 3 a rail button (expand) */
     HIT_SIDEBAR_AGENT,     /* index = tab, sub_index = pane */
     HIT_SIDEBAR_NOTE,      /* index = row in AppState.side_notes */
+    HIT_SIDEBAR_JUMP,      /* the docked list's jump pill: index = the tab it
+                            * goes to, sub_index = SIDEBAR_JUMP_UP / _DOWN */
     HIT_SPLIT_DIVIDER,
     HIT_SCROLLBAR,
     HIT_SCROLL_BOTTOM,     /* floating "jump to bottom" button in a pane;

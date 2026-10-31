@@ -9,6 +9,7 @@
 #include "history/bridge/bridge.h"
 #include "core/atomic_file.h"
 #include "history/bridge/compatibility.h"
+#include "history/bridge/handoff.h"
 #include "history/bridge/lineage.h"
 #include "history/bridge/sources.h"
 #include "history/bridge/targets.h"
@@ -340,6 +341,8 @@ static const BridgeTarget *const kTargets[] = {
     &g_bridge_target_omp,
     &g_bridge_target_openclaw,
     &g_bridge_target_hermes,
+    &g_bridge_target_mastracode,
+    &g_bridge_target_maki,
 };
 #define TARGET_COUNT ((usize)(sizeof kTargets / sizeof kTargets[0]))
 
@@ -421,7 +424,14 @@ bool bridge_migrate_history(const BridgeHistory *history,
         return false;
     }
 
-    if (!t->import_history(history, result)) {
+    /* The version gate turned a writer or an importer into a hand-off: the
+     * briefing, never the store or the import this version was not checked
+     * against. */
+    bool degraded = result->mode == BRIDGE_IMPORT_CONTEXT_HANDOFF &&
+                    t->mode != BRIDGE_IMPORT_CONTEXT_HANDOFF;
+    bool imported = degraded ? bridge_handoff_import(history, result, t->handoff_launch)
+                             : t->import_history(history, result);
+    if (!imported) {
         result_fail(result, result->error[0] ? NULL : "Import failed.");
         return false;
     }
@@ -430,7 +440,9 @@ bool bridge_migrate_history(const BridgeHistory *history,
      * fwrite return would hand the user a launch command for something the
      * target agent then refuses to open. Validation is mandatory and a
      * failure is a failure. */
-    if (t->validate_import && !t->validate_import(result)) {
+    bool (*validate)(const BridgeImportResult *) =
+        degraded ? bridge_handoff_validate : t->validate_import;
+    if (validate && !validate(result)) {
         result_fail(result, result->error[0] ? NULL
                           : "Generated session failed validation; nothing was launched.");
         return false;
@@ -516,15 +528,52 @@ struct BridgeProc {
     bool  eof;
 };
 
+/* The process environment with every "NAME=value" of `set` in place of the
+ * variable of that name, as a malloc'd array of borrowed pointers (NULL when
+ * `set` is empty or on OOM). Built before fork: the child of a threaded
+ * process may not allocate. */
+static char **proc_env_with(const char *const set[]) {
+    if (!set || !set[0]) return NULL;
+    usize nenv = 0, nset = 0;
+    while (environ && environ[nenv]) nenv++;
+    while (set[nset]) nset++;
+    char **envp = calloc(nenv + nset + 1, sizeof *envp);
+    if (!envp) return NULL;
+    usize k = 0;
+    for (usize i = 0; i < nenv; i++) {
+        const char *eq = strchr(environ[i], '=');
+        usize name_len = eq ? (usize)(eq - environ[i]) : strlen(environ[i]);
+        bool replaced = false;
+        for (usize j = 0; j < nset && !replaced; j++)
+            replaced = strncmp(set[j], environ[i], name_len) == 0 && set[j][name_len] == '=';
+        if (!replaced) envp[k++] = environ[i];
+    }
+    for (usize j = 0; j < nset; j++) envp[k++] = (char *)set[j];
+    envp[k] = NULL;
+    return envp;
+}
+
 BridgeProc *bridge_proc_start(const char *const argv[]) {
+    return bridge_proc_start_env(argv, NULL);
+}
+
+BridgeProc *bridge_proc_start_env(const char *const argv[], const char *const env_set[]) {
     if (!argv || !argv[0]) return NULL;
+    char **envp = NULL;
+    if (env_set && env_set[0]) {
+        for (usize j = 0; env_set[j]; j++)
+            if (!strchr(env_set[j], '=') || env_set[j][0] == '=') return NULL;
+        envp = proc_env_with(env_set);
+        if (!envp) return NULL;
+    }
     int inp[2], outp[2];
-    if (pipe(inp) != 0) return NULL;
-    if (pipe(outp) != 0) { close(inp[0]); close(inp[1]); return NULL; }
+    if (pipe(inp) != 0) { free(envp); return NULL; }
+    if (pipe(outp) != 0) { close(inp[0]); close(inp[1]); free(envp); return NULL; }
 
     pid_t pid = fork();
     if (pid < 0) {
         close(inp[0]); close(inp[1]); close(outp[0]); close(outp[1]);
+        free(envp);
         return NULL;
     }
     if (pid == 0) {
@@ -536,10 +585,14 @@ BridgeProc *bridge_proc_start(const char *const argv[]) {
         int devnull = open("/dev/null", O_WRONLY);
         if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
         close(inp[0]); close(inp[1]); close(outp[0]); close(outp[1]);
+        /* execvp searches PATH in, and hands over, `environ`: pointing it at
+         * the prepared array is the one step the child takes. */
+        if (envp) environ = envp;
         execvp(argv[0], (char *const *)argv);
         _exit(127);
     }
 
+    free(envp);
     close(inp[0]);
     close(outp[1]);
 

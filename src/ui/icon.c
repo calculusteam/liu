@@ -123,6 +123,7 @@ static const char *const ICON_LUCIDE[ICON_COUNT] = {
     [ICON_HASH]           = "hash",
     [ICON_HISTORY]        = "history",
     [ICON_BRUSH]          = "brush",
+    [ICON_MAXIMIZE]       = "maximize-2",
 };
 _Static_assert(sizeof(ICON_LUCIDE) / sizeof(ICON_LUCIDE[0]) == ICON_COUNT,
                "ICON_LUCIDE must have exactly one row per IconKind");

@@ -40,13 +40,13 @@ static const char *arg_value(const char *arg, const char *key) {
  * Returns 0 for an unknown id; callers must reject that rather than pass it
  * on: chat_scan reads a mask of 0 as "scan everything", so the filter would
  * look like it worked while listing every agent. */
-static u32 parse_tools_mask(const char *s) {
+static ChatToolMask parse_tools_mask(const char *s) {
     if (!s || !*s) return 0;
     if (strcmp(s, "all") == 0)
         return (CHAT_TOOL_COUNT_ >= 32) ? 0xFFFFFFFFu
-                                        : ((1u << CHAT_TOOL_COUNT_) - 1u);
+                                        : (CHAT_TOOL_BIT(CHAT_TOOL_COUNT_) - 1u);
     ChatTool t = chat_tool_from_agent_id(s);
-    return (t == CHAT_TOOL_UNKNOWN) ? 0 : (1u << t);
+    return (t == CHAT_TOOL_UNKNOWN) ? 0 : CHAT_TOOL_BIT(t);
 }
 
 static u32 parse_roles(const char *s) {
@@ -109,7 +109,7 @@ static bool list_cb(const ChatSessionMeta *m, void *user) {
 }
 
 static int cmd_list(int argc, char **argv) {
-    u32 tools = 0;
+    ChatToolMask tools = 0;
     u32 limit = 20;
     for (int i = 0; i < argc; i++) {
         const char *v;

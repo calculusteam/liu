@@ -6,6 +6,7 @@
 #include "ui/fb_asset_icons.h"
 #include "ui/icon.h"
 #include "ui/anim.h"          /* ui_hover_amount — the shared hover engine */
+#include "ui/panel_ink.h"      /* its tints, as washes solved for linear blending */
 #include "ui/chrome_palette.h"
 #include "ui/md_live_lines.h"   /* the live editor's line classes and heights */
 #include "ui/line_scroll.h"      /* a wheel event as whole lines */
@@ -2225,7 +2226,7 @@ void fb_refresh(FileBrowser *fb) {
 static void fb_scroll_row_into_view(FileBrowser *fb, i32 i) {
     f32 row_h = fb->list_row_h, view = fb->viewport_height;
     if (row_h <= 0.0f || view <= 0.0f) return;
-    f32 top = (f32)i * row_h, bot = top + row_h;
+    f32 top = (f32)(i - fb_list_first(fb)) * row_h, bot = top + row_h;
     if (top < fb->scroll_offset_px) fb->scroll_offset_px = top;
     else if (bot > fb->scroll_offset_px + view) fb->scroll_offset_px = bot - view;
     if (fb->scroll_offset_px < 0.0f) fb->scroll_offset_px = 0.0f;
@@ -3286,21 +3287,13 @@ static void draw_text_clipped(Renderer *r, const char *text, f32 x, f32 y,
     if (trunc && *p) renderer_push_glyph(r, cx, y, 0x2026, fg);   /* … */
 }
 
-/* Column count of a UTF-8 string — the unit draw_text_clipped actually
- * advances in, one step per codepoint.
- *
- * strlen() counts BYTES, and using it as a column count silently over-measures
- * every non-ASCII string: "~/Masaüstü/" is 11 columns but 13 bytes, because
- * each 'ü' costs two. A caller that advanced the pen by that figure would
- * leave a gap exactly as wide as the extra bytes. */
+/* Code points in `s`: the cells draw_text_clipped steps through. */
 static usize fb_text_cols(const char *s) {
     return s ? utf8_len((const u8 *)s, strlen(s)) : 0;
 }
 
-/* Byte offset of the `n`-th codepoint (clamped to the terminator). Trimming a
- * string from the left has to land on a character boundary — a byte offset
- * derived from a column count can otherwise slice a multi-byte sequence in
- * half and render the remainder as mojibake. */
+/* Byte offset of the `n`-th code point (clamped to the terminator), so a
+ * string trimmed from the left starts on a character boundary. */
 static usize fb_utf8_skip(const char *s, usize n) {
     const u8 *p = (const u8 *)s;
     while (n > 0 && *p) {
@@ -3310,6 +3303,30 @@ static usize fb_utf8_skip(const char *s, usize n) {
         n--;
     }
     return (usize)((const char *)p - s);
+}
+
+/* The width draw_text_clipped gives `text` inside `max_w`: whole cells. */
+static f32 fb_text_drawn_w(const char *text, f32 step, f32 max_w) {
+    if (step <= 0.0f || max_w < step) return 0.0f;
+    f32 whole = (f32)fb_text_cols(text) * step;
+    f32 room  = floorf(max_w / step) * step;
+    return whole < room ? whole : room;
+}
+
+/* draw_text_clipped that loses the START instead of the end: an ellipsis,
+ * then as much of the end of `text` as fits, so a path keeps its nearest
+ * folders. */
+static void draw_text_tail(Renderer *r, const char *text, f32 x, f32 y, Color fg, f32 max_w) {
+    f32 step = g_ui_step > 0 ? g_ui_step : r->font.cell_width;
+    if (!text || step <= 0.0f || max_w < step) return;
+    usize cols = fb_text_cols(text);
+    usize fits = (usize)(max_w / step);
+    if (cols <= fits) { draw_text_clipped(r, text, x, y, fg, max_w); return; }
+    if (fits < 2) return;
+    font_warm_text_glyphs(&r->font, text);
+    renderer_push_glyph(r, x, y, 0x2026, fg);   /* … */
+    draw_text_clipped(r, text + fb_utf8_skip(text, cols - (fits - 1)), x + step, y, fg,
+                      max_w - step);
 }
 
 /* Map the semantic file-type kind (fb_icon_for) onto the monoline vector icon
@@ -3434,6 +3451,41 @@ void fb_file_icon_draw(Renderer *r, FbFileIcon icon, f32 x, f32 y,
     icon_draw(r, fb_minimal_icon(kind), x, y, size, tint);
 }
 
+/* Colours of the explorer panel, from the three its caller hands it. */
+typedef struct {
+    Color body;     /* names */
+    Color strong;   /* the folder's own name, a selected row's name */
+    Color muted;    /* hidden entries, the parent path, chevrons, folder icons */
+    Color faint;    /* sizes, the empty-folder line */
+} FbPanelInk;
+
+static f32 fb_ink_lum(Color c) { return 0.2126f * c.r + 0.7152f * c.g + 0.0722f * c.b; }
+
+static FbPanelInk fb_panel_ink(Color fg, Color bg) {
+    bool dark = fb_ink_lum(fg) > fb_ink_lum(bg);
+    f32 to = dark ? 1.0f : 0.0f;
+    FbPanelInk k;
+    k.body   = (Color){ fg.r, fg.g, fg.b, 1.0f };
+    k.strong = (Color){ fg.r + (to - fg.r) * 0.45f, fg.g + (to - fg.g) * 0.45f,
+                        fg.b + (to - fg.b) * 0.45f, 1.0f };
+    k.muted  = (Color){ fg.r, fg.g, fg.b, 0.58f };
+    k.faint  = (Color){ fg.r, fg.g, fg.b, 0.42f };
+    return k;
+}
+
+/* The rows a selected entry's level spans: its parent's children and their
+ * subtrees, whose indent guide at `level` is drawn brighter. */
+static void fb_active_guide(const FileBrowser *fb, i32 first, i32 *level, i32 *lo, i32 *hi) {
+    *level = -1; *lo = 0; *hi = -1;
+    i32 s = fb->selected;
+    if (s < first || s >= fb->entry_count || fb->entries[s].depth <= 0) return;
+    i32 d = fb->entries[s].depth;
+    i32 a = s, b = s;
+    while (a - 1 >= first && fb->entries[a - 1].depth >= d) a--;
+    while (b + 1 < fb->entry_count && fb->entries[b + 1].depth >= d) b++;
+    *level = d - 1; *lo = a; *hi = b;
+}
+
 void fb_render_sidebar(FileBrowser *fb, Renderer *r, f32 x, f32 y, f32 w, f32 h,
                        const Color *bg, const Color *fg, const Color *sel,
                        const Color *dim, const Color *accent, f32 dpi,
@@ -3442,228 +3494,127 @@ void fb_render_sidebar(FileBrowser *fb, Renderer *r, f32 x, f32 y, f32 w, f32 h,
      * flight has no entries yet, and this is the call that installs them. */
     fb_poll_async(fb);
     if (!fb->open || !fb->entries) return;
-    /* Use fixed UI-size step for sidebar text */
     f32 cw = 8.0f * dpi;
     f32 ch = 16.0f * dpi;
     g_ui_step = cw;
     renderer_set_ui_scale(r, cw, ch);
+    (void)sel; (void)accent;
 
-    /* No body fill. `bg` is the colour of the SURFACE this list is drawn on —
-     * the header tint and the scrollbar track are derived from it — and
-     * painting that surface is the caller's. The docked sidebar sits on the
-     * window's clear colour (render_sidebar), where a fill of the same colour
-     * would composite denser than the clear beneath it at opacity < 1; the
-     * file-browser tab paints its rail's well colour before calling. */
+    /* No body fill: `bg` is the panel's surface, painted by the caller. Rules
+     * follow its alpha so they fade with a translucent window. */
+    FbPanelInk ink = fb_panel_ink(*fg, *bg);
+    Color base = { bg->r, bg->g, bg->b, 1.0f };
+    f32 line = fmaxf(1.0f, floorf(CHROME_LINE_PT * dpi));
+    Color rule = panel_wash(base, *dim, 0.75f);
+    rule.a *= bg->a;
 
-    /* Borderless right edge — the list meets the pane beside it flush.
-     * border_clr lives on only as the thin horizontal rule under the
-     * breadcrumb header. */
-    Color border_clr = {dim->r + 0.02f, dim->g + 0.02f, dim->b + 0.02f, 0.62f};
-    f32 chrome_line = fmaxf(1.0f, CHROME_LINE_PT * dpi);
+    /* ---- header: the folder's name, its parent path, three buttons ------- */
+    f32 hdr_h = fb_list_hdr_h(dpi);
+    f32 hdr_cy = y + hdr_h * 0.5f;
+    renderer_draw_rect(r, x, y + hdr_h - line, w, line, rule);
 
-    /* CWD header — minimal, with path. Inherit alpha from the passed bg
-     * so the header fades together with the sidebar body when window
-     * opacity drops below 1.0 (otherwise the strip stays fully opaque
-     * over a translucent body and looks detached). */
-    /* Header strip is a compact SIDEBAR_HEADER_PT (not the full tab-bar
-     * height) so the breadcrumb sits snug under the tab bar instead of
-     * floating in a tall band of dead space above it. Kept in lockstep with
-     * the hit-test in hittest.c (both HIT_SIDEBAR spots). */
-    f32 hdr_h = SIDEBAR_HEADER_PT * dpi;
-    Color hdr_bg = {bg->r + 0.02f, bg->g + 0.02f, bg->b + 0.02f, bg->a};
-    renderer_draw_rect(r, x, y, w, hdr_h, hdr_bg);
-    Color hdr_sep = border_clr; hdr_sep.a *= bg->a;
-    renderer_draw_rect(r, x, y + hdr_h - 1, w, 1, hdr_sep);
-
-    /* CWD path */
-    const char *cwd = fb->cwd;
-    const char *home = getenv("HOME");
-    char short_cwd[256];
-    if (home && strncmp(cwd, home, strlen(home)) == 0)
-        snprintf(short_cwd, sizeof(short_cwd), "~%s", cwd + strlen(home));
-    else
-        snprintf(short_cwd, sizeof(short_cwd), "%s", cwd);
-
-
-    /* Header action icons — up / refresh / close, right-aligned. The 3*cw
-     * click zones are unchanged (mirrored by the HIT_SIDEBAR handler in
-     * src/main.c); only the visuals gain a hover chip + brighter icon. */
-    f32 btn_w  = FB_HDR_BTN_W_CELLS * cw;
-    /* Optically right-aligned: see fb_hdr_close_x. The ✕'s ink lands
-     * FB_HDR_PAD_PT from the panel edge, matching the breadcrumb's inset on
-     * the left instead of sitting several points further in. */
+    f32 btn_w = FB_HDR_BTN_W_CELLS * cw;
+    f32 hdr_icon = ui_icon_box_px(FB_HDR_ICON_PT, dpi);
     f32 close_ink_r = 0.0f;
-    icon_ink_insets(ICON_CLOSE, ui_icon_box_px(FB_HDR_ICON_PT, dpi),
-                    NULL, &close_ink_r);
-    f32 close_x   = fb_hdr_close_x(x, w, cw,
-                                   ui_icon_box_px(FB_HDR_ICON_PT, dpi),
-                                   close_ink_r, dpi);
+    icon_ink_insets(ICON_CLOSE, hdr_icon, NULL, &close_ink_r);
+    f32 close_x   = fb_hdr_close_x(x, w, cw, hdr_icon, close_ink_r, dpi);
     f32 refresh_x = close_x - btn_w;
     f32 up_x      = refresh_x - btn_w;
-
-    Color icon_idle  = { fg->r * 0.78f, fg->g * 0.78f, fg->b * 0.78f, 0.95f };
-    Color icon_hot   = { fg->r, fg->g, fg->b, 1.0f };               /* hovered up/refresh */
-    /* Close reads neutral at rest and only turns red under the pointer. A
-     * permanently red glyph sitting between two grey ones pulled the eye to the
-     * one control you rarely want, and made the row look unbalanced; the danger
-     * colour belongs to the moment you are about to click it. */
-    Color icon_close = icon_idle;
-    Color icon_close_hot = { 0.98f, 0.52f, 0.52f, 1.0f };
-
-    /* Path — breadcrumb, not a raw string.
-     *
-     * Clipping from the END would throw away the one part that matters: in a
-     * deep tree, the folder you are actually in. Here the current folder is
-     * drawn first at full strength and always fits; the parent trail fills
-     * whatever space is left, dimmed and elided from the LEFT so the nearest
-     * ancestors survive. A leading folder glyph anchors the row so short paths
-     * ("/") don't leave the left half empty. */
-    {
-        f32 path_x0 = ui_fb_row_icon_x(x, dpi);
-        f32 path_max = up_x - path_x0 - 6.0f * dpi;
-
-        /* Folder glyph, vertically centred on the row and hung on the shared
-         * ink rail (see FB_ROW_PAD_PT) so it stacks with the row icons below. */
-        f32 fico = ui_icon_box_px(FB_HDR_ICON_PT, dpi);   /* same box as the buttons */
-        f32 fico_ink = 0.0f;
-        icon_ink_insets(ICON_FT_FOLDER, fico, &fico_ink, NULL);
-        Color fico_clr = { fg->r * 0.55f, fg->g * 0.55f, fg->b * 0.55f, 0.9f };
-        icon_draw(r, ICON_FT_FOLDER, path_x0 - fico_ink,
-                  y + (hdr_h - fico) * 0.5f, fico, fico_clr);
-        f32 path_text_x = ui_fb_row_text_x(x, fico, dpi);
-        path_max -= path_text_x - path_x0;
-        path_x0   = path_text_x;
-
-        /* Split "a/b/c" into parent ("a/b/") and leaf ("c"). Root and a
-         * single-segment path have no parent, which the loop handles by
-         * leaving parent_len at 0. */
-        const char *leaf = short_cwd;
-        usize scl = strlen(short_cwd);
-        usize parent_len = 0;
-        if (scl > 1) {
-            /* Ignore a trailing slash so "/a/b/" still leafs to "b". */
-            usize end = (short_cwd[scl - 1] == '/') ? scl - 1 : scl;
-            for (usize i = end; i > 0; i--) {
-                if (short_cwd[i - 1] == '/') { leaf = short_cwd + i; parent_len = i; break; }
-            }
-        }
-
-        f32 text_y = y + (hdr_h - ch) / 2;
-        f32 leaf_w = (f32)fb_text_cols(leaf) * cw;
-        if (leaf_w > path_max) leaf_w = path_max;
-
-        Color leaf_clr   = { fg->r, fg->g, fg->b, 1.0f };
-        Color parent_clr = { fg->r * 0.62f, fg->g * 0.62f, fg->b * 0.62f, 1.0f };
-
-        /* Parent trail gets the leftover; elide from the left when short. */
-        f32 parent_avail = path_max - leaf_w;
-        if (parent_len > 0 && parent_avail > 3.0f * cw) {
-            char pbuf[512];
-            usize copy = parent_len < sizeof(pbuf) - 1 ? parent_len : sizeof(pbuf) - 1;
-            memcpy(pbuf, short_cwd, copy);
-            pbuf[copy] = '\0';
-
-            /* Everything here is in COLUMNS, not bytes — `copy` above is a byte
-             * length and must not be compared against a column budget. */
-            usize cols = fb_text_cols(pbuf);
-            usize fits = (usize)(parent_avail / cw);
-            const char *pstart = pbuf;
-            if (cols > fits && fits > 1) {
-                /* Keep the tail: drop the leading (cols - (fits-1)) characters,
-                 * resolved to a byte offset on a character boundary. */
-                pstart = pbuf + fb_utf8_skip(pbuf, cols - (fits - 1));
-                draw_text_clipped(r, "…", path_x0, text_y, parent_clr, cw);
-                path_x0 += cw;
-                parent_avail -= cw;
-            }
-            f32 pw = (f32)fb_text_cols(pstart) * cw;
-            if (pw > parent_avail) pw = parent_avail;
-            draw_text_clipped(r, pstart, path_x0, text_y, parent_clr, pw);
-            path_x0 += pw;
-        }
-        draw_text_clipped(r, leaf, path_x0, text_y, leaf_clr, leaf_w);
-    }
-
-    /* One square box for every control in this row.
-     *
-     * Both axes of the hover chip come from the same number, so the three
-     * buttons read as the same shape whichever one is hovered, and the glyph
-     * inside uses the shared even-pixel icon box so the three icons are
-     * identical in size and land on whole pixels. */
-    f32 chip_sz = ui_icon_box_px(FB_HDR_CHIP_PT, dpi);
-    if (chip_sz > hdr_h - 4.0f * dpi) chip_sz = hdr_h - 4.0f * dpi;
-    if (chip_sz > btn_w)              chip_sz = btn_w;
-    f32 hdr_icon   = ui_icon_box_px(FB_HDR_ICON_PT, dpi);
-    f32 hdr_icon_y = y + (hdr_h - hdr_icon) * 0.5f;
-    f32 chip_w  = chip_sz;
-    f32 chip_h  = chip_sz;
-    f32 chip_yy = y + (hdr_h - chip_h) * 0.5f;
-    f32 chip_r  = 7.0f * dpi;
+    f32 chip      = fminf(ui_icon_box_px(FB_PANEL_BTN_PT, dpi), fminf(btn_w, hdr_h - 4.0f * dpi));
 
     struct { f32 bx; i32 icon; bool is_close; } hbtns[3] = {
         { up_x,      ICON_UP,      false },
         { refresh_x, ICON_REFRESH, false },
         { close_x,   ICON_CLOSE,   true  },
     };
-    /* Pass 1: hover chips (rrects), flushed before the icons. */
     for (i32 b = 0; b < 3; b++) {
-        bool hot = ui_hover_hit(hbtns[b].bx, y, btn_w, hdr_h, hover_x, hover_y);
-        if (!hot) continue;
-        Color chip = hbtns[b].is_close
-            ? (Color){ 0.86f, 0.42f, 0.42f, 0.18f }
-            : (Color){ fg->r, fg->g, fg->b, 0.12f };
-        renderer_draw_rrect_simple(r, hbtns[b].bx + (btn_w - chip_w) * 0.5f,
-                                   chip_yy, chip_w, chip_h, chip, chip_r);
+        if (!ui_hover_hit(hbtns[b].bx, y, btn_w, hdr_h, hover_x, hover_y)) continue;
+        Color c = hbtns[b].is_close ? panel_wash(base, (Color){ 0.90f, 0.36f, 0.36f, 1.0f }, 0.22f)
+                                    : panel_wash(base, *fg, 0.11f);
+        renderer_draw_rrect_simple(r, floorf(hbtns[b].bx + (btn_w - chip) * 0.5f),
+                                   floorf(hdr_cy - chip * 0.5f), chip, chip, c,
+                                   FB_PANEL_BTN_RADIUS_PT * dpi);
     }
+    renderer_flush_rects(r);
     renderer_flush_rrects(r);
-    /* Pass 2: icons. */
     for (i32 b = 0; b < 3; b++) {
         bool hot = ui_hover_hit(hbtns[b].bx, y, btn_w, hdr_h, hover_x, hover_y);
-        Color ic = hbtns[b].is_close ? (hot ? icon_close_hot : icon_close)
-                                     : (hot ? icon_hot : icon_idle);
-        icon_draw(r, hbtns[b].icon,
-                  hbtns[b].bx + (btn_w - hdr_icon) * 0.5f, hdr_icon_y,
-                  hdr_icon, ic);
+        Color ic = !hot ? ink.muted
+                 : hbtns[b].is_close ? (Color){ 0.98f, 0.52f, 0.52f, 1.0f } : ink.strong;
+        icon_draw(r, hbtns[b].icon, floorf(hbtns[b].bx + (btn_w - hdr_icon) * 0.5f),
+                  floorf(hdr_cy - hdr_icon * 0.5f), hdr_icon, ic);
     }
 
+    {
+        /* The folder's own name first and in full where it fits; the path
+         * above it after, dimmed, losing its START when short of room, so the
+         * nearest parents are what stays. */
+        const char *cwd = fb->cwd;
+        const char *home = getenv("HOME");
+        char short_cwd[FB_MAX_PATH];
+        usize hl = home ? strlen(home) : 0;
+        if (hl > 1 && strncmp(cwd, home, hl) == 0 && (cwd[hl] == '/' || cwd[hl] == '\0'))
+            snprintf(short_cwd, sizeof short_cwd, "~%s", cwd + hl);
+        else
+            snprintf(short_cwd, sizeof short_cwd, "%s", cwd);
+        usize scl = strlen(short_cwd);
+        if (scl > 1 && short_cwd[scl - 1] == '/') short_cwd[--scl] = '\0';
+        char parent[FB_MAX_PATH] = "";
+        const char *leaf = short_cwd;
+        for (usize i = scl; i > 0; i--) {
+            if (short_cwd[i - 1] != '/') continue;
+            if (i > 1 && i < scl) {
+                usize pl = i - 1 < sizeof parent - 1 ? i - 1 : sizeof parent - 1;
+                memcpy(parent, short_cwd, pl);
+                parent[pl] = '\0';
+                leaf = short_cwd + i;
+            } else if (i == 1 && scl > 1) {
+                snprintf(parent, sizeof parent, "/");
+                leaf = short_cwd + 1;
+            }
+            break;
+        }
+
+        f32 fx = x + FB_PANEL_PAD_PT * dpi;
+        f32 fico_ink = 0.0f;
+        icon_ink_insets(ICON_FT_FOLDER, hdr_icon, &fico_ink, NULL);
+        icon_draw(r, ICON_FT_FOLDER, floorf(fx - fico_ink), floorf(hdr_cy - hdr_icon * 0.5f),
+                  hdr_icon, ink.muted);
+        f32 tx = fx + hdr_icon + 7.0f * dpi;
+        f32 ty = hdr_cy - ch * 0.5f;
+        f32 room = up_x + (btn_w - chip) * 0.5f - 6.0f * dpi - tx;
+        if (room >= cw) {
+            draw_text_clipped(r, leaf, tx, ty, ink.strong, room);
+            f32 px = tx + fb_text_drawn_w(leaf, cw, room) + cw;
+            f32 prem = tx + room - px;
+            if (parent[0] && prem > 3.0f * cw)
+                draw_text_tail(r, parent, px, ty, ink.muted, prem);
+        }
+    }
     renderer_flush_rects(r);
     renderer_flush_glyphs(r);
 
-    /* File entries -- virtualized: only render visible entries. One uniform
-     * row height (text cell + equal top/bottom padding, see layout.h); every
-     * per-row element centres inside it so the breathing room is identical
-     * above and below on all rows. */
-    f32 entry_h = FB_ENTRY_H(ch, dpi);
+    /* ---- rows ------------------------------------------------------------ */
+    f32 row_h = fb_list_row_h(dpi);
     f32 list_y = y + hdr_h;
     f32 viewport_h = h - hdr_h;
-    /* Rows hang off the same ink rail as the header breadcrumb — see
-     * FB_ROW_PAD_PT in layout.h for why this is one constant and not two. */
-    f32 row_icon_rail = ui_fb_row_icon_x(x, dpi);
+    i32 first = fb_list_first(fb);
+    i32 rows = fb->entry_count - first;
 
-    /* Update content/viewport metrics for scroll clamping */
-    fb->content_height = (f32)fb->entry_count * entry_h;
+    fb->content_height = (f32)rows * row_h;
     fb->viewport_height = viewport_h;
-    fb->list_row_h = entry_h;
-
-    /* Sync pixel scroll offset from legacy integer offset (first-time migration) */
-    if (fb->scroll_offset_px == 0.0f && fb->scroll_offset > 0) {
-        fb->scroll_offset_px = (f32)fb->scroll_offset * entry_h;
-    }
-
-    /* Clamp scroll offset */
-    f32 max_scroll = fb->content_height - viewport_h;
-    if (max_scroll < 0) max_scroll = 0;
+    fb->list_row_h = row_h;
+    if (fb->scroll_offset_px == 0.0f && fb->scroll_offset > 0)
+        fb->scroll_offset_px = (f32)fb->scroll_offset * row_h;
+    f32 max_scroll = fmaxf(0.0f, fb->content_height - viewport_h);
     if (fb->scroll_offset_px < 0) fb->scroll_offset_px = 0;
     if (fb->scroll_offset_px > max_scroll) fb->scroll_offset_px = max_scroll;
 
-    /* Compute visible entry range (virtual scrolling) */
-    i32 first_visible = (i32)(fb->scroll_offset_px / entry_h);
-    i32 last_visible  = first_visible + (i32)(viewport_h / entry_h) + 2; /* +2 for partial entries */
-    if (first_visible < 0) first_visible = 0;
-    if (last_visible > fb->entry_count) last_visible = fb->entry_count;
-
-    /* Partial-entry Y offset for smooth sub-entry scrolling */
-    f32 sub_offset = fb->scroll_offset_px - (f32)first_visible * entry_h;
+    i32 r0 = (i32)(fb->scroll_offset_px / row_h);
+    i32 r1 = r0 + (i32)(viewport_h / row_h) + 2;
+    if (r0 < 0) r0 = 0;
+    if (r1 > rows) r1 = rows;
+    f32 sub_offset = fb->scroll_offset_px - (f32)r0 * row_h;
 
     /* The worker's finished stats, before the rows that asked for them are
      * drawn: a row painted this frame shows the figure it asked for last
@@ -3672,109 +3623,108 @@ void fb_render_sidebar(FileBrowser *fb, Renderer *r, f32 x, f32 y, f32 w, f32 h,
     /* The rows are clipped to the LIST, not to the section. The list scrolls
      * by the pixel, so the first row is usually part-way above `list_y` — and
      * with only the caller's clip (header + list) that part would be painted
-     * over the breadcrumb header, row text across the path. Scissors do not
-     * nest: the caller's clip is this function's own rect, and it is put back
-     * after the loop. */
+     * over the header. Scissors do not nest: the caller's clip is this
+     * function's own rect, and it is put back after the rows, whose glyphs
+     * are flushed before that. */
     renderer_push_scissor(r, x, list_y, w, viewport_h);
-    for (i32 i = first_visible; i < last_visible; i++) {
+
+    f32 pad    = FB_PANEL_ROW_PAD_PT * dpi;
+    f32 indent = FB_PANEL_INDENT_PT * dpi;
+    f32 chev   = ui_icon_box_px(FB_PANEL_CHEV_PT, dpi);
+    f32 icon   = ui_icon_box_px(FB_PANEL_ICON_PT, dpi);
+    f32 icon_dx = (FB_PANEL_CHEV_PT + FB_PANEL_CHEV_GAP_PT) * dpi;
+    f32 name_dx = icon_dx + FB_PANEL_ICON_PT * dpi + FB_PANEL_ICON_GAP_PT * dpi;
+    bool show_size = w >= FB_PANEL_SIZE_MIN_W_PT * dpi;
+    i32 act_level, act_lo, act_hi;
+    fb_active_guide(fb, first, &act_level, &act_lo, &act_hi);
+
+    /* Pass 1, flat fills: row states and indent guides. A row's state changes
+     * only its fill, and only by a step of the text colour: the selected row
+     * is a shade above a hovered one, with no rim and no accent, so a click
+     * marks where the keys will act without reading as a highlight. */
+    Color hov_bg   = panel_wash(base, *fg, 0.045f);
+    Color sel_bg   = panel_wash(base, *fg, 0.075f);
+    Color guide    = panel_wash(base, *fg, 0.10f);
+    Color guide_on = panel_wash(base, *fg, 0.26f);
+    for (i32 ri = r0; ri < r1; ri++) {
+        i32 i = first + ri;
+        const FileEntry *e = &fb->entries[i];
+        f32 ey = list_y + (f32)(ri - r0) * row_h - sub_offset;
+        if (ey + row_h < list_y || ey > list_y + viewport_h) continue;
+        bool in_sel = fb_sel_has(fb, i) || i == fb->selected;
+        if (in_sel)                      renderer_draw_rect(r, x, ey, w, row_h, sel_bg);
+        else if (i == fb->hover_entry)   renderer_draw_rect(r, x, ey, w, row_h, hov_bg);
+        i32 depth = e->depth > 0 ? e->depth : 0;
+        for (i32 lv = 0; lv < depth; lv++) {
+            f32 gx = floorf(x + pad + (f32)lv * indent + chev * 0.5f);
+            bool on = lv == act_level && i >= act_lo && i <= act_hi;
+            renderer_draw_rect(r, gx, ey, line, row_h, on ? guide_on : guide);
+        }
+    }
+    renderer_flush_rects(r);
+
+    /* Pass 2: chevrons and icons draw now; names and sizes go to the glyph
+     * batch flushed below, still under the list's clip. */
+    for (i32 ri = r0; ri < r1; ri++) {
+        i32 i = first + ri;
         FileEntry *e = &fb->entries[i];
-        f32 ey = list_y + (f32)(i - first_visible) * entry_h - sub_offset;
+        f32 ey = list_y + (f32)(ri - r0) * row_h - sub_offset;
+        if (ey + row_h < list_y || ey > list_y + viewport_h) continue;
+        f32 cy = ey + row_h * 0.5f;
+        bool in_sel = fb_sel_has(fb, i) || i == fb->selected;
+        bool hidden = e->name[0] == '.';
+        f32 lx = x + pad + fminf((f32)(e->depth > 0 ? e->depth : 0) * indent,
+                                 fmaxf(0.0f, w - 140.0f * dpi));
 
-        /* Cull entries completely outside viewport */
-        if (ey + entry_h < list_y || ey > list_y + viewport_h) continue;
-
-        /* Row states share ONE rect (full row, full width) so every entry
-         * keeps the same visual shape — only the background colour changes:
-         * hover = faint fg tint, selection = the stronger sel fill. The
-         * "primary" (last-clicked) additionally gets the left accent bar so
-         * the cursor-style focus ring remains visible in a sea of selections. */
-        bool sel_hit = fb_sel_has(fb, i) || i == fb->selected;
-        if (sel_hit) {
-            Color sel_bg = {sel->r, sel->g, sel->b, 0.32f};
-            renderer_draw_rect(r, x, ey, w, entry_h, sel_bg);
-        } else if (i == fb->hover_entry) {
-            Color hov_bg = {fg->r, fg->g, fg->b, 0.09f};
-            renderer_draw_rect(r, x, ey, w, entry_h, hov_bg);
-        }
-        if (i == fb->selected) {
-            renderer_draw_rect(r, x, ey, fmaxf(2.0f, 2.0f * chrome_line), entry_h,
-                              *accent);
-        }
-
-        /* Draw one monoline icon per row; choose color by entry type and
-         * hidden state. Render .. with the parent-directory arrow. */
-        f32 icon_size = ui_icon_box_px(FB_LIST_ICON_PT, dpi);
-        f32 icon_y  = ey + (entry_h - icon_size) / 2;
-        bool is_up = (strcmp(e->name, "..") == 0);
-        /* Reserve the disclosure slot for files too, so siblings align. */
-        f32 indent = fminf(e->depth * FB_TREE_INDENT_PT * dpi,
-                          fmaxf(0.0f, w - 140.0f * dpi));
-        f32 disclosure_x = row_icon_rail + indent;
-        f32 tree_icon_x = disclosure_x +
-                          (FB_TREE_DISCLOSURE_PT + FB_TREE_DISCLOSURE_GAP_PT) * dpi;
-        if (e->is_dir && !is_up) {
-            f32 size = FB_TREE_DISCLOSURE_PT * dpi;
-            Color arrow = (i == fb->selected) ? *fg : *dim;
-            if (e->tree_pending) arrow.a *= 0.6f;
+        if (e->is_dir) {
+            Color cc = in_sel || i == fb->hover_entry ? ink.body : ink.muted;
+            if (e->tree_pending) cc.a *= 0.6f;
             icon_draw(r, e->expanded ? ICON_CHEVRON_DOWN : ICON_CHEVRON_RIGHT,
-                      disclosure_x, ey + (entry_h - size) * 0.5f, size, arrow);
+                      floorf(lx), floorf(cy - chev * 0.5f), chev, cc);
         }
 
-        if (is_up) {
-            f32 up_ink = 0.0f;
-            icon_ink_insets(ICON_UP, icon_size, &up_ink, NULL);
-            icon_draw(r, ICON_UP, tree_icon_x - up_ink, icon_y, icon_size, *dim);
-        } else {
-            bool subdued = (e->name[0] == '.');
-            Color ic_c;
-            if (subdued)        ic_c = (Color){dim->r, dim->g, dim->b, 0.72f};
-            else if (e->is_dir) ic_c = *accent;
-            else                ic_c = (Color){fg->r * 0.66f, fg->g * 0.66f,
-                                               fg->b * 0.66f, 0.95f};
-            /* A file's Seti icon in Seti's colour (only the alpha above
-             * applies to it), the monoline folder otherwise — the same call
-             * the editor tab makes for its pill. */
-            FbFileIcon ik = fb_file_icon_kind(e->name, e->is_dir);
-            f32 ik_ink = fb_file_icon_ink_left(ik, icon_size);
-            fb_file_icon_draw(r, ik, tree_icon_x - ik_ink, icon_y, icon_size, ic_c);
-        }
+        /* A file's Seti icon in Seti's colour (only the alpha applies to it);
+         * a folder is the monoline folder in the muted ink. The same call the
+         * editor tab makes for its pill. */
+        Color ic = e->is_dir ? ink.muted
+                             : (Color){ fg->r, fg->g, fg->b, hidden ? 0.78f : 1.0f };
+        if (e->is_dir && hidden) ic.a *= 0.75f;
+        FbFileIcon ik = fb_file_icon_kind(e->name, e->is_dir);
+        f32 ix = lx + icon_dx;
+        fb_file_icon_draw(r, ik, floorf(ix - fb_file_icon_ink_left(ik, icon)),
+                          floorf(cy - icon * 0.5f), icon, ic);
 
-        /* Name -- with proper font color */
-        f32 name_x = tree_icon_x + icon_size + FB_LIST_ICON_GAP_PT * dpi;
-        Color name_clr = *fg;
-        if (e->name[0] == '.') name_clr = (Color){dim->r, dim->g, dim->b, 0.72f};
-        /* ".." stays the same accent colour as dirs so it reads as nav, not dim */
-        if (is_up)            name_clr = *accent;
+        f32 nx = lx + name_dx;
+        bool sized = show_size && !e->is_dir;
+        f32 name_room = x + w - nx - FB_PANEL_PAD_PT * dpi - (sized ? FB_PANEL_SIZE_COL_PT * dpi : 0.0f);
+        Color nc = in_sel ? ink.strong : hidden ? ink.muted : ink.body;
+        f32 ty = cy - ch * 0.5f;
+        if (name_room > 0.0f) draw_text_clipped(r, e->name, nx, ty, nc, name_room);
 
-        bool show_size = w >= 300.0f * dpi && !e->is_dir;
-        f32 max_name_w = fmaxf(0.0f, w - (name_x - x) - 12.0f * dpi -
-                              (show_size ? 8 * cw : 0));
-        const char *display = is_up ? ".. (up)" : e->name;
-        draw_text_clipped(r, display, name_x, ey + (entry_h - ch) / 2, name_clr, max_name_w);
-
-        /* Show no value until stat completes to avoid displaying a temporary
-         * zero. */
-        if (show_size) {
-            fb_entry_ensure_stat(fb, e);
-        }
-        if (show_size && e->stat_known) {
+        /* No figure until the stat completes: a temporary zero would read as
+         * an empty file. */
+        if (sized) fb_entry_ensure_stat(fb, e);
+        if (sized && e->stat_known) {
             const char *sz = fb_format_size(e->size);
-            f32 sz_w = (f32)strlen(sz) * cw;
-            /* `dim` is already the theme's muted foreground; halving its alpha
-             * on top of that dropped the size column to roughly a quarter of
-             * the row's contrast and made it unreadable against the panel.
-             * Dimmed relative to the filename is the intent — invisible is not. */
-            Color sz_clr = {dim->r, dim->g, dim->b, 0.85f};
-            draw_text_clipped(r, sz, x + w - sz_w - 10, ey + (entry_h - ch) / 2, sz_clr, sz_w);
+            f32 sw = fb_text_drawn_w(sz, cw, FB_PANEL_SIZE_COL_PT * dpi);
+            draw_text_clipped(r, sz, x + w - FB_PANEL_PAD_PT * dpi - sw, ty, ink.faint, sw);
         }
     }
 
-    renderer_push_scissor(r, x, y, w, h);     /* back to the caller's clip (see above the loop) */
+    /* An empty folder says so, where its first row would be. */
+    if (rows == 0 && !fb_local_listing_active(fb) && !fb->sftp_list_job) {
+        draw_text_clipped(r, "This folder is empty", x + pad + icon_dx,
+                          list_y + (row_h - ch) * 0.5f + 4.0f * dpi,
+                          ink.faint, w - pad - icon_dx - FB_PANEL_PAD_PT * dpi);
+    }
+    renderer_flush_rects(r);
+    renderer_flush_glyphs(r);
 
-    /* Scrollbar -- only draw when content exceeds viewport, and only while it
-     * has something to say: an overlay that appears when the pointer is in the
-     * sidebar or the list moves, and fades out on its own a couple of seconds
-     * after the pointer leaves (ui_autohide_alpha, anim.h). */
+    renderer_push_scissor(r, x, y, w, h);     /* back to the caller's clip (see above the rows) */
+
+    /* Scrollbar: a thumb with no track, only while it has something to say —
+     * while the pointer is over the panel or the list moves, fading out a
+     * moment after (ui_autohide_alpha, anim.h). */
     if (fb->content_height > viewport_h && viewport_h > 0) {
         bool ptr_inside = ui_hover_hit(x, y, w, h, hover_x, hover_y);
         /* Every scroll source — wheel, keyboard row navigation, a navigate
@@ -3786,23 +3736,16 @@ void fb_render_sidebar(FileBrowser *fb, Renderer *r, f32 x, f32 y, f32 w, f32 h,
         }
         if (ptr_inside) fb->sb_active_t = platform_time_sec();
         f32 sb_alpha = ui_autohide_alpha(fb->sb_active_t, ptr_inside);
-
         if (sb_alpha > 0.004f) {
-            f32 bar_w = 4 * dpi;
-            f32 bar_x = x + w - bar_w - 2;
-            f32 thumb_h = (viewport_h / fb->content_height) * viewport_h;
-            if (thumb_h < 20 * dpi) thumb_h = 20 * dpi;  /* minimum thumb size */
-            f32 scroll_range = viewport_h - thumb_h;
-            f32 thumb_y = list_y + (fb->scroll_offset_px / max_scroll) * scroll_range;
-
-            /* Track + thumb — also follow the sidebar's window opacity so the
-             * scrollbar doesn't pop opaque over a translucent panel. */
-            Color track_clr = {bg->r + 0.03f, bg->g + 0.03f, bg->b + 0.03f,
-                               0.3f * bg->a * sb_alpha};
-            renderer_draw_rect(r, bar_x, list_y, bar_w, viewport_h, track_clr);
-            Color thumb_clr = {fg->r * 0.5f, fg->g * 0.5f, fg->b * 0.5f,
-                               0.4f * bg->a * sb_alpha};
-            renderer_draw_rect(r, bar_x, thumb_y, bar_w, thumb_h, thumb_clr);
+            f32 bar_w = FB_PANEL_SCROLL_W_PT * dpi;
+            f32 bar_x = x + w - bar_w - 2.0f * dpi;
+            f32 thumb_h = fmaxf((viewport_h / fb->content_height) * viewport_h, 24.0f * dpi);
+            f32 thumb_y = list_y + 2.0f * dpi +
+                          (fb->scroll_offset_px / max_scroll) * (viewport_h - thumb_h - 4.0f * dpi);
+            Color thumb = panel_wash(base, *fg, 0.28f);
+            thumb.a *= bg->a * sb_alpha;
+            renderer_draw_rrect_simple(r, bar_x, thumb_y, bar_w, thumb_h, thumb, bar_w * 0.5f);
+            renderer_flush_rrects(r);
         }
     }
 
@@ -6330,9 +6273,7 @@ void fb_render_viewer(FileBrowser *fb, Renderer *r, f32 x, f32 y, f32 w, f32 h,
             cw = ui_cw; ch = ui_ch;
             renderer_flush_glyphs(r);
             renderer_set_ui_scale(r, cw, ch);
-            f32 sui_h = (r->font.cell_width > 0.0f)
-                      ? cw * (r->font.cell_height / r->font.cell_width) : ch;
-            f32 slabel_y = status_y + (status_h - sui_h) * 0.5f;
+            f32 slabel_y = renderer_ui_cap_center_y(r, status_y, status_h);
             Color s_fg  = { fg_color.r, fg_color.g, fg_color.b, 0.70f * opacity };
             Color s_dim = { fg_color.r, fg_color.g, fg_color.b, 0.46f * opacity };
 
@@ -6444,23 +6385,19 @@ void fb_render_viewer(FileBrowser *fb, Renderer *r, f32 x, f32 y, f32 w, f32 h,
         f32 title_text_x = x + title_pad;
         f32 title_max_w = info_right - title_text_x - 8.0f * dpi;
         if (title_max_w < 0.0f) title_max_w = 0.0f;
-        /* True drawn glyph height. UI text is rasterized to the font's real
-         * cell aspect (taller than the layout's nominal `ch` for fonts like
-         * JetBrains Mono), so centering by `ch` parks text slightly low and
-         * looks cramped inside tight controls. Center by the actual height. */
-        f32 ui_glyph_h = (r->font.cell_width > 0.0f)
-                       ? cw * (r->font.cell_height / r->font.cell_width) : ch;
+        /* One baseline for the bar's text — the name, the counts and the
+         * switch's labels — with the capitals centred in the bar. */
+        f32 text_y = renderer_ui_cap_center_y(r, y, title_h);
         if (show_stats) {
             Color stats_fg = { fg_color.r, fg_color.g, fg_color.b, 0.42f * opacity };
-            draw_text_clipped(r, stats_buf, stats_x,
-                              y + (title_h - ui_glyph_h) * 0.5f, stats_fg, stats_w + cw);
+            draw_text_clipped(r, stats_buf, stats_x, text_y, stats_fg, stats_w + cw);
         }
         /* Filename with a dimmed extension: the stem reads at full strength
          * and the ".md" tail recedes, giving the title a touch of typographic
          * hierarchy instead of one flat run. A leading-dot dotfile (".bashrc")
          * has no stem, so draw it whole. */
         {
-            f32 name_y = y + (title_h - ui_glyph_h) * 0.5f;
+            f32 name_y = text_y;
             const char *ext = strrchr(fname, '.');
             if (ext && ext != fname) {
                 char stem[256];
@@ -6539,7 +6476,7 @@ void fb_render_viewer(FileBrowser *fb, Renderer *r, f32 x, f32 y, f32 w, f32 h,
             Color active_fg = chrome_legible_on(thumb);
             active_fg.a = 0.96f * opacity;
             Color inactive_fg = { fg_color.r, fg_color.g, fg_color.b, 0.46f * opacity };
-            f32 label_y = y + (title_h - ui_glyph_h) * 0.5f;
+            f32 label_y = text_y;
             draw_text_clipped(r, render_lbl,
                               toggle_x + (render_seg - render_w) * 0.5f, label_y,
                               raw_on ? inactive_fg : active_fg, render_w);
@@ -8889,13 +8826,9 @@ bool fb_editor_click_caret(FileBrowser *fb, f32 mx, f32 my) {
 
 bool fb_handle_click(FileBrowser *fb, f32 rel_x, f32 rel_y, f32 w, f32 h, f32 dpi) {
     (void)w; (void)rel_x; (void)h;
-    f32 ch = 16.0f * dpi;  /* match UI scale used in render */
-    f32 hdr_h = SIDEBAR_HEADER_PT * dpi;
-    f32 entry_h = FB_ENTRY_H(ch, dpi);   /* single source of truth: layout.h */
+    if (rel_y < fb_list_hdr_h(dpi)) return true; /* header click */
 
-    if (rel_y < hdr_h) return true; /* header click */
-
-    i32 idx = (i32)((rel_y - hdr_h + fb->scroll_offset_px) / entry_h);
+    i32 idx = fb_list_entry_at(fb, rel_y, dpi);
     if (idx >= 0 && idx < fb->entry_count) {
         fb->selected = idx;
         fb_sel_clear(fb);
@@ -9526,13 +9459,9 @@ void fb_handle_scroll(FileBrowser *fb, f32 dy, bool precise) {
     if (max_scroll < 0) max_scroll = 0;
     if (fb->scroll_offset_px > max_scroll) fb->scroll_offset_px = max_scroll;
 
-    /* Keep legacy integer offset in sync for hit-testing. Derive the exact
-     * per-row height from the render-updated content metrics when available
-     * (content_height = entry_count * entry_h) instead of a hardcoded guess
-     * that drifts whenever the row height changes in layout.h. */
-    f32 entry_h = (fb->entry_count > 0 && fb->content_height > 0.0f)
-                ? fb->content_height / (f32)fb->entry_count
-                : FB_ENTRY_H(16.0f, 1.0f);
+    /* Keep the legacy integer offset in sync, in rows of the height the list
+     * was last drawn at. */
+    f32 entry_h = fb->list_row_h > 0.0f ? fb->list_row_h : fb_list_row_h(1.0f);
     fb->scroll_offset = (i32)(fb->scroll_offset_px / entry_h);
     if (fb->scroll_offset < 0) fb->scroll_offset = 0;
     if (fb->scroll_offset >= fb->entry_count) fb->scroll_offset = fb->entry_count - 1;

@@ -6,6 +6,7 @@
 #include "core/memory.h"
 #include "core/string_utils.h"
 #include "core/theme_import.h"
+#include "core/config.h"
 #include "core/net.h"
 #include "ui/palette.h"
 #include "core/sites.h"   /* Site/SiteManager for the launcher mode */
@@ -14,6 +15,7 @@
 #include "history/parser.h"
 #include "history/session.h"
 #include "history/session_title.h"
+#include "agentctl/agentctl_delegated.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -357,6 +359,13 @@ static const char *g_commands_static[] = {
     "Close Tab",
     "Split Horizontal",
     "Split Vertical",
+    "Focus Pane Left",        /* the keyboard to the pane on that side */
+    "Focus Pane Right",
+    "Focus Pane Above",
+    "Focus Pane Below",
+    "Next Pane",              /* the panes in reading order, wrapping */
+    "Previous Pane",
+    "Toggle Pane Zoom",       /* the focused pane fills the tab, or the layout comes back */
     "Toggle Sidebar",
     "Customize Sidebar",     /* the sidebar's own settings popover */
     "Toggle File Browser",
@@ -411,6 +420,11 @@ static const char *g_commands_static[] = {
     "Select Element",         /* arm browser pick mode → paste to agent */
     "Attach Element",         /* re-send last picked element to agent */
     "Agent History",          /* push palette into history mode (Claude/Codex/Copilot) */
+    "Delegate to Codex",      /* a job written here, run beside the focused pane (agentctl) */
+    "Delegate to Claude Code",
+    "Delegate to Gemini",
+    "Delegate to OpenCode",
+    "Agent Team",             /* every delegated agent of the window: state, files, spend */
     "Folder History",         /* folders a command was run in — cd the pane there */
     "Go to Heading",          /* push palette into markdown outline mode */
     "Open Note",              /* push palette into markdown quick switcher */
@@ -890,6 +904,13 @@ static const char *tool_display(ChatTool t) {
         case CHAT_TOOL_OMP:         return "Oh My Pi";
         case CHAT_TOOL_OPENCLAW:    return "OpenClaw";
         case CHAT_TOOL_HERMES:      return "Hermes";
+        case CHAT_TOOL_DEVIN:       return "Devin";
+        case CHAT_TOOL_QODER:       return "Qoder";
+        case CHAT_TOOL_LETTA:       return "Letta Code";
+        case CHAT_TOOL_MASTRACODE:  return "Mastra Code";
+        case CHAT_TOOL_MAKI:        return "Maki";
+        case CHAT_TOOL_MUSE:        return "Muse Code";
+        case CHAT_TOOL_PRIME:       return "Prime Agent";
         default:                    return chat_tool_name(t);
     }
 }
@@ -1121,6 +1142,7 @@ typedef struct {
     f64              title_spent;             /* seconds of reading so far */
     i32              title_read, title_known; /* files read / answers remembered */
     i32              title_named;             /* rows that got a title */
+    const char      *delegated;               /* sessions delegated agents ran (agentctl_delegated.h) */
 } HistScanCtx;
 
 static f64 hist_now_sec(void) {
@@ -1231,6 +1253,16 @@ static bool history_scan_cb(const ChatSessionMeta *m, void *user) {
                  agent, short_sid, ts, sz);
     }
 
+    /* A session a delegated agent ran for another: said so, with what the
+     * job was and who asked */
+    char deleg[200];
+    if (ctx->delegated && agentctl_delegated_lookup(ctx->delegated, m->session_id, deleg, sizeof deleg, NULL, 0)) {
+        char rest[sizeof it->detail];
+        snprintf(rest, sizeof rest, "%s", it->detail);
+        snprintf(it->detail, sizeof it->detail, "delegated%s%s  \xc2\xb7  %s", deleg[0] ? ": " : "", deleg, rest);
+        hist_utf8_trim_tail(it->detail);
+    }
+
     /* Named by its first prompt when there is one: the prompt is the first
      * line and the project leads the second. Without one the project is
      * above and the rest below. */
@@ -1279,9 +1311,13 @@ static void *hist_worker_main(void *arg) {
             /* Scratch for reading titles: one line at a time, reset per line. */
             Arena ta = arena_create(HIST_TITLE_ARENA_BYTES);
             if (ta.base) mem_budget_transient_adjust(MEM_HISTORY, (isize)HIST_TITLE_ARENA_BYTES);
-            HistScanCtx ctx = { &hs, ta.base ? &ta : NULL, 0.0, 0, 0, 0 };
+            HistScanCtx ctx = { &hs, ta.base ? &ta : NULL, 0.0, 0, 0, 0, NULL };
+            /* the config folder was worked out at launch, before any scan */
+            char *delegated = agentctl_delegated_read(config_user_dir());
+            ctx.delegated = delegated;
             hist_title_memo_begin_scan();
             hs.complete = chat_scan_cancellable(&a, 0, history_scan_cb, &ctx, &g_hw.cancel);
+            free(delegated);
             title_sec = ctx.title_spent;
             title_read = ctx.title_read; title_known = ctx.title_known; title_named = ctx.title_named;
             if (ta.base) {

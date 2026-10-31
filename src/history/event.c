@@ -20,7 +20,6 @@ const char *chat_tool_name(ChatTool t) {
         case CHAT_TOOL_ANTIGRAVITY: return "antigravity";
         case CHAT_TOOL_KIMI:        return "kimi";
         case CHAT_TOOL_QWEN:        return "qwen";
-        case CHAT_TOOL_AIDER:       return "aider";
         case CHAT_TOOL_AMAZON_Q:    return "amazon-q";
         case CHAT_TOOL_CONTINUE:    return "continue";
         case CHAT_TOOL_WINDSURF:    return "windsurf";
@@ -30,6 +29,13 @@ const char *chat_tool_name(ChatTool t) {
         case CHAT_TOOL_OMP:         return "omp";
         case CHAT_TOOL_OPENCLAW:    return "openclaw";
         case CHAT_TOOL_HERMES:      return "hermes";
+        case CHAT_TOOL_DEVIN:       return "devin";
+        case CHAT_TOOL_QODER:       return "qoder";
+        case CHAT_TOOL_LETTA:       return "letta";
+        case CHAT_TOOL_MASTRACODE:  return "mastracode";
+        case CHAT_TOOL_MAKI:        return "maki";
+        case CHAT_TOOL_MUSE:        return "muse";
+        case CHAT_TOOL_PRIME:       return "prime";
         default:                    return "unknown";
     }
 }

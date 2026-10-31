@@ -52,6 +52,9 @@ typedef struct AtomicFileWriter {
     bool refused_readonly;
     /* The commit rewrote the old inode instead of renaming over it. */
     bool wrote_in_place;
+    /* Set through atomic_file_skip_sync(): the commit renames without
+     * flushing the file or its folder to the disk. */
+    bool no_sync;
     char final_path[ATOMIC_FILE_PATH_CAP];
     char temp_path[ATOMIC_FILE_PATH_CAP];
 } AtomicFileWriter;
@@ -97,6 +100,14 @@ static inline void atomic_file_keep(AtomicFileWriter *writer, u32 what) {
     if (writer && writer->stream) writer->keep = what;
 }
 
+/* For a file whose loss in a system crash or a power cut costs nothing a
+ * reader cannot tell (it checks what it reads): the commit is still an atomic
+ * rename — another process, or this one after a crash of its own, sees the old
+ * file or the new one — but nothing waits for the disk. Every begin clears it. */
+static inline void atomic_file_skip_sync(AtomicFileWriter *writer) {
+    if (writer && writer->stream) writer->no_sync = true;
+}
+
 /* Flushes, fsyncs, closes, and atomically renames the temporary file.
  *
  * On success `writer->committed_st` holds the fstat() of the bytes that were
@@ -110,5 +121,20 @@ bool atomic_file_commit(AtomicFileWriter *writer);
 
 /* Closes and removes an unfinished temporary file. */
 void atomic_file_abort(AtomicFileWriter *writer);
+
+/* True when `path` already holds exactly `data` as an app-private file: a
+ * regular file (not a link) owned by the effective user, mode 0600, `len`
+ * bytes long, byte for byte the same. A periodic writer asks this first and
+ * leaves an unchanged file alone, so nothing is written or synced to disk for
+ * a state that did not move. Any doubt — a missing file, another owner or
+ * mode, a short read — answers false and the caller writes. */
+bool atomic_file_holds_private(const char *path, const void *data, usize len);
+
+/* `path` opened to READ ("rb"), judged on the descriptor: only a regular file
+ * is opened, and a FIFO or a device in its place is refused at once (opened
+ * without blocking) instead of holding the caller until something writes to
+ * it. A symbolic link is followed. NULL with errno ENOENT when there is no
+ * file and EINVAL when it is not a regular one. */
+FILE *atomic_file_open_regular(const char *path);
 
 #endif

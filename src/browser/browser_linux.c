@@ -130,6 +130,28 @@ void browser_native_set_viewport_pt(BrowserNative *n,
     (void)n; (void)x_pt; (void)y_pt; (void)w_pt; (void)h_pt; (void)vw; (void)vh;
 }
 
+void browser_native_set_screen_shape(BrowserNative *n, const BrowserScreenShape *shape) {
+    (void)n; (void)shape;
+}
+
+bool browser_native_screen_probe(BrowserNative *n, BrowserScreenProbe *out) {
+    (void)n;
+    if (out) memset(out, 0, sizeof *out);
+    return false;
+}
+
+bool browser_native_mask(const BrowserMaskSpec *spec, BrowserMask *out) {
+    (void)spec;
+    if (out) memset(out, 0, sizeof *out);
+    return false;
+}
+
+bool browser_native_device_art(const BrowserDeviceLayout *d, f32 dpi, BrowserDeviceArt *out) {
+    (void)d; (void)dpi;
+    if (out) memset(out, 0, sizeof *out);
+    return false;
+}
+
 bool browser_native_take_pick(BrowserNative *n, BrowserPick *out) {
     (void)n; (void)out;
     return false;

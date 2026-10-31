@@ -54,12 +54,25 @@
  * animation from the agent instead of guessing from output volume. liu-notify
  * routes it to the agent-state ring and never speaks or plays a sound for it
  * (see EVT_START in daemon.c). */
+#define CLAUDE_TOOL_MATCHER "Bash|Edit|Write|MultiEdit|NotebookEdit"
 static const char *kEventNames[3] = { "Notification", "Stop",     "UserPromptSubmit" };
 static const char *kEventArgs[3]  = { "notify",       "complete", "start" };
 #define CLAUDE_HOOK_EVENT_COUNT ((int)(sizeof kEventNames / sizeof kEventNames[0]))
 
+/* Claude Code also tells Liu when it runs a tool that can change files:
+ * before (PreToolUse) and after (PostToolUse), with the call's command or
+ * file. Nothing is said or played for it; it is how a team that this pane
+ * leads knows which changes in its folder are the lead's own (`--event=tool`
+ * hands the payload to agent control, which drops it at once when the pane
+ * leads no team; the two lines differ so neither reads as a repeat of the
+ * other). */
+static const char *kClaudeEventNames[5]    = { "Notification", "Stop", "UserPromptSubmit", "PreToolUse", "PostToolUse" };
+static const char *kClaudeEventArgs[5]     = { "notify", "complete", "start", "tool-pre", "tool-post" };
+static const char *kClaudeEventMatchers[5] = { "", "", "", CLAUDE_TOOL_MATCHER, CLAUDE_TOOL_MATCHER };
+
 /* Command Code fires exactly four hook events — PreToolUse, PostToolUse, Stop
- * and SessionStart. Only Stop maps to anything Liu reports.
+ * and SessionStart. Stop is the turn's end; the two tool events are agent
+ * control's, as Claude Code's are.
  *
  * SessionStart is deliberately NOT wired to --event=start: it fires when the
  * CLI boots, not when a turn begins, so latching the pane's hook-driven mode
@@ -67,8 +80,16 @@ static const char *kEventArgs[3]  = { "notify",       "complete", "start" };
  * alone Command Code behaves like Codex and Grok — the accent bar animates
  * from output volume, and the agent's own signal is what closes the turn and
  * opens the done panel. */
-static const char *kCmdCodeEventNames[1] = { "Stop"     };
-static const char *kCmdCodeEventArgs[1]  = { "complete" };
+static const char *kCmdCodeEventNames[3]    = { "Stop", "PreToolUse", "PostToolUse" };
+static const char *kCmdCodeEventArgs[3]     = { "complete", "tool-pre", "tool-post" };
+static const char *kCmdCodeEventMatchers[3] = { "", CLAUDE_TOOL_MATCHER, CLAUDE_TOOL_MATCHER };
+
+/* Devin CLI fires Claude Code's events into its own config.json: a turn's
+ * start (UserPromptSubmit) and its end (Stop). Qoder CLI keeps Claude Code's
+ * three in ~/.qoder/settings.json. Each payload carries the session id, which
+ * is what a relaunch resumes. */
+static const char *kDevinEventNames[2] = { "Stop",     "UserPromptSubmit" };
+static const char *kDevinEventArgs[2]  = { "complete", "start" };
 
 /* Hook events Liu must NOT keep registered: SubagentStop fires every time a
  * Task-tool subagent finishes, and only the top-level Stop should notify. It
@@ -83,16 +104,27 @@ typedef struct {
     const char **event_names; /* CLI-side hook event names */
     const char **event_args;  /* matching liu-notify --event= values */
     int          event_count;
+    const char **event_matchers; /* each event's tool matcher; NULL = "" for all */
 } HookSchema;
 
 static const HookSchema kClaudeSchema = {
     "/" LIU_HOOK_CLAUDE_REL, "claude",
-    kEventNames, kEventArgs, CLAUDE_HOOK_EVENT_COUNT
+    kClaudeEventNames, kClaudeEventArgs, 5, kClaudeEventMatchers
 };
 
 static const HookSchema kCommandCodeSchema = {
     "/" LIU_HOOK_COMMANDCODE_REL, "commandcode",
-    kCmdCodeEventNames, kCmdCodeEventArgs, 1
+    kCmdCodeEventNames, kCmdCodeEventArgs, 3, kCmdCodeEventMatchers
+};
+
+static const HookSchema kDevinSchema = {
+    "/" LIU_HOOK_DEVIN_REL, "devin",
+    kDevinEventNames, kDevinEventArgs, 2, NULL
+};
+
+static const HookSchema kQoderSchema = {
+    "/" LIU_HOOK_QODER_REL, "qoder",
+    kEventNames, kEventArgs, CLAUDE_HOOK_EVENT_COUNT, NULL
 };
 
 static bool resolve_settings_path(char *out, size_t cap, const char *rel) {
@@ -127,7 +159,7 @@ static bool resolve_settings_path(char *out, size_t cap, const char *rel) {
  * one that only reads passes NULL. */
 static cJSON *load_or_empty(const char *path, bool *wide_int) {
     if (wide_int) *wide_int = false;
-    FILE *f = fopen(path, "rb");
+    FILE *f = atomic_file_open_regular(path);   /* a FIFO is refused, not waited on */
     if (!f) return (errno == ENOENT) ? cJSON_CreateObject() : NULL;
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
     long sz = ftell(f);
@@ -285,7 +317,7 @@ static ClaudeHookResult hooks_install_schema(const char *notify_bin_path,
         strip_liu_hooks(arr);    /* drop stale entries from a prior install */
 
         cJSON *block = cJSON_CreateObject();
-        cJSON_AddStringToObject(block, "matcher", "");
+        cJSON_AddStringToObject(block, "matcher", sc->event_matchers ? sc->event_matchers[i] : "");
         cJSON *inner = cJSON_AddArrayToObject(block, "hooks");
         cJSON *h = cJSON_CreateObject();
         cJSON_AddStringToObject(h, "type", "command");
@@ -294,9 +326,12 @@ static ClaudeHookResult hooks_install_schema(const char *notify_bin_path,
          * from the real hook_event_name — so a subagent stop that reaches the
          * Stop hook is dropped and only the top-level turn notifies. The
          * binary path is shell-quoted: the agent runs this through sh. */
+        /* A tool hook runs for every tool call of the agent, in any pane:
+         * the guard ends it in the shell unless the pane leads a team. */
+        bool tool_event = !strncmp(sc->event_args[i], "tool", 4);
         int cmd_len = agent_hook_shell_quote(notify_bin_path, qbin, sizeof qbin)
-                    ? snprintf(cmd, sizeof cmd, "%s send --tool=%s --event=%s --hook",
-                               qbin, sc->tool_arg, sc->event_args[i])
+                    ? snprintf(cmd, sizeof cmd, "%s%s send --tool=%s --event=%s --hook",
+                               tool_event ? HOOK_LEAD_GUARD : "", qbin, sc->tool_arg, sc->event_args[i])
                     : -1;
         if (cmd_len < 0 || (size_t)cmd_len >= sizeof cmd) {
             /* `h` is not attached to anything yet — cJSON_AddItemToArray(inner,
@@ -438,4 +473,24 @@ ClaudeHookResult commandcode_hooks_uninstall(void) {
 }
 bool commandcode_hooks_installed(void) {
     return hooks_installed_schema(&kCommandCodeSchema);
+}
+
+ClaudeHookResult devin_hooks_install(const char *notify_bin_path) {
+    return hooks_install_schema(notify_bin_path, &kDevinSchema);
+}
+ClaudeHookResult devin_hooks_uninstall(void) {
+    return hooks_uninstall_schema(&kDevinSchema);
+}
+bool devin_hooks_installed(void) {
+    return hooks_installed_schema(&kDevinSchema);
+}
+
+ClaudeHookResult qoder_hooks_install(const char *notify_bin_path) {
+    return hooks_install_schema(notify_bin_path, &kQoderSchema);
+}
+ClaudeHookResult qoder_hooks_uninstall(void) {
+    return hooks_uninstall_schema(&kQoderSchema);
+}
+bool qoder_hooks_installed(void) {
+    return hooks_installed_schema(&kQoderSchema);
 }

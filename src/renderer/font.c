@@ -479,6 +479,7 @@ static struct {
      * face_line_metrics) and the stroke procedural glyphs draw with. */
     f32  underline_y, underline_h, strike_y, strike_h;
     i32  line_px;
+    f32  cap;                        /* capital height above the baseline, px */
 } g_face;
 static f32 g_font_scale = 0;
 static f32 g_font_ascent = 0;
@@ -4345,17 +4346,23 @@ static void cache_drop_dynamic(FontAtlasPriv *p) {
 
 static void cache_evict_cold(FontAtlasPriv *p) {
     /* Single-threaded (main thread only — invoked from cache_insert via the
-     * frame-drain path). Static scratch buffers avoid ~80 KiB of stack; they
-     * stay process-wide even though the tables are per-atlas because the call
-     * never overlaps itself — every caller is on the main thread. */
-    static u64 stamps[GLYPH_CACHE_SIZE];
-    static CachedGlyph survivors[GLYPH_CACHE_SIZE];
+     * frame-drain path). The scratch is taken for the call and given back:
+     * eviction runs only at saturation, and buffers kept for the next one
+     * would stay resident (~700 KiB) for the life of the process. Without
+     * it the dynamic cache is dropped whole; glyphs re-rasterize on demand. */
+    u64 *stamps = malloc((usize)p->cache_cap * sizeof *stamps);
+    CachedGlyph *survivors = malloc((usize)p->cache_cap * sizeof *survivors);
+    if (!stamps || !survivors) {
+        free(stamps); free(survivors);
+        cache_drop_dynamic(p);
+        return;
+    }
 
     u32 n = 0;
     for (u32 i = 0; i < p->cache_cap; i++) {
         if (p->cache[i].valid) stamps[n++] = p->cache[i].last_used_frame;
     }
-    if (n == 0) { p->cache_used = 0; return; }
+    if (n == 0) { p->cache_used = 0; free(stamps); free(survivors); return; }
 
     /* Shell sort to find the kth smallest last_used_frame. n is bounded at
      * 2048 and this fires only at saturation, so cost is negligible. No
@@ -4407,6 +4414,8 @@ static void cache_evict_cold(FontAtlasPriv *p) {
         /* A survivor that cannot find a slot within the probe window is
          * dropped; it is re-rasterized on demand. */
     }
+    free(stamps);
+    free(survivors);
 }
 
 /* Shared 32-slot linear probe for both insert paths. Returns the slot to
@@ -4545,7 +4554,10 @@ i32 g_font_probe_raster = 0;
  * in the colour atlas"), and `exhausted` sentinels go too — they are precisely
  * the glyphs that were refused for lack of room and now have some. */
 static void cache_drop_color(FontAtlasPriv *p) {
-    static CachedGlyph survivors[GLYPH_CACHE_SIZE];
+    /* Scratch for this call only (see cache_evict_cold). Without it every
+     * dynamic entry goes: alpha glyphs re-rasterize on demand as well. */
+    CachedGlyph *survivors = malloc((usize)p->cache_cap * sizeof *survivors);
+    if (!survivors) { cache_drop_dynamic(p); return; }
     u32 n = 0;
     for (u32 i = 0; i < p->cache_cap; i++) {
         if (!p->cache[i].valid) continue;
@@ -4565,6 +4577,7 @@ static void cache_drop_color(FontAtlasPriv *p) {
             }
         }
     }
+    free(survivors);
 }
 
 /* Double the colour atlas and start its packer over. Returns false when it is
@@ -6879,6 +6892,7 @@ static bool face_load_locked(const char *font_path, f32 font_size, f32 dpi_scale
 #endif
         if (!(cap > 0.0f)) cap = fm_ascent * 0.7f;
         g_cap_px = cap;
+        g_face.cap = cap;
         g_icon_h_px = MIN(fm_cell_h, (2.0f * cap + fm_cell_h) / 3.0f);
         g_icon2_h_px = MIN(fm_cell_h, (cap + fm_cell_h) * 0.5f);
         face_line_metrics_locked(fm_ascent, fm_cell_h, xh);
@@ -7191,6 +7205,7 @@ static bool font_atlas_create_impl(FontAtlas *atlas, const char *font_path,
     atlas->strike_y    = g_face.strike_y;
     atlas->strike_h    = g_face.strike_h;
     atlas->line_px     = g_face.line_px > 0 ? g_face.line_px : 1;
+    atlas->cap_height  = g_face.cap;
 
     /* Remember the identity this atlas was built against. The face is shared
      * and the NEXT window to ask for a different size or DPI replaces it, so

@@ -54,6 +54,13 @@ static const char *g_action_names[] = {
     [ACT_SPLIT_HORIZONTAL]  = "Split Horizontal",
     [ACT_SPLIT_VERTICAL]    = "Split Vertical",
     [ACT_SAVE_FILE]         = "Save File",
+    [ACT_FOCUS_PANE_LEFT]   = "Focus Pane Left",
+    [ACT_FOCUS_PANE_RIGHT]  = "Focus Pane Right",
+    [ACT_FOCUS_PANE_UP]     = "Focus Pane Above",
+    [ACT_FOCUS_PANE_DOWN]   = "Focus Pane Below",
+    [ACT_NEXT_PANE]         = "Next Pane",
+    [ACT_PREV_PANE]         = "Previous Pane",
+    [ACT_TOGGLE_PANE_ZOOM]  = "Toggle Pane Zoom",
     [ACT_PREV_PROMPT]       = "Previous Prompt",
     [ACT_NEXT_PROMPT]       = "Next Prompt",
     [ACT_UNDO_CLOSE_TAB]   = "Undo Close Tab",
@@ -140,8 +147,8 @@ void keybind_init_defaults(KeyBindTable *kb) {
      * the macOS "scroll to top / bottom of document" convention in TextEdit-
      * style fields — users coming from other apps expect that, so prompt
      * jumps use Cmd+Shift+Up/Down instead. The other Cmd+Arrow combos remain
-     * reserved: window snap is Cmd+Ctrl+Arrows, divider nudge is
-     * Cmd+Alt+Arrows. */
+     * reserved: window snap is Cmd+Ctrl+Arrows, pane focus is Cmd+Alt+Arrows
+     * and the divider nudge Cmd+Ctrl+Alt+Arrows. */
     BIND(ACT_PREV_PROMPT,      KEY_UP,         MOD_SUPER | MOD_SHIFT);
     BIND(ACT_NEXT_PROMPT,      KEY_DOWN,       MOD_SUPER | MOD_SHIFT);
 
@@ -151,6 +158,16 @@ void keybind_init_defaults(KeyBindTable *kb) {
     /* Split */
     BIND(ACT_SPLIT_HORIZONTAL, KEY_D,  MOD_SUPER);
     BIND(ACT_SPLIT_VERTICAL,   KEY_D,  MOD_SUPER | MOD_SHIFT);
+
+    /* Panes — Cmd+Option and an arrow to the neighbour, Cmd+[ / Cmd+] through
+     * them in reading order, Cmd+Shift+Enter to fill the tab with one. */
+    BIND(ACT_FOCUS_PANE_LEFT,  KEY_LEFT,  MOD_SUPER | MOD_ALT);
+    BIND(ACT_FOCUS_PANE_RIGHT, KEY_RIGHT, MOD_SUPER | MOD_ALT);
+    BIND(ACT_FOCUS_PANE_UP,    KEY_UP,    MOD_SUPER | MOD_ALT);
+    BIND(ACT_FOCUS_PANE_DOWN,  KEY_DOWN,  MOD_SUPER | MOD_ALT);
+    BIND(ACT_PREV_PANE,        KEY_LEFT_BRACKET,  MOD_SUPER);
+    BIND(ACT_NEXT_PANE,        KEY_RIGHT_BRACKET, MOD_SUPER);
+    BIND(ACT_TOGGLE_PANE_ZOOM, KEY_ENTER, MOD_SUPER | MOD_SHIFT);
 
     /* Broadcast */
     BIND(ACT_BROADCAST_TOGGLE, KEY_I,  MOD_SUPER | MOD_SHIFT);
@@ -244,6 +261,18 @@ void keybind_init_defaults(KeyBindTable *kb) {
      * already spent. */
     BIND(ACT_SPLIT_HORIZONTAL, KEY_D,  MOD_CTRL | MOD_SHIFT);
     BIND(ACT_SPLIT_VERTICAL,   KEY_D,  MOD_CTRL | MOD_ALT);
+
+    /* Panes — Alt+Shift and an arrow to the neighbour: Ctrl+Shift+Up/Down
+     * are the prompt jumps, Ctrl+Alt+Left/Right belong to the desktop's
+     * workspace switch and Super+Alt+Arrows nudge the divider. Ctrl+Shift+[ / ]
+     * go through the panes in order and Ctrl+Shift+Z fills the tab with one. */
+    BIND(ACT_FOCUS_PANE_LEFT,  KEY_LEFT,  MOD_ALT | MOD_SHIFT);
+    BIND(ACT_FOCUS_PANE_RIGHT, KEY_RIGHT, MOD_ALT | MOD_SHIFT);
+    BIND(ACT_FOCUS_PANE_UP,    KEY_UP,    MOD_ALT | MOD_SHIFT);
+    BIND(ACT_FOCUS_PANE_DOWN,  KEY_DOWN,  MOD_ALT | MOD_SHIFT);
+    BIND(ACT_PREV_PANE,        KEY_LEFT_BRACKET,  MOD_CTRL | MOD_SHIFT);
+    BIND(ACT_NEXT_PANE,        KEY_RIGHT_BRACKET, MOD_CTRL | MOD_SHIFT);
+    BIND(ACT_TOGGLE_PANE_ZOOM, KEY_Z, MOD_CTRL | MOD_SHIFT);
 
     /* Broadcast */
     BIND(ACT_BROADCAST_TOGGLE, KEY_I,  MOD_CTRL | MOD_SHIFT);

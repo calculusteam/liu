@@ -54,19 +54,20 @@ HANDOFF_TARGET(droid,       CHAT_TOOL_DROID,       "droid",        "droid exec %
 HANDOFF_TARGET(amp,         CHAT_TOOL_AMP,         "amp",          "amp %s");
 HANDOFF_TARGET(antigravity, CHAT_TOOL_ANTIGRAVITY, "agy",          "agy -i %s");
 
-/* The four terminal harnesses. Each takes the opening message on its command
- * line, so a briefing can be handed over; none has a writer (Pi and omp
- * document their session format, but a file written into another app's store
- * is only worth it once resuming it has been verified).
- *   pi / omp    the messages are positional arguments.
+/* Two terminal harnesses that take the opening message on their command line,
+ * so a briefing can be handed over (Pi and Oh My Pi have writers of their own,
+ * target_writers.c).
  *   openclaw    `openclaw chat --message <text>` runs the agent in the TUI
  *               process itself, with no Gateway to start first.
  *   hermes      `hermes chat -q <text>` submits it as the first turn and
  *               leaves the session open on a TTY. */
-HANDOFF_TARGET(pi,          CHAT_TOOL_PI,          "pi",           "pi %s");
-HANDOFF_TARGET(omp,         CHAT_TOOL_OMP,         "omp",          "omp %s");
 HANDOFF_TARGET(openclaw,    CHAT_TOOL_OPENCLAW,    "openclaw",     "openclaw chat --message %s");
 HANDOFF_TARGET(hermes,      CHAT_TOOL_HERMES,      "hermes",       "hermes chat -q %s");
+
+/* Two more that open their interface with a first message: Mastra Code's
+ * `--tui-prompt <text>` sends it, Maki takes it as its positional prompt. */
+HANDOFF_TARGET(mastracode,  CHAT_TOOL_MASTRACODE,  "mastracode",   "mastracode --tui-prompt %s");
+HANDOFF_TARGET(maki,        CHAT_TOOL_MAKI,        "maki",         "maki %s");
 
 /* Kiro's CLI takes no positional prompt in any released build, so there is
  * nothing to interpolate: the briefing is written and the user is told where

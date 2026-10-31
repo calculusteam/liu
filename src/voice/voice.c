@@ -430,23 +430,19 @@ bool voice_start(const VoiceConfig *cfg) {
     return true;
 }
 
-/* After a recording ends, shrink the capture buffer only when its capacity
- * exceeds twice the 120-second retention target. This avoids reallocating for
- * sessions up to the threshold while releasing capacity left by much longer
- * recordings. Called from main-thread session-end paths; allocation and free
- * do not occur on the audio callback. */
-#define VOICE_PCM_RETAIN_SEC 120.0f
-
-
-
-static void voice_pcm_release_high_water(void) {
-    i32 retain = (i32)(VOICE_PCM_RETAIN_SEC * (f32)PLATFORM_CAPTURE_RATE);
-    if (g.pcm_cap <= retain * 2) return;      /* inside the hysteresis band */
-    f32 *p = realloc(g.pcm, (usize)retain * sizeof *p);
-    if (!p) return;                            /* keep the big one; harmless */
-    voice_charge(((isize)retain - (isize)g.pcm_cap) * (isize)sizeof *p);
-    g.pcm     = p;
-    g.pcm_cap = retain;
+/* After a recording ends the capture buffer is dead until the next start (a
+ * dictation's samples have moved to `g.job`): it is handed back whole, and the
+ * next start allocates it again. Every second recorded is 62.5 KiB written,
+ * which would otherwise stay resident until the process ends. Called from
+ * main-thread session-end paths; allocation and free do not occur on the
+ * audio callback. */
+static void voice_pcm_release(void) {
+    if (g.pcm) {
+        voice_charge(-(isize)g.pcm_cap * (isize)sizeof *g.pcm);
+        free(g.pcm);
+    }
+    g.pcm     = NULL;
+    g.pcm_cap = 0;
     g.pcm_len = 0;
 }
 
@@ -460,7 +456,7 @@ static void voice_submit(void) {
         g.cancel = true;                  /* let the worker drop the model */
         pthread_mutex_unlock(&g.mu);
         voice_post(W_RUN);
-        voice_pcm_release_high_water();
+        voice_pcm_release();
         return;
     }
 
@@ -482,8 +478,8 @@ static void voice_submit(void) {
 
     g.state = VOICE_TRANSCRIBING;
     /* The samples are in `copy` now; the capture buffer is dead until the next
-     * start, which is the moment to hand back an unusually large one. */
-    voice_pcm_release_high_water();
+     * start. */
+    voice_pcm_release();
 }
 
 void voice_stop(void) {
@@ -524,7 +520,7 @@ void voice_cancel(void) {
     g.level     = 0.0f;
     g.wq_n = 0; g.wq_peak = 0.0f; g.wq_fill = 0;
     g.state     = VOICE_IDLE;
-    voice_pcm_release_high_water();
+    voice_pcm_release();
 }
 
 void voice_tick(void) {

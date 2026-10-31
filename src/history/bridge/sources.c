@@ -229,6 +229,7 @@ u32 bridge_push_anthropic_content(BridgeHistory *h, ChatTool src,
             /* The note is less than the tool returned: marked and counted the
              * way a clipped output is. */
             e.tool_output_truncated = media > 0;
+            e.tool_failed  = hist_cjson_bool(part, "is_error");
             /* A result carries no tool name in the Anthropic shape; the name
              * lives on the call it points at. Leaving it NULL is correct —
              * targets that need one look it up by call id. */
@@ -403,10 +404,23 @@ bool bridge_parse_source(Arena *arena, const ChatSessionMeta *meta,
         case CHAT_TOOL_KIRO:        ok = bridge_parse_kiro    (arena, meta, out); break;
         case CHAT_TOOL_DROID:       ok = bridge_parse_droid   (arena, meta, out); break;
 
+        /* Command Code's current records first; its earlier flat layout
+         * through the ChatEvent fold. */
+        case CHAT_TOOL_COMMANDCODE:
+            ok = bridge_parse_commandcode(arena, meta, out);
+            if (!ok) {
+                bridge_history_free(out);
+                bridge_history_init(out, arena, CHAT_TOOL_COMMANDCODE);
+                bridge_history_set_session_id(out, meta->session_id);
+                bridge_history_set_path(out, meta->path);
+                bridge_history_set_cwd(out, meta->cwd);
+                ok = bridge_source_from_chatevents(arena, meta, out) > 0;
+            }
+            break;
+
         /* The fold over the existing ChatEvent parsers. */
         case CHAT_TOOL_COPILOT:
         case CHAT_TOOL_ANTIGRAVITY:
-        case CHAT_TOOL_COMMANDCODE:
         case CHAT_TOOL_PI:
         case CHAT_TOOL_OMP:
         case CHAT_TOOL_CLINE:

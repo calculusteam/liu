@@ -14,10 +14,11 @@
 static const BridgeCompatibility kCompat[] = {
     /* tool                 binary        min        max        native  writer  version_arg */
 
-    /* Native import targets use their supported APIs: Codex uses
-     * thread/inject_items over app-server; OpenCode uses opencode import on
-     * 1.x or opencode session import on 2.x with an export document. This
-     * table does not set maximum versions for these targets. */
+    /* Native import targets use their supported APIs: Codex uses its session
+     * import over app-server (thread/inject_items where a release has none);
+     * OpenCode uses opencode import on 1.x or opencode session import on 2.x
+     * with an export document. This table does not set maximum versions for
+     * these targets. */
     { CHAT_TOOL_CODEX,       "codex",       "0.40.0",  NULL,     true,  false, "--version" },
     { CHAT_TOOL_OPENCODE,    "opencode",    "0.5.0",   NULL,     true,  false, "--version" },
 
@@ -35,6 +36,11 @@ static const BridgeCompatibility kCompat[] = {
      * the UI identifies the writer as unverified. */
     { CHAT_TOOL_QWEN,        "qwen",        "0.1.0",   "2.0.0",  false, true,  "--version" },
 
+    /* Pi and Oh My Pi document their session file (docs/session-format.md),
+     * checked against pi 1.3 and omp 18.11. */
+    { CHAT_TOOL_PI,          "pi",          "1.0.0",   "2.0.0",  false, true,  "--version" },
+    { CHAT_TOOL_OMP,         "omp",         "18.0.0",  "19.0.0", false, true,  "--version" },
+
     /* No verified writer. Present in the table so the UI can say WHY:
      * available, understood as a source, but nothing safe to write. */
     { CHAT_TOOL_CURSOR,      "cursor-agent", NULL,     NULL,     false, false, "--version" },
@@ -43,10 +49,15 @@ static const BridgeCompatibility kCompat[] = {
     { CHAT_TOOL_KIRO,        "kiro",        NULL,      NULL,     false, false, "--version" },
     { CHAT_TOOL_AMP,         "amp",         NULL,      NULL,     false, false, "--version" },
     { CHAT_TOOL_ANTIGRAVITY, "agy",         NULL,      NULL,     false, false, "--version" },
-    { CHAT_TOOL_PI,          "pi",          NULL,      NULL,     false, false, "--version" },
-    { CHAT_TOOL_OMP,         "omp",         NULL,      NULL,     false, false, "--version" },
     { CHAT_TOOL_OPENCLAW,    "openclaw",    NULL,      NULL,     false, false, "--version" },
     { CHAT_TOOL_HERMES,      "hermes",      NULL,      NULL,     false, false, "--version" },
+    { CHAT_TOOL_DEVIN,       "devin",       NULL,      NULL,     false, false, "--version" },
+    { CHAT_TOOL_QODER,       "qodercli",    NULL,      NULL,     false, false, "--version" },
+    { CHAT_TOOL_LETTA,       "letta",       NULL,      NULL,     false, false, "--version" },
+    { CHAT_TOOL_MASTRACODE,  "mastracode",  NULL,      NULL,     false, false, "--version" },
+    { CHAT_TOOL_MAKI,        "maki",        NULL,      NULL,     false, false, "--version" },
+    { CHAT_TOOL_MUSE,        "muse",        NULL,      NULL,     false, false, "--version" },
+    { CHAT_TOOL_PRIME,       "prime-agent", NULL,      NULL,     false, false, "--version" },
 };
 
 #define COMPAT_COUNT ((usize)(sizeof kCompat / sizeof kCompat[0]))

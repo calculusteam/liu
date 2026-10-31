@@ -140,6 +140,10 @@ static bool build_path(char *out, usize out_sz, const char *name) {
     return true;
 }
 
+bool notify_run_dir(char *out, usize out_sz) {
+    return socket_dir(out, out_sz);
+}
+
 bool notify_socket_path(char *out, usize out_sz) {
     return build_path(out, out_sz, SOCK_NAME);
 }
