@@ -31,6 +31,26 @@
 /* Field accepts digits only — inserts and pastes are filtered, so a pasted
  * "8080\n" or ":3000" cannot smuggle non-numeric bytes into a port field. */
 #define TEXTEDIT_DIGITS  (1u << 1)
+/* Field takes printable ASCII only (0x20..0x7E): typed, composed and pasted
+ * text alike. A character beyond it is refused whole, never half-inserted. */
+#define TEXTEDIT_ASCII   (1u << 2)
+/* Field also refuses '"' and '\\': its value is spliced into a double-quoted
+ * curl config, where either one ends or escapes the value. */
+#define TEXTEDIT_NO_QUOTES (1u << 3)
+
+/* May `cp` go into a field with these flags? One answer for a typed character,
+ * a composition's commit and every character of a paste: a control byte, a
+ * surrogate or a value past U+10FFFF is never text, and the flags narrow the
+ * rest. */
+static inline bool textedit_cp_allowed(u32 flags, u32 cp) {
+    if (cp < 32 || cp == 127) return false;
+    if (cp >= 0xD800 && cp <= 0xDFFF) return false;
+    if (cp > 0x10FFFF) return false;
+    if ((flags & TEXTEDIT_DIGITS) && (cp < '0' || cp > '9')) return false;
+    if ((flags & TEXTEDIT_ASCII) && cp > 126) return false;
+    if ((flags & TEXTEDIT_NO_QUOTES) && (cp == '"' || cp == '\\')) return false;
+    return true;
+}
 
 typedef struct {
     char *buf;      /* NUL-terminated UTF-8, caller-owned */
@@ -96,6 +116,12 @@ void textedit_selection(const TextEdit *e, i32 *from, i32 *to);
 /* Character (not byte) index of a byte offset — what a monospaced renderer
  * needs to place the caret and the selection rectangle. */
 i32 textedit_cell_index(const char *buf, i32 byte_off);
+
+/* Screen columns between character indexes `from` and `to` of a field's text:
+ * a wide (CJK) character is drawn two columns wide, so the caret after 你好
+ * stands four columns in, not two. A masked field draws one bullet per
+ * character. */
+i32 textedit_field_cols(const char *buf, i32 len, i32 from, i32 to, bool mask);
 
 /* Inverse of textedit_cell_index: byte offset of the `cell`-th character.
  * Clamps to `len`. Lets a renderer scroll a long value horizontally by

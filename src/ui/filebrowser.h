@@ -104,6 +104,12 @@ static inline FbTabSplit fb_tab_split(f32 ox, f32 total_w, f32 dpi,
  * up with it instead of running through it. The painter, the caret and the
  * click all take it from here. */
 #define FB_TAB_COLS CODE_INDENT_GUIDE_COLS
+/* How the views count columns (ui/editor_text.h). Both give a wide character
+ * — CJK, fullwidth, emoji — the two columns its glyph is drawn in; the code
+ * and text editor runs a tab to the next stop, the Markdown live editor draws
+ * one cell for it. */
+#define FB_CODE_COLS ((EditorCols){ FB_TAB_COLS, true })
+#define FB_LIVE_COLS EDITOR_LIVE_COLS
 
 /* A single in-document find match: a byte range [start,end) into view_content. */
 typedef struct { u32 start, end; } FbFindMatch;
@@ -1169,6 +1175,10 @@ bool fb_md_live_locate(FileBrowser *fb, f32 mx, f32 my);
  * false for markdown/image/graph views or before the first render. */
 bool fb_editor_click_caret(FileBrowser *fb, f32 mx, f32 my);
 void fb_editor_move(FileBrowser *fb, i32 dcol, i32 drow);
+/* The caret's visual column, in the columns this view draws (a tab to its
+ * stop, a wide character two): where the caret is on screen, as opposed to
+ * cursor_col, a byte offset. */
+i32 fb_editor_cursor_vcol(FileBrowser *fb);
 /* Returns true when the document is written. Returns false when there is
  * nothing to save or when saving is refused or fails; `FileBrowser.notice`,
  * `save_result`, and `save_errno` describe the reason. A repeated save within

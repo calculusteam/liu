@@ -514,17 +514,10 @@ void fb_find_draw_line(const FileBrowser *fb, Renderer *r, usize line_off,
         if (m.end <= ls) continue;                         /* ends before the line */
         u32 s = m.start > ls ? m.start : ls;
         u32 e = m.end   < le ? m.end   : le;
-        /* Codepoint columns for the byte sub-range within the line. */
-        i32 col_s = 0;
-        for (u32 b = ls; b < s; ) {
-            u32 cp; u32 nb = utf8_decode((const u8 *)lp + (b - ls), le - b, &cp);
-            b += nb ? nb : 1; col_s++;
-        }
-        i32 span = 0;
-        for (u32 b = s; b < e; ) {
-            u32 cp; u32 nb = utf8_decode((const u8 *)lp + (b - ls), e - b, &cp);
-            b += nb ? nb : 1; span++;
-        }
+        /* Columns for the byte sub-range within the line (a wide character is
+         * two, as the live editor draws it). */
+        i32 col_s = editor_col_at(lp, line_len, (i32)(s - ls), FB_LIVE_COLS);
+        i32 span = editor_col_at(lp, line_len, (i32)(e - ls), FB_LIVE_COLS) - col_s;
         bool is_cur = ((i32)mi == fb->find_current);
         renderer_draw_rect(r, lx + (f32)col_s * lcw, cy, (f32)span * lcw, lch,
                            is_cur ? cur_bg : all_bg);

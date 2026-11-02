@@ -9,6 +9,7 @@
 #include "platform/clip_request.h"    /* one clipboard request, its own answer */
 #include "platform/clipboard_png.h"
 #include "platform/x_time_map.h"
+#include "platform/x11_ime_gate.h"
 #include "platform/xim_commit.h"
 #include "platform/event_queue.h"
 #include <stdatomic.h>
@@ -17,11 +18,16 @@
 #include "core/utf8.h"             /* utf8_validate: clipboard text is UTF8_STRING */
 #include "platform/xdg_trash.h"       /* the desktop's Trash */
 #include "platform/x11_monitor.h"     /* a point's monitor and visible frame */
+#include "platform/x11_workarea.h"    /* the per-monitor work area a desktop publishes */
+#include "platform/x11_identity.h"    /* the desktop file id and window class */
+#include "platform/x11_clipsave.h"    /* handing the clipboard to a manager at quit */
 #include "platform/open_url_policy.h"
 #include "platform/atspi_bridge.h" /* screen readers: the AT-SPI2 bridge */
 #include "platform/key_mods.h"     /* a key event's modifiers after it */
 #include "platform/x11_keypos.h"   /* a chord's key on any layout */
 #include "platform/xim_preedit.h"  /* an on-the-spot composition's text */
+#include "platform/x11_pointer_screen.h" /* pointer events from another X screen */
+#include "platform/xim_focus.h"    /* which window's context the IM has focused */
 
 /* X11 typedefs `KeyCode` (unsigned char), which collides with platform.h's
  * KeyCode enum. Rename X11's to XKeyCode across the X11 headers; the body
@@ -41,6 +47,9 @@
 #include <X11/extensions/XInput2.h>  /* smooth scroll valuators */
 #endif
 #undef KeyCode
+#include "platform/x11_monitors_xlib.h" /* the monitors of the screen (RandR, Xinerama) */
+#include "platform/x11_scale_xlib.h"    /* the desktop scale: resources, XSETTINGS, environment */
+#include "platform/x11_cursor_xlib.h"   /* libXcursor's default size */
 #ifdef LIU_HAVE_DBUS
 #include <dbus/dbus.h>   /* taskbar badge signal */
 #endif
@@ -269,6 +278,10 @@ static struct {
     bool        edge_cur_init;
 } g_platform = {0};
 
+/* The desktop's scale and where it came from (x11_scale_xlib.h). Main thread
+ * only. */
+static X11ScaleState g_scale;
+
 /* Shared with the macOS backend: the overflow policy (which events may be
  * folded, which must never be dropped) lives in platform/event_queue.h so the
  * two cannot drift. */
@@ -288,6 +301,8 @@ static i32             g_window_count;
  * has had it. Which window is GL-current is another question entirely
  * (platform_make_current): the loop makes every window current in turn. */
 static PlatformWindow *g_key_window = NULL;
+/* The window whose input context the input method has focused (xim_focus.h). */
+static XicFocus g_ic_focus;
 /* The window the last pointer event came from: the cursor shape is set there. */
 static PlatformWindow *g_pointer_window = NULL;
 /* The window whose X event is being dispatched; push_event() stamps it. */
@@ -414,6 +429,9 @@ struct PlatformWindow {
     /* platform_ime_reset ran and no keystroke has come since: input-method
      * commits until then are the ended composition's (char_input.ime_reset). */
     bool        ime_reset_pending;
+    /* platform_ime_allow(false): an ASCII-only field has the keyboard, so the
+     * input context stands down (platform/x11_ime_gate.h). */
+    X11ImeGate  ime_gate;
 
     /* Mirrors of window-manager state, refreshed from PropertyNotify on
      * _NET_WM_STATE / WM_STATE rather than round-tripped per query — the
@@ -554,6 +572,8 @@ PlatformMemPressure platform_memory_pressure_take(void) {
     return (PlatformMemPressure)level;
 }
 
+static pid_t g_clip_store_pid;             /* the process that opened the display */
+
 bool platform_init(void) {
     if (g_platform.initialized) return true;
     g_platform.wake_pipe[0] = -1;
@@ -643,6 +663,7 @@ bool platform_init(void) {
     g_platform.a_wm_state           = XInternAtom(d, "WM_STATE", False);
     g_platform.a_wm_protocols       = XInternAtom(d, "WM_PROTOCOLS", False);
     g_platform.a_net_wm_ping        = XInternAtom(d, "_NET_WM_PING", False);
+    x11x_scale_init(&g_scale, d, g_platform.screen);
 
     g_platform.a_xdnd_aware       = XInternAtom(d, "XdndAware", False);
     g_platform.a_xdnd_enter       = XInternAtom(d, "XdndEnter", False);
@@ -667,7 +688,11 @@ bool platform_init(void) {
      *
      * Root property traffic is user-driven (focus, workspace, window list), so
      * an idle desktop produces none; the dispatcher filters by atom. */
-    XSelectInput(d, RootWindow(d, g_platform.screen), PropertyChangeMask);
+    XSelectInput(d, RootWindow(d, g_platform.screen),
+                 PropertyChangeMask | StructureNotifyMask);   /* + a settings manager's MANAGER message */
+    /* RESOURCE_MANAGER lives on screen 0's root for every screen of the display */
+    if (g_platform.screen != 0)
+        XSelectInput(d, RootWindow(d, 0), PropertyChangeMask);
 
     {
         XSetWindowAttributes hattr = {0};
@@ -684,6 +709,7 @@ bool platform_init(void) {
     wheel_lines_init();
 
     g_platform.initialized = true;
+    g_clip_store_pid = getpid();
     return true;
 }
 
@@ -852,6 +878,7 @@ static bool linux_png_send(Display *dpy,const XSelectionRequestEvent *req,Atom p
 }
 
 void platform_shutdown(void) {
+    platform_clipboard_hand_off();   /* while the display is still open */
     atspi_shutdown();
     platform_event_queue_clear(&g_evq);
     platform_payloads_reset(&g_payloads);
@@ -1167,10 +1194,22 @@ static void linux_set_window_identity(Window win) {
     if (ch) {
         /* res_name matches the .desktop file's StartupWMClass / basename
          * convention (lowercase), res_class is the human-facing app name. */
-        ch->res_name  = (char *)"liu";
-        ch->res_class = (char *)"Liu";
+        ch->res_name  = (char *)X11_WM_CLASS_NAME;
+        ch->res_class = (char *)X11_WM_CLASS_CLASS;
         XSetClassHint(dpy, win, ch);
         XFree(ch);
+    }
+
+    /* The desktop file this window belongs to, for the desktops that name an
+     * application from it (x11_identity.h): GNOME Shell reads
+     * _GTK_APPLICATION_ID, KWin _KDE_NET_WM_DESKTOP_FILE. */
+    {
+        static const char id[] = X11_DESKTOP_FILE_ID;
+        Atom ids[2] = { XInternAtom(dpy, "_GTK_APPLICATION_ID", False),
+                        XInternAtom(dpy, "_KDE_NET_WM_DESKTOP_FILE", False) };
+        for (int i = 0; i < 2; i++)
+            XChangeProperty(dpy, win, ids[i], g_platform.a_utf8, 8, PropModeReplace,
+                            (const unsigned char *)id, (int)(sizeof id - 1));
     }
 
     pid_t pid = getpid();
@@ -1321,6 +1360,28 @@ static void xim_preedit_caret(XIC xic, XPointer client, XPointer call) {
     if (w->pre_caret > w->pre_len) w->pre_caret = w->pre_len;
     c->position = w->pre_caret;
     linux_preedit_push(w);
+}
+
+/* A window's input context stops being the focused one: the keyboard left the
+ * window, or another window's context is taking the focus. fcitx5, on-the-spot,
+ * COMMITS what an unfocused context is still composing - the raw "ni hao" of a
+ * pinyin draft - into the window, where it was typed into the pane; ibus drops
+ * the draft. The input method's own reset ends the composition instead (a
+ * pinyin draft is dropped, a Hangul syllable committed: xim_focus.h), so it
+ * goes first. */
+static void linux_ic_release(PlatformWindow *w) {
+    if (!w || !w->xic) return;
+    platform_ime_reset(w);
+    XUnsetICFocus(w->xic);
+}
+
+/* `w`'s context takes the input method's focus; the window that held it lets go
+ * first (it may be gone: holders are looked up, never dereferenced). */
+static void linux_ic_focus_take(PlatformWindow *w) {
+    const void *prev = xic_focus_take(&g_ic_focus, w);
+    for (i32 i = 0; prev && i < g_window_count; i++)
+        if ((const void *)g_windows[i] == prev) { linux_ic_release(g_windows[i]); break; }
+    XSetICFocus(w->xic);
 }
 
 PlatformWindow *platform_window_create(const PlatformWindowConfig *cfg) {
@@ -1514,7 +1575,6 @@ PlatformWindow *platform_window_create(const PlatformWindowConfig *cfg) {
                                XNFocusWindow,  w->xwindow,
                                (void *)NULL);
         }
-        if (w->xic) XSetICFocus(w->xic);
     }
 
     XMapWindow(dpy, w->xwindow);
@@ -1575,6 +1635,9 @@ PlatformWindow *platform_window_create(const PlatformWindowConfig *cfg) {
         if (swapInterval) swapInterval(dpy, w->xwindow, 1);
     }
 
+    /* Last, so a window that failed above never took the focus from one that
+     * has it: the window that held it is reset and let go of first. */
+    if (w->xic) linux_ic_focus_take(w);
     g_windows[g_window_count++] = w;
     if (!g_key_window) g_key_window = w;
     atspi_window_attach(&w->a11y, w);
@@ -1588,7 +1651,10 @@ void platform_window_destroy(PlatformWindow *w) {
     if (!w) return;
     atspi_window_detach(&w->a11y);
     Display *dpy = g_platform.display;
-    if (w->xic) { XUnsetICFocus(w->xic); XDestroyIC(w->xic); w->xic = NULL; }
+    if (w->xic) {
+        xic_focus_drop(&g_ic_focus, w);
+        XUnsetICFocus(w->xic); XDestroyIC(w->xic); w->xic = NULL;
+    }
     for (i32 i = 0; i < g_window_count; i++) {
         if (g_windows[i] != w) continue;
         memmove(&g_windows[i], &g_windows[i + 1],
@@ -1807,30 +1873,50 @@ PlatformWindow *platform_window_at_screen_point_below(f32 sx, f32 sy,
     return NULL;
 }
 
+/* The per-monitor work areas the window manager publishes for the current
+ * virtual desktop (_GTK_WORKAREAS_D<n>, x11_workarea.h); none when it does
+ * not, which leaves the desktop-wide _NET_WORKAREA. */
+static i32 linux_gtk_work_areas(X11Rect *out, i32 cap) {
+    Display *dpy = g_platform.display;
+    Window root = RootWindow(dpy, g_platform.screen);
+    unsigned long desktop = 0;
+    unsigned char *data = NULL;
+    unsigned long n = 0;
+    if (x11_get_prop(root, g_platform.a_net_current_desktop, XA_CARDINAL, 32, 1,
+                     &data, &n)) {
+        desktop = ((const unsigned long *)(const void *)data)[0];
+        XFree(data);
+    }
+    char name[40];
+    if (!x11_gtk_workareas_name(desktop, name, sizeof name)) return 0;
+    Atom prop = XInternAtom(dpy, name, True);
+    if (prop == None) return 0;
+    data = NULL; n = 0;
+    if (!x11_get_prop(root, prop, XA_CARDINAL, 32, 4 * X11_WORKAREAS_MAX, &data, &n))
+        return 0;
+    i32 count = x11_gtk_workareas_parse((const unsigned long *)(const void *)data, n, out, cap);
+    XFree(data);
+    return count;
+}
+
 /* The monitor holding (or nearest to) a root point, less the panels: the work
  * area clipped to it (x11_monitor.h). The whole screen is the monitor when
- * RandR lists none. */
+ * the server lists none. */
 static X11Rect linux_visible_frame(i32 px, i32 py) {
     Display *dpy = g_platform.display;
     X11Rect mon = { 0, 0, DisplayWidth(dpy, g_platform.screen),
                     DisplayHeight(dpy, g_platform.screen) };
-#ifdef LIU_HAVE_XRANDR
     {
-        int nmon = 0;
-        XRRMonitorInfo *mons = XRRGetMonitors(dpy, RootWindow(dpy, g_platform.screen),
-                                              True, &nmon);
-        X11Rect r[16];
-        i32 n = 0;
-        for (int i = 0; mons && i < nmon && n < 16; i++)
-            r[n++] = (X11Rect){ mons[i].x, mons[i].y, mons[i].width, mons[i].height };
-        if (mons) XRRFreeMonitors(mons);
+        X11Rect r[X11_MONITORS_MAX];
+        i32 n = x11x_monitors(dpy, g_platform.screen, r, X11_MONITORS_MAX, NULL);
         i32 at = x11_monitor_at(r, n, px, py);
         if (at >= 0) mon = r[at];
     }
-#endif
     i32 ax, ay, aw, ah;
     linux_work_area(&ax, &ay, &aw, &ah);
-    return x11_visible_frame(mon, (X11Rect){ ax, ay, aw, ah });
+    X11Rect areas[X11_WORKAREAS_MAX];
+    i32 na = linux_gtk_work_areas(areas, X11_WORKAREAS_MAX);
+    return x11_monitor_work(mon, areas, na, (X11Rect){ ax, ay, aw, ah });
 }
 
 bool platform_screen_visible_frame_at(f32 sx, f32 sy,
@@ -1944,6 +2030,11 @@ f32 platform_window_max_refresh_hz(PlatformWindow *w) {
 
     int event_base = 0, error_base = 0;
     if (!XRRQueryExtension(g_platform.display, &event_base, &error_base)) return 60.0f;
+    {
+        i32 rmaj = 0, rmin = 0;
+        x11x_randr_version(g_platform.display, &rmaj, &rmin);
+        if (!x11_randr_has_crtcs(rmaj, rmin)) return 60.0f;   /* no CRTCs to read */
+    }
 
     Window root = DefaultRootWindow(g_platform.display);
     XWindowAttributes wa;
@@ -2022,41 +2113,12 @@ void platform_window_get_framebuffer_size(PlatformWindow *w, i32 *width, i32 *he
     *width = w->width; *height = w->height;
 }
 
-/* Read the desktop's scale factor from Xft.dpi in the root RESOURCE_MANAGER.
- * That property is the single place X11 publishes it — there is no per-window
- * backing scale to query the way macOS has one. */
+/* Read the desktop's scale factor: Xft.dpi in RESOURCE_MANAGER, else the
+ * settings manager's, else GDK_SCALE / QT_SCALE_FACTOR (x11_dpi_source.h). That
+ * is the only place X11 publishes it - there is no per-window backing scale to
+ * query the way macOS has one. */
 static f32 linux_compute_dpi_scale(void) {
-    f32 scale = 1.0f;
-    /* Read RESOURCE_MANAGER off the root directly rather than calling
-     * XResourceManagerString(): that helper returns the copy Xlib cached when
-     * the Display was opened and never refetches, so it would report the
-     * startup value forever and miss a live Xft.dpi change. */
-    unsigned char *prop = NULL;
-    unsigned long nitems = 0;
-    char *rms = NULL;
-    if (x11_get_prop(RootWindow(g_platform.display, g_platform.screen),
-                     XA_RESOURCE_MANAGER, XA_STRING, 8, 256 * 1024,
-                     &prop, &nitems))
-        rms = (char *)prop;
-    if (rms) {
-        XrmDatabase db = XrmGetStringDatabase(rms);
-        if (db) {
-            char *type = NULL; XrmValue val;
-            if (XrmGetResource(db, "Xft.dpi", "Xft.Dpi", &type, &val) && val.addr) {
-                errno = 0;
-                char *end = NULL;
-                double dpi = strtod(val.addr, &end);
-                if (end != val.addr && errno != ERANGE && isfinite(dpi) && dpi > 1.0) {
-                    if (dpi > 768.0) dpi = 768.0;
-                    scale = (f32)(dpi / 96.0);
-                }
-            }
-            XrmDestroyDatabase(db);
-        }
-    }
-    if (prop) XFree(prop);
-    if (scale < 1.0f) scale = 1.0f;   /* never downscale point dimensions */
-    return scale;
+    return x11x_scale_read(&g_scale).scale;
 }
 
 f32 platform_window_get_dpi_scale(PlatformWindow *w) {
@@ -2067,6 +2129,32 @@ f32 platform_window_get_dpi_scale(PlatformWindow *w) {
     if (g_platform.dpi_scale <= 0.0f)
         g_platform.dpi_scale = linux_compute_dpi_scale();
     return g_platform.dpi_scale;
+}
+
+static void linux_cursor_resize(void);   /* fwd: near the cursors */
+
+/* A source of the scale changed (the resources, or the settings manager's
+ * property): work it out again, move the cursor with it, and tell every window
+ * when the scale itself moved. The setting is the desktop's, so it is every
+ * window's. */
+static void linux_scale_refresh(void) {
+    f32 fresh = linux_compute_dpi_scale();
+    linux_cursor_resize();
+    if (fabsf(fresh - g_platform.dpi_scale) > 0.001f) {
+        g_platform.dpi_scale = fresh;
+        for (i32 i = 0; i < g_window_count; i++)
+            push_event((PlatformEvent){
+                .type = EVENT_DPI_CHANGE, .window = g_windows[i],
+                .dpi = { .scale = fresh }
+            });
+    }
+}
+
+/* A window whose property changes can move the scale though it is not ours: the
+ * settings manager's, and screen 0's root where the resources are kept. */
+static bool linux_scale_watches(Window w) {
+    return w != None && (w == g_scale.owner ||
+                         (g_platform.display && w == RootWindow(g_platform.display, 0)));
 }
 
 /* Usable desktop rectangle for the current virtual desktop: the screen minus
@@ -2676,9 +2764,39 @@ static KeyCode map_keysym(KeySym ks) {
 
 static u32 linux_keysym_known(u32 ks) { return (u32)map_keysym((KeySym)ks); }
 
+static u32 linux_sym_at(void *ctx, u32 keycode, i32 group, i32 level) {
+    return (u32)XkbKeycodeToKeysym((Display *)ctx, (XKeyCode)keycode, group, level);
+}
+
+/* Whether the server numbers its keys as PC positions (Linux input code + 8),
+ * from the keymap's keycodes component: read when a chord needs it, since a
+ * keymap can be replaced while Liu runs. */
+static bool linux_keycodes_are_pc(Display *dpy) {
+    bool pc = false;
+    XkbDescPtr d = XkbAllocKeyboard();
+    if (!d) return false;
+    if (XkbGetNames(dpy, XkbKeycodesNameMask, d) == Success && d->names && d->names->keycodes) {
+        char *name = XGetAtomName(dpy, d->names->keycodes);
+        pc = x11_keycodes_are_pc_positions(name);
+        if (name) XFree(name);
+    }
+    XkbFreeKeyboard(d, XkbAllComponentsMask, True);
+    return pc;
+}
+
+/* The US key-cap at the key's position, for a keymap with no Latin layout (0
+ * otherwise): the local keymap says whether there is a Latin layout, and only
+ * then is the server asked how it numbers its keys. */
+static u32 linux_position_cap(Display *dpy, unsigned int keycode) {
+    u32 cap = x11_physical_cap(keycode, linux_sym_at, dpy);
+    return cap && linux_keycodes_are_pc(dpy) ? cap : 0;
+}
+
 /* The key a chord names when the symbol the layout typed is none Liu knows
  * (x11_keypos.h): XKB is asked what else the same physical key carries — the
- * Shift level of the active layout, then the keymap's other layouts. */
+ * Shift level of the active layout, then the keymap's other layouts. A keymap
+ * with no Latin layout at all has nothing else to offer, and the key's
+ * position is read (Ctrl+C on a Russian-only or Greek-only keyboard). */
 static KeyCode linux_key_by_position(Display *dpy, unsigned int keycode, unsigned int state) {
     X11KeySyms k;
     memset(&k, 0, sizeof k);
@@ -2689,7 +2807,12 @@ static KeyCode linux_key_by_position(Display *dpy, unsigned int keycode, unsigne
             if (sym != NoSymbol) k.groups = g + 1;
         }
     }
-    return (KeyCode)x11_key_by_position(&k, (i32)XkbGroupForCoreState(state), linux_keysym_known);
+    u32 found = x11_key_by_position(&k, (i32)XkbGroupForCoreState(state), linux_keysym_known);
+    if (!found) {
+        u32 cap = linux_position_cap(dpy, keycode);
+        if (cap) found = linux_keysym_known(cap);
+    }
+    return (KeyCode)found;
 }
 
 /* X11 numbers its buttons 1=left, 2=MIDDLE, 3=right; PlatformEvent uses
@@ -2963,6 +3086,20 @@ static i32 linux_resize_edge(PlatformWindow *w, i32 x, i32 y) {
 }
 
 static void linux_apply_cursor(PlatformWindow *w, i32 type);   /* fwd */
+static bool linux_cursor_size_sync(void);                        /* fwd */
+
+/* The resize cursors, made when first wanted and again after a size change. */
+static void linux_edge_cursors(void) {
+    if (g_platform.edge_cur_init) return;
+    Display *dpy = g_platform.display;
+    static const unsigned int shapes[8] = {
+        XC_top_left_corner, XC_top_side, XC_top_right_corner, XC_right_side,
+        XC_bottom_right_corner, XC_bottom_side, XC_bottom_left_corner, XC_left_side,
+    };
+    linux_cursor_size_sync();
+    for (i32 i = 0; i < 8; i++) g_platform.edge_cur[i] = XCreateFontCursor(dpy, shapes[i]);
+    g_platform.edge_cur_init = true;
+}
 
 /* The pointer moved: show the edge's resize cursor while it is on one, and
  * the app's own shape again when it leaves. No event and no frame: raw
@@ -2974,20 +3111,16 @@ static void linux_edge_hover(PlatformWindow *w, i32 x, i32 y) {
     w->edge_dir = dir;
     Display *dpy = g_platform.display;
     if (dir < 0) { linux_apply_cursor(w, w->app_cursor); return; }
-    if (!g_platform.edge_cur_init) {
-        static const unsigned int shapes[8] = {
-            XC_top_left_corner, XC_top_side, XC_top_right_corner, XC_right_side,
-            XC_bottom_right_corner, XC_bottom_side, XC_bottom_left_corner, XC_left_side,
-        };
-        for (i32 i = 0; i < 8; i++) g_platform.edge_cur[i] = XCreateFontCursor(dpy, shapes[i]);
-        g_platform.edge_cur_init = true;
-    }
+    linux_edge_cursors();
     XDefineCursor(dpy, w->xwindow, g_platform.edge_cur[dir]);
     XFlush(dpy);
 }
 
 static void linux_begin_moveresize(PlatformWindow *w, long direction);   /* fwd */
 static void linux_move_pending_motion(PlatformWindow *w);               /* fwd */
+
+/* Where the pointer last was inside Liu's screen (x11_pointer_screen.h). */
+static X11PtrMemo g_ptr_memo;
 
 static void handle_pointer_button(PlatformWindow *win, bool press,
                                   unsigned int button, i32 x, i32 y,
@@ -3239,20 +3372,27 @@ static bool xi2_dispatch(Display *dpy, XEvent *xep) {
     switch (xep->xcookie.evtype) {
     case XI_Motion: {
         const XIDeviceEvent *ev = (const XIDeviceEvent *)xep->xcookie.data;
+        i32 mx = (i32)ev->event_x, my = (i32)ev->event_y;
+        if (!x11_pointer_event(&g_ptr_memo, X11_PTR_MOTION,
+                               ev->root == RootWindow(dpy, g_platform.screen), &mx, &my)) break;
         xi2_handle_motion(xi2_event_window(ev), ev);
         break;
     }
     case XI_ButtonPress:
     case XI_ButtonRelease: {
         const XIDeviceEvent *ev = (const XIDeviceEvent *)xep->xcookie.data;
+        i32 bx = (i32)ev->event_x, by = (i32)ev->event_y;
+        if (!x11_pointer_event(&g_ptr_memo,
+                               xep->xcookie.evtype == XI_ButtonPress ? X11_PTR_PRESS : X11_PTR_RELEASE,
+                               ev->root == RootWindow(dpy, g_platform.screen), &bx, &by))
+            break;
         PlatformWindow *win = xi2_event_window(ev);
         /* Scroll valuators are also replayed as legacy button 4-7 presses for
          * core clients. The valuators are read here, so the emulation is
          * dropped. */
         if (!(ev->flags & XIPointerEmulated))
             handle_pointer_button(win, xep->xcookie.evtype == XI_ButtonPress,
-                                  (unsigned)ev->detail,
-                                  (i32)ev->event_x, (i32)ev->event_y,
+                                  (unsigned)ev->detail, bx, by,
                                   (unsigned)ev->mods.effective, ev->time);
         break;
     }
@@ -3332,7 +3472,8 @@ static void linux_dispatch_xevent_for(XEvent *xep, PlatformWindow *win) {
     if(xep->type==PropertyNotify) {
         if(linux_png_property(dpy,&xep->xproperty))return;
         if(xep->xproperty.window!=RootWindow(dpy,g_platform.screen) &&
-           xep->xproperty.window!=g_platform.helper && !win)return;
+           xep->xproperty.window!=g_platform.helper && !win &&
+           !linux_scale_watches(xep->xproperty.window))return;
     }
     if((xep->type==ConfigureNotify || xep->type==MapNotify ||
         xep->type==UnmapNotify) && !win)return;
@@ -3377,8 +3518,12 @@ static void linux_dispatch_xevent_for(XEvent *xep, PlatformWindow *win) {
         win->pre_escape_at = platform_time_sec();
 
     /* IM first refusal: a key that's part of a compose/dead-key/CJK sequence is
-     * swallowed here and must not be processed further. */
-    if (XFilterEvent(&xe, None)) return;
+     * swallowed here and must not be processed further. Not while an ASCII-only
+     * field has the keyboard (platform_ime_allow): the input method gets no key
+     * then, and the letters are what was typed. */
+    if (!(xe.type == KeyPress && win &&
+          !x11_ime_filters_key(&win->ime_gate, xe.xkey.keycode != 0)) &&
+        XFilterEvent(&xe, None)) return;
 
     switch (xe.type) {
     case KeyPress: {
@@ -3394,7 +3539,11 @@ static void linux_dispatch_xevent_for(XEvent *xep, PlatformWindow *win) {
 
         i32 xim_lookups = 0;                  /* for the probe below */
         i32 typed_chars = 0;                  /* characters this keystroke typed */
-        if (win && win->xic) {
+        /* Through the input context, except for a real key while the input
+         * method stands down (platform_ime_allow): that is plain Xlib text. */
+        bool ic_lookup = win && x11_ime_looks_up_in_context(&win->ime_gate, win->xic != NULL,
+                                                            xe.xkey.keycode != 0);
+        if (ic_lookup) {
             len = Xutf8LookupString(win->xic, &xe.xkey, buf, cap - 1, &ks, &status);
             xim_lookups = 1;
             /* XBufferOverflow is not "too much text to care about": the return
@@ -3508,13 +3657,20 @@ static void linux_dispatch_xevent_for(XEvent *xep, PlatformWindow *win) {
          * NUL, Ctrl+_ and Ctrl+/ US, the same on any layout that types those
          * symbols. Anything else a Ctrl chord produces is no text. */
         if (mods & MOD_CTRL) {
-            u8 c0 = (u8)buf[0];
-            if (len == 1 && (c0 < 0x20 || c0 == 0x7F))
+            i32 c0 = (len == 1 && ((u8)buf[0] < 0x20 || (u8)buf[0] == 0x7F)) ? (i32)(u8)buf[0] : -1;
+            /* Xlib types no control byte for a key that is a letter of another
+             * script (Ctrl+[ on a Russian-only keymap types the letter): the
+             * key-cap at its position does (x11_keypos.h). */
+            if (c0 < 0 && !(mods & MOD_SHIFT)) {
+                u32 cap = linux_position_cap(dpy, kc_raw);
+                if (cap) c0 = x11_ctrl_byte(cap);
+            }
+            if (c0 >= 0)
                 push_event((PlatformEvent){
                     .type = EVENT_CHAR_INPUT,
                     .timestamp = ev_time,
                     .timestamp_uncertain = !ev_certain,
-                    .char_input = { .codepoint = c0, .mods = mods }
+                    .char_input = { .codepoint = (u32)c0, .mods = mods }
                 });
             goto key_press_done;
         }
@@ -3522,7 +3678,7 @@ static void linux_dispatch_xevent_for(XEvent *xep, PlatformWindow *win) {
         /* Decode committed UTF-8 into codepoints; one CHAR_INPUT per codepoint
          * (NOT per byte). Skip C0/DEL: Enter/Tab/Esc/Backspace go via the
          * KEY_DOWN channel. */
-        if ((status == XLookupChars || status == XLookupBoth || !win || !win->xic)
+        if ((status == XLookupChars || status == XLookupBoth || !ic_lookup)
             && len > 0) {
             i32 emitted = 0;
             /* Xlib hands an input method's commit over as a KeyPress of
@@ -3596,21 +3752,36 @@ static void linux_dispatch_xevent_for(XEvent *xep, PlatformWindow *win) {
         break;
     }
     case ButtonPress:
-    case ButtonRelease:
+    case ButtonRelease: {
+        i32 bx = xe.xbutton.x, by = xe.xbutton.y;
+        if (!x11_pointer_event(&g_ptr_memo, xe.type == ButtonPress ? X11_PTR_PRESS : X11_PTR_RELEASE,
+                               xe.xbutton.same_screen, &bx, &by))
+            break;
         if (win) g_pointer_window = win;
         handle_pointer_button(win, xe.type == ButtonPress,
-                              xe.xbutton.button, xe.xbutton.x, xe.xbutton.y,
+                              xe.xbutton.button, bx, by,
                               xe.xbutton.state, xe.xbutton.time);
         break;
-    case MotionNotify:
+    }
+    case MotionNotify: {
+        i32 mx = xe.xmotion.x, my = xe.xmotion.y;
+        if (!x11_pointer_event(&g_ptr_memo, X11_PTR_MOTION, xe.xmotion.same_screen, &mx, &my)) break;
         if (win) g_pointer_window = win;
-        linux_edge_hover(win, xe.xmotion.x, xe.xmotion.y);
+        linux_edge_hover(win, mx, my);
         linux_move_pending_motion(win);
         push_event((PlatformEvent){
             .type = EVENT_MOUSE_MOVE,
-            .mouse = { .button = -1, .x = xe.xmotion.x, .y = xe.xmotion.y,
+            .mouse = { .button = -1, .x = mx, .y = my,
                        .mods = get_mods(xe.xmotion.state) }
         });
+        break;
+    }
+    case DestroyNotify:
+        /* The settings manager quit: what it said stops counting. */
+        if (g_scale.owner != None && xe.xdestroywindow.window == g_scale.owner) {
+            x11x_xsettings_find(&g_scale);
+            linux_scale_refresh();
+        }
         break;
     case ConfigureNotify: {
         /* Update the cached size and emit EVENT_RESIZE only when dimensions
@@ -3646,6 +3817,15 @@ static void linux_dispatch_xevent_for(XEvent *xep, PlatformWindow *win) {
                 XSendEvent(dpy, reply.xclient.window, False,
                            SubstructureNotifyMask | SubstructureRedirectMask, &reply);
             }
+            break;
+        }
+
+        /* A settings manager taking the _XSETTINGS_S<screen> selection announces
+         * itself to the root (ICCCM 2.8): one that starts after Liu is found now. */
+        if (cm->message_type == g_scale.a_manager &&
+            (Atom)cm->data.l[1] == g_scale.a_selection) {
+            x11x_xsettings_find(&g_scale);
+            linux_scale_refresh();
             break;
         }
 
@@ -3750,22 +3930,17 @@ static void linux_dispatch_xevent_for(XEvent *xep, PlatformWindow *win) {
          * Xft.dpi when the window moves to a differently-scaled monitor).
          * Re-read and tell the app, which rebuilds the font atlas at the new
          * density, so the terminal follows the new scale without a restart.
-         */
-        if (xe.xproperty.window == RootWindow(dpy, g_platform.screen)) {
-            if (xe.xproperty.atom == XA_RESOURCE_MANAGER) {
-                f32 fresh = linux_compute_dpi_scale();
-                if (fabsf(fresh - g_platform.dpi_scale) > 0.001f) {
-                    g_platform.dpi_scale = fresh;
-                    /* The setting is the desktop's, so it is every window's. */
-                    for (i32 i = 0; i < g_window_count; i++)
-                        push_event((PlatformEvent){
-                            .type = EVENT_DPI_CHANGE, .window = g_windows[i],
-                            .dpi = { .scale = fresh }
-                        });
-                }
-            }
+         * The settings manager's own window says it too (XSETTINGS). */
+        X11ScaleEvent scale_ev = x11_scale_event_for(
+            xe.xproperty.window, xe.xproperty.atom, RootWindow(dpy, g_platform.screen),
+            RootWindow(dpy, 0), g_scale.owner, XA_RESOURCE_MANAGER,
+            g_scale.a_screen_resources, g_scale.a_property);
+        if (scale_ev != X11_SCALE_EVENT_NONE) {
+            if (scale_ev == X11_SCALE_EVENT_XSETTINGS) x11x_xsettings_read(&g_scale);
+            linux_scale_refresh();
             break;
         }
+        if (xe.xproperty.window == RootWindow(dpy, g_platform.screen)) break;
 
         if (xe.xproperty.window == g_platform.helper) {
             if (xe.xproperty.atom == g_platform.a_liu_time_ping)
@@ -3829,8 +4004,11 @@ static void linux_dispatch_xevent_for(XEvent *xep, PlatformWindow *win) {
             if (focused) g_key_window = win;
         }
         if (win && win->xic) {
-            if (focused) XSetICFocus(win->xic);
-            else         XUnsetICFocus(win->xic);
+            if (focused) {
+                if (x11_ime_focus_in_sets(&win->ime_gate)) linux_ic_focus_take(win);
+            } else if (xic_focus_drop(&g_ic_focus, win)) {
+                linux_ic_release(win);
+            }
         }
 
         if (focused && win) {
@@ -4380,6 +4558,71 @@ PlatformClipResult platform_clipboard_set_png(const u8 *png,usize length) {
     XFlush(dpy);return PLATFORM_CLIP_OK;
 }
 
+/* At quit, ask the clipboard manager to take the copy over (x11_clipsave.h):
+ * what Liu owns on CLIPBOARD goes when Liu does, unless something keeps it.
+ * Where no manager owns CLIPBOARD_MANAGER, or Liu owns nothing worth keeping,
+ * this returns after at most a few round trips. Called from main()'s
+ * liu_lifecycle_atexit (every way out: Ctrl+Shift+Q, a signal, the last window
+ * closing) and from platform_shutdown; the first call wins. The manager's
+ * requests are answered by the ordinary dispatch, so TARGETS, the text and a
+ * large image's INCR transfer are served as for any other client. */
+static bool g_clip_store_ran;
+
+void platform_clipboard_hand_off(void) {
+    Display *dpy = g_platform.display;
+    Window helper = g_platform.helper;
+    if (!dpy || !helper || g_clip_store_ran) return;
+    if (g_clip_store_pid != getpid()) return;   /* a forked child shares the connection, not the copy */
+    bool has_text = g_platform.clip_text != NULL, has_png = g_platform.clip_png != NULL;
+    if (!has_text && !has_png) return;
+    Atom mgr = XInternAtom(dpy, "CLIPBOARD_MANAGER", False);
+    ClipSaveFacts facts = {
+        .owns_clipboard = XGetSelectionOwner(dpy, g_platform.a_clipboard) == helper,
+        .has_content = true,
+        .secret = g_platform.clip_secret,
+        .manager_present = XGetSelectionOwner(dpy, mgr) != None,
+        .already_asked = false,
+    };
+    g_clip_store_ran = true;
+    if (!clip_save_wanted(&facts)) return;
+
+    Atom save = XInternAtom(dpy, "SAVE_TARGETS", False);
+    Atom prop = XInternAtom(dpy, "_LIU_SAVE_TARGETS", False);
+    ClipSaveTarget kinds[4];
+    Atom list[4];
+    i32 nk = clip_save_targets(has_text, has_png, kinds, 4);
+    for (i32 i = 0; i < nk; i++)
+        list[i] = kinds[i] == CLIP_SAVE_UTF8 ? g_platform.a_utf8
+                : kinds[i] == CLIP_SAVE_TEXT ? g_platform.a_text
+                : kinds[i] == CLIP_SAVE_STRING ? XA_STRING : g_platform.a_png;
+    XChangeProperty(dpy, helper, prop, XA_ATOM, 32, PropModeReplace,
+                    (const unsigned char *)list, nk);
+
+    ClipSave cs;
+    clip_save_begin(&cs, platform_time_sec());
+    XConvertSelection(dpy, mgr, save, prop, helper, CurrentTime);
+    XFlush(dpy);
+    while (clip_save_pending(&cs, platform_time_sec())) {
+        while (XPending(dpy)) {
+            XEvent xe;
+            XNextEvent(dpy, &xe);
+            if (xe.type == SelectionNotify && xe.xselection.requestor == helper &&
+                xe.xselection.selection == mgr && xe.xselection.target == save) {
+                clip_save_notify(&cs, xe.xselection.property == None);
+                continue;
+            }
+            if (xe.type == SelectionRequest) clip_save_activity(&cs, platform_time_sec());
+            linux_dispatch_xevent(&xe);
+        }
+        if (!clip_save_pending(&cs, platform_time_sec())) break;
+        struct pollfd pfd = { .fd = ConnectionNumber(dpy), .events = POLLIN };
+        (void)poll(&pfd, 1, clip_save_wait_ms(&cs, platform_time_sec()));
+    }
+    XDeleteProperty(dpy, helper, prop);
+    if (cs.state == CLIP_SAVE_TIMED_OUT)
+        fprintf(stderr, "liu: the clipboard manager did not take the copy in time\n");
+}
+
 void platform_set_option_as_alt(i32 mode) { (void)mode; }
 
 /* Same policy as the macOS opener (open_url_policy.h): allow-listed schemes
@@ -4595,6 +4838,7 @@ static void linux_apply_cursor(PlatformWindow *w, i32 type) {
     Display *dpy = g_platform.display;
     if (!dpy || !w) return;
     if (!g_platform.cur_init) {
+        linux_cursor_size_sync();
         g_platform.cur[CURSOR_DEFAULT]  = XCreateFontCursor(dpy, XC_left_ptr);
         g_platform.cur[CURSOR_TEXT]     = XCreateFontCursor(dpy, XC_xterm);
         g_platform.cur[CURSOR_RESIZE_H] = XCreateFontCursor(dpy, XC_sb_h_double_arrow);
@@ -4604,6 +4848,48 @@ static void linux_apply_cursor(PlatformWindow *w, i32 type) {
     }
     if (type >= 0 && type < 5 && g_platform.cur[type])
         XDefineCursor(dpy, w->xwindow, g_platform.cur[type]);
+}
+
+/* Bring libXcursor's default size to what its own rule gives for the
+ * resources as they are now (x11_cursor_size.h); true when that moved it.
+ * Cursors made after this have the size, the ones already made keep theirs. */
+static bool linux_cursor_size_sync(void) {
+    Display *dpy = g_platform.display;
+    if (!dpy) return false;
+    (void)platform_window_get_dpi_scale(NULL);   /* the sources, up to date */
+    return x11x_cursor_default_size(
+        dpy, x11_cursor_size(x11_cursor_size_text(getenv("XCURSOR_SIZE")),
+                             g_scale.cursor_res, g_scale.dpi.dpi,
+                             DisplayWidth(dpy, g_platform.screen),
+                             DisplayHeight(dpy, g_platform.screen)));
+}
+
+/* The desktop's scale changed: make the cursors again at the new size and put
+ * them on every window, so the pointer over Liu is the size of the pointer
+ * everywhere else. */
+static void linux_cursor_resize(void) {
+    Display *dpy = g_platform.display;
+    if (!dpy) return;
+    Cursor old_cur[5], old_edge[8];
+    memcpy(old_cur, g_platform.cur, sizeof old_cur);
+    memcpy(old_edge, g_platform.edge_cur, sizeof old_edge);
+    bool had = g_platform.cur_init || g_platform.edge_cur_init;
+    if (!linux_cursor_size_sync() || !had) return;
+    memset(g_platform.cur, 0, sizeof g_platform.cur);
+    memset(g_platform.edge_cur, 0, sizeof g_platform.edge_cur);
+    g_platform.cur_init = g_platform.edge_cur_init = false;
+    for (i32 i = 0; i < g_window_count; i++) {
+        PlatformWindow *w = g_windows[i];
+        if (w->edge_dir >= 0) {
+            linux_edge_cursors();
+            XDefineCursor(dpy, w->xwindow, g_platform.edge_cur[w->edge_dir]);
+        } else {
+            linux_apply_cursor(w, w->app_cursor);
+        }
+    }
+    for (i32 i = 0; i < 5; i++) if (old_cur[i]) XFreeCursor(dpy, old_cur[i]);
+    for (i32 i = 0; i < 8; i++) if (old_edge[i]) XFreeCursor(dpy, old_edge[i]);
+    XFlush(dpy);
 }
 void platform_set_ime_cursor_pos(f32 x, f32 y, f32 cell_w, f32 cell_h) {
     (void)cell_w;
@@ -4665,6 +4951,23 @@ void platform_ime_reset(PlatformWindow *w) {
         w->pre_len = w->pre_caret = 0;
         linux_preedit_push(w);
     }
+}
+
+/* An ASCII-only Settings field (ui_ime_field_off) has the keyboard: the input
+ * context is left without the focus, so the input method neither composes nor
+ * takes the keys, and gets it back when the keyboard moves on. Only a change
+ * costs a round trip; a window without the focus applies it at focus-in. */
+void platform_ime_allow(PlatformWindow *w, bool allowed) {
+    if (!w) return;
+    X11ImeCall call = x11_ime_allow(&w->ime_gate, w->xic != NULL, allowed, w->focused);
+    if (call == X11_IME_SET_FOCUS) {
+        linux_ic_focus_take(w);
+    } else if (call == X11_IME_UNSET_FOCUS) {
+        xic_focus_drop(&g_ic_focus, w);
+        XUnsetICFocus(w->xic);
+    }
+    if (call != X11_IME_NO_CALL && linux_xim_probe_on())
+        fprintf(stderr, "[xim] input method %s\n", allowed ? "allowed" : "stood down");
 }
 
 bool platform_get_system_symbol_rgba(const char *name, i32 pixel_size,

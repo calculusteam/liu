@@ -20,7 +20,10 @@
  *
  * What a cell is:
  *
- *   valid character     its glyph, one column
+ *   valid character     its glyph; one column, or two for a wide character
+ *                       (CJK, fullwidth forms, emoji: the width the terminal
+ *                       grid gives it, utf8_char_width, which is also the box
+ *                       the renderer draws its glyph in)
  *   byte not UTF-8      U+FFFD, one column, ONE byte — the next byte gets its
  *                       own cell, so a run of Latin-1 letters keeps its length
  *   NUL                 U+2400 (the "NUL" picture), one column
@@ -29,6 +32,14 @@
  *
  * A line's TEXT stops before the CR of a CRLF: the CR belongs to the break, so
  * it is never a cell and the caret can never sit between it and the LF.
+ *
+ * The columns are the view's choice (EditorCols): a wide character is two, the
+ * box its glyph is drawn in, so a glyph never overlaps its neighbour and the
+ * caret never stands inside one; only a tab differs between the code editor
+ * (to the next stop) and the Markdown live editor (one cell). A character that
+ * takes no room in the grid (a combining mark, a joiner) is a cell of its own
+ * here, one column: the caret steps by character, and drawing it into the
+ * previous cell would take a cluster walk.
  */
 #ifndef UI_EDITOR_TEXT_H
 #define UI_EDITOR_TEXT_H
@@ -47,14 +58,32 @@ typedef struct {
     i32 cols;    /* columns it takes; 0 past the end */
 } EditorCell;
 
+/* How a view counts columns. */
+typedef struct {
+    i32  tab;    /* tab stop width in columns; below 1 is taken as 1 */
+    bool wide;   /* a wide character takes two columns, or one */
+} EditorCols;
+
+/* The Markdown live editor's columns: a wide character takes two, and a tab is
+ * one cell (it draws one cell for it). */
+#define EDITOR_LIVE_COLS ((EditorCols){ 1, true })
+
+/* Columns of a character that draws something: two when the terminal grid
+ * gives it two (utf8_char_width, East Asian Width W and F), the box the
+ * renderer draws its glyph in; otherwise one. */
+static inline i32 editor_cp_cols(u32 cp) {
+    if (cp < 0x80) return 1;
+    return utf8_char_width(cp) == 2 ? 2 : 1;
+}
+
 /* The cell that starts at byte `pos` of `line[len]`, when it is drawn from
  * visual column `col` (only a tab's width depends on where it starts). */
-static inline EditorCell editor_cell_at(const char *line, i32 len, i32 pos, i32 col, i32 tab) {
+static inline EditorCell editor_cell_at(const char *line, i32 len, i32 pos, i32 col, EditorCols m) {
     EditorCell c = { 0, 1, 1 };
     if (!line || pos < 0 || pos >= len) { c.bytes = 0; c.cols = 0; return c; }
     u8 b = (u8)line[pos];
     if (b == '\t') {
-        if (tab < 1) tab = 1;
+        i32 tab = m.tab < 1 ? 1 : m.tab;
         if (col < 0) col = 0;
         c.cols = tab - (col % tab);
         return c;
@@ -67,6 +96,7 @@ static inline EditorCell editor_cell_at(const char *line, i32 len, i32 pos, i32 
     if (n == 0) { c.cp = EDITOR_CP_INVALID; return c; }
     c.cp = cp;
     c.bytes = (i32)n;
+    if (m.wide) c.cols = editor_cp_cols(cp);
     return c;
 }
 
@@ -98,7 +128,7 @@ static inline i32 editor_char_back(const char *line, i32 len, i32 pos) {
 }
 
 /* Visual column of byte offset `byte` (clamped to the line). */
-static inline i32 editor_col_at(const char *line, i32 len, i32 byte, i32 tab) {
+static inline i32 editor_col_at(const char *line, i32 len, i32 byte, EditorCols m) {
     if (byte > len) byte = len;
     i32 col = 0;
     for (i32 pos = 0; pos < byte; ) {
@@ -110,7 +140,7 @@ static inline i32 editor_col_at(const char *line, i32 len, i32 byte, i32 tab) {
         col += run - pos;
         pos = run;
         if (pos >= byte) break;
-        EditorCell c = editor_cell_at(line, len, pos, col, tab);
+        EditorCell c = editor_cell_at(line, len, pos, col, m);
         if (c.bytes <= 0) break;
         pos += c.bytes;
         col += c.cols;
@@ -119,19 +149,19 @@ static inline i32 editor_col_at(const char *line, i32 len, i32 byte, i32 tab) {
 }
 
 /* Columns the whole line takes. */
-static inline i32 editor_cols(const char *line, i32 len, i32 tab) {
-    return editor_col_at(line, len, len, tab);
+static inline i32 editor_cols(const char *line, i32 len, EditorCols m) {
+    return editor_col_at(line, len, len, m);
 }
 
 /* The cell boundary nearest to visual column `col`, as a byte offset: the
  * start of the cell that holds the column, or its end when the column is in
- * the cell's right half (which only a tab has). Past the last cell: the end of
- * the line. Always where a cell begins. */
-static inline i32 editor_byte_at_col(const char *line, i32 len, i32 col, i32 tab) {
+ * the cell's right half (which only a tab or a wide character has). Past the
+ * last cell: the end of the line. Always where a cell begins. */
+static inline i32 editor_byte_at_col(const char *line, i32 len, i32 col, EditorCols m) {
     if (col <= 0) return 0;
     i32 at = 0;
     for (i32 pos = 0; pos < len; ) {
-        EditorCell c = editor_cell_at(line, len, pos, at, tab);
+        EditorCell c = editor_cell_at(line, len, pos, at, m);
         if (c.bytes <= 0) break;
         if (col < at + c.cols)
             return (col - at) * 2 >= c.cols ? pos + c.bytes : pos;
@@ -144,12 +174,13 @@ static inline i32 editor_byte_at_col(const char *line, i32 len, i32 col, i32 tab
 /* The same for a POINT: `col` is a fractional column (a click's x divided by
  * the cell width). The caret goes to whichever edge of the cell under the
  * point is nearer — its right half puts the caret after it, the way a native
- * text field answers, and a four-column tab is judged at ITS middle. */
-static inline i32 editor_byte_at_point(const char *line, i32 len, f32 col, i32 tab) {
+ * text field answers, and a four-column tab or a wide character is judged at
+ * ITS middle. */
+static inline i32 editor_byte_at_point(const char *line, i32 len, f32 col, EditorCols m) {
     if (col <= 0.0f) return 0;
     i32 at = 0;
     for (i32 pos = 0; pos < len; ) {
-        EditorCell c = editor_cell_at(line, len, pos, at, tab);
+        EditorCell c = editor_cell_at(line, len, pos, at, m);
         if (c.bytes <= 0) break;
         if (col < (f32)(at + c.cols))
             return (col - (f32)at) * 2.0f >= (f32)c.cols ? pos + c.bytes : pos;

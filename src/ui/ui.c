@@ -48,9 +48,11 @@
 #include "ui/sites_ui.h"
 #include "ui/anim.h"
 #include "ui/chrome_palette.h"
+#include "ui/window_edge.h"
 #include "ui/notification.h"
 #include "ui/status_colors.h"
 #include "ui/toast_stack.h"
+#include "ui/notice_wrap.h"
 #include "ui/icon.h"
 #include "ui/prompt_thumb.h"
 #include "ui/prompt_card_math.h"
@@ -4636,6 +4638,8 @@ i32 app_new_filebrowser_tab(AppState *app, const char *path) {
     tab->kind         = TAB_FILEBROWSER;
     tab->browser_pane = -1;
     tab->fb           = fb;
+    static u64 s_fb_uid;
+    tab->fb_uid       = ++s_fb_uid;
     tab->fb_viewer_ratio = 0.0f;     /* lazy: use VIEWER_WIDTH_RATIO default */
     tab->active       = true;
     tab->dirty        = true;
@@ -5679,6 +5683,13 @@ void app_forget_tab_aliases(AppState *app, i32 index) {
         if (app->fb_prompt_active && app->fb_prompt_actor.id == tab->sftp->id) app->fb_prompt_active = false;
         if (app->fb_prompt_actor.id == tab->sftp->id) app->fb_prompt_actor = (SftpActor){ 0, 0 };
         if (app->fb_actor.id == tab->sftp->id) app->fb_actor = (SftpActor){ 0, 0 };
+    }
+    /* The same for the rail of a Code Editor tab that a Delete asked about. */
+    if (tab->kind == TAB_FILEBROWSER && tab->fb_uid) {
+        const u64 rail = FB_ACTOR_RAIL | tab->fb_uid;
+        if (app->fb_prompt_active && app->fb_prompt_actor.id == rail) app->fb_prompt_active = false;
+        if (app->fb_prompt_actor.id == rail) app->fb_prompt_actor = (SftpActor){ 0, 0 };
+        if (app->fb_actor.id == rail) app->fb_actor = (SftpActor){ 0, 0 };
     }
 
     for (i32 p = 0; p < MAX_SPLIT_PANES; p++) {
@@ -9419,41 +9430,6 @@ const char *ui_fit_cols(const char *s, i32 cols, char *buf, usize cap) {
     return buf;
 }
 
-/* `s` on at most two lines of `cols` display columns: broken at the last
- * space that fits (inside the word when there is none), the second line
- * ellipsized. Returns the number of lines. The sidebar is ~22 columns at its
- * default width, which one line of "Not deleted: the folder is not empty"
- * does not fit in. */
-static i32 ui_wrap_two(const char *s, i32 cols, char *l1, usize c1, char *l2, usize c2) {
-    if (cols < 4) cols = 4;
-    usize len = strlen(s);
-    l2[0] = '\0';
-    if ((i32)utf8_display_cols((const u8 *)s, len) <= cols) {
-        snprintf(l1, c1, "%s", s);
-        return 1;
-    }
-    usize off = 0, last_space = 0;
-    i32 used = 0;
-    while (off < len) {
-        u32 cp = 0; i32 gc = 1;
-        u32 gb = utf8_next_grapheme((const u8 *)s + off, len - off, &cp, &gc);
-        if (gb == 0) break;
-        if (gc < 0) gc = 0;
-        if (used + gc > cols) break;
-        if (cp == ' ') last_space = off;
-        used += gc; off += gb;
-    }
-    usize cut = last_space > 0 ? last_space : off;
-    usize n1 = cut < c1 - 1 ? cut : c1 - 1;
-    memcpy(l1, s, n1);
-    l1[n1] = '\0';
-    const char *rest = s + cut;
-    while (*rest == ' ') rest++;
-    char fit[512];
-    snprintf(l2, c2, "%s", ui_fit_cols(rest, cols, fit, sizeof fit));
-    return l2[0] ? 2 : 1;
-}
-
 /* ---- Context menus: one panel, one row painter ---------------------------
  *
  * A tab's menu, a pane's, the explorer's and a tab group's are the same menu
@@ -9874,6 +9850,16 @@ void ui_ime_field_caret(Renderer *r, AppState *app, const void *owner,
     if (!mask) ui_ime_draw_composition(r, app, x, y, cw, ch, 0.0f, 0.0f);
 }
 
+void ui_ime_field_off(AppState *app, const void *owner, f32 x, f32 y, f32 ch) {
+    app->ime_field_owner = owner;
+    app->ime_spot_x = x;
+    app->ime_spot_y = y;
+    app->ime_spot_h = ch;
+    app->ime_spot_valid = true;
+    app->ime_field_now = true;
+    app->ime_field_off = true;
+}
+
 /* The code editor draws its caret in filebrowser.c, which has no AppState: it
  * leaves the caret on the FileBrowser and the caller claims it here, in the
  * code's own cell. */
@@ -9889,11 +9875,7 @@ static void ui_ime_editor_caret(Renderer *r, AppState *app, const FileBrowser *f
  * four columns in, not two (it stood between the two characters). A masked
  * field draws one bullet per character. */
 static i32 ui_field_cols(const char *buf, i32 len, i32 from, i32 to, bool mask) {
-    if (to <= from) return 0;
-    if (mask) return to - from;
-    i32 a = textedit_byte_offset(buf, len, from);
-    i32 b = textedit_byte_offset(buf, len, to);
-    return b > a ? (i32)utf8_display_cols((const u8 *)buf + a, (usize)(b - a)) : 0;
+    return textedit_field_cols(buf, len, from, to, mask);
 }
 
 /* Draw a chrome text field's value together with the shared editor's caret,
@@ -9910,10 +9892,10 @@ static i32 ui_field_cols(const char *buf, i32 len, i32 from, i32 to, bool mask) 
  *
  * Scroll is advisory state on AppState and updated here: the renderer is the
  * only place that knows how many cells actually fit. */
-f32 ui_draw_edit_field(Renderer *r, AppState *app, const char *buf, i32 len,
-                           f32 x, f32 y, f32 cw, f32 ch, i32 max_cells,
-                           Color fg, Color caret_c, Color sel_c,
-                           bool mask, bool show_caret) {
+f32 ui_draw_edit_field_ex(Renderer *r, AppState *app, const char *buf, i32 len,
+                          f32 x, f32 y, f32 cw, f32 ch, i32 max_cells,
+                          Color fg, Color caret_c, Color sel_c,
+                          bool mask, bool show_caret, bool ime_off) {
     if (max_cells < 1) max_cells = 1;
 
     /* Fields drawn straight onto a panel (settings' API rows, the search bar)
@@ -9968,10 +9950,20 @@ f32 ui_draw_edit_field(Renderer *r, AppState *app, const char *buf, i32 len,
         f32 caret_w = fmaxf(2.0f, 2.0f * (app->dpi_scale > 0.0f
                                           ? app->dpi_scale : 1.0f));
         renderer_draw_rect(r, caret_x, y, caret_w, ch, caret_c);
-        /* The field with the keyboard: an input method composes here. */
-        ui_ime_field_caret(r, app, buf, caret_x, y, cw, ch, mask);
+        /* The field with the keyboard: an input method composes here, unless
+         * the value takes none (ime_off). */
+        if (ime_off) ui_ime_field_off(app, buf, caret_x, y, ch);
+        else         ui_ime_field_caret(r, app, buf, caret_x, y, cw, ch, mask);
     }
     return caret_x;
+}
+
+f32 ui_draw_edit_field(Renderer *r, AppState *app, const char *buf, i32 len,
+                       f32 x, f32 y, f32 cw, f32 ch, i32 max_cells,
+                       Color fg, Color caret_c, Color sel_c,
+                       bool mask, bool show_caret) {
+    return ui_draw_edit_field_ex(r, app, buf, len, x, y, cw, ch, max_cells,
+                                 fg, caret_c, sel_c, mask, show_caret, false);
 }
 
 /* Blink phase shared by every chrome caret: a square on/off pulse on the
@@ -12093,6 +12085,34 @@ static void draw_tab_accent_ex(Renderer *r, Tab *tab, f32 x, f32 y, f32 w, f32 h
                 app->agentctl_tip_y = jp->tab_y + jp->tab_h;
             }
         }
+    }
+
+    /* The edge of a floating window (ui/window_edge.h): X11 draws no frame,
+     * border or shadow for Liu's windows, so two overlapping ones would have no
+     * line between them. One device-pixel outline in the theme's divider colour
+     * over the window's outermost ring; none while maximized or fullscreen. */
+    static void render_window_edge(AppState *app) {
+#ifndef PLATFORM_MACOS
+        PlatformWindow *hw = app->host_window;
+        if (!hw) return;
+        f32 line = window_edge_line_px(app->dpi_scale);
+        if (!window_edge_wanted(platform_draws_own_window_controls(),
+                                platform_window_is_maximized(hw),
+                                platform_window_is_fullscreen(hw),
+                                (f32)app->fb_width, (f32)app->fb_height, line))
+            return;
+        Renderer *r = &app->renderer;
+        const Theme *t = app->config.theme ? app->config.theme : &THEME_Liu;
+        Color c = chrome_palette_for(t).divider_strong;
+        c.a = 1.0f;
+        WindowEdgeRect e[4];
+        i32 n = window_edge_rects((f32)app->fb_width, (f32)app->fb_height, line, e);
+        for (i32 i = 0; i < n; i++)
+            renderer_draw_rect(r, e[i].x, e[i].y, e[i].w, e[i].h, c);
+        renderer_flush_rects(r);
+#else
+        (void)app;
+#endif
     }
 
     static void render_toolbar(AppState *app) {
@@ -21230,6 +21250,7 @@ void app_render(AppState *app) {
      * this frame: the focused pane, then a field drawn over it. */
     app->ime_field_prev = app->ime_field_now;
     app->ime_field_now = false;
+    app->ime_field_off = false;
 
     /* On Metal a glyph is drawable only once a frame's preparation (inside
      * renderer_begin_frame, just above) has queued its texels. A glyph packed
@@ -23606,7 +23627,7 @@ void app_render(AppState *app) {
         Color title_fg = t->fg; title_fg.a *= panel_alpha;
         /* The text below is the SERVER's, in a dialog of Liu's: the title says
          * whose it is, so a prompt worded like "Vault master password" cannot
-         * pass for one of ours (PuTTY's prompt-spoofing advisory). */
+         * pass for one of ours. */
         i32 kbi_title_room = (i32)((dw - 24) / ui_cw);
         char kbi_title[400];
         snprintf(kbi_title, sizeof kbi_title, "Server prompt: %s",
@@ -25946,12 +25967,14 @@ void app_render(AppState *app) {
         f32 w = app->sidebar_width - 2.0f * inset;
         f32 x = inset;
         f32 tx = x + 10.0f * dpi + isz + 8.0f * dpi;
-        char l1[sizeof app->fb_status + 8], l2[sizeof app->fb_status + 8];
-        i32 lines = ui_wrap_two(app->fb_status, (i32)((x + w - 10.0f * dpi - tx) / ui_cw),
-                                l1, sizeof l1, l2, sizeof l2);
+        NoticeWrap nw;
+        i32 cols = (i32)((x + w - 10.0f * dpi - tx) / ui_cw);
+        i32 lines = notice_wrap_keep_end(app->fb_status, cols, NOTICE_WRAP_MAX, &nw);
         f32 line_h = ui_ch + 2.0f * dpi;
         f32 h = (f32)lines * line_h - 2.0f * dpi + 14.0f * dpi;
         f32 y = (f32)app->fb_height - h - app->status_bar_height - inset;
+        app->fb_status_lines = lines; app->fb_status_cols = cols < 4 ? 4 : cols;
+        app->fb_status_x = x; app->fb_status_y = y; app->fb_status_w = w; app->fb_status_h = h;
         Color danger = ui_danger(t);
         Color mark = kind == FB_STATUS_ERROR ? danger
                    : kind == FB_STATUS_OK    ? theme_ui_accent(t) : t->fg;
@@ -25975,8 +25998,8 @@ void app_render(AppState *app) {
         icon_draw(r, kind == FB_STATUS_OK ? ICON_CHECK : ICON_INFO,
                   x + 10.0f * dpi, ty + (ui_ch - isz) * 0.5f, isz, ic);
         Color fg = t->fg; fg.a = 0.95f * sa;
-        draw_text_ex(r, l1, tx, ty, fg, (i32)strlen(l1), ui_cw);
-        if (lines > 1) draw_text_ex(r, l2, tx, ty + line_h, fg, (i32)strlen(l2), ui_cw);
+        for (i32 li = 0; li < lines; li++)
+            draw_text_ex(r, nw.line[li], tx, ty + (f32)li * line_h, fg, (i32)strlen(nw.line[li]), ui_cw);
         renderer_flush_glyphs(r);
         renderer_reset_ui_scale(r);
         }
@@ -26258,6 +26281,8 @@ void app_render(AppState *app) {
      * the decoded image. */
     lightbox_render(app);
     sketch_render(app);
+
+    render_window_edge(app);
 
     /* Floating notices, sharing their grid and chrome with agent notices:
      * newest on top, up to three, each in its kind's mark and colour. Drawn

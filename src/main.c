@@ -31,6 +31,7 @@
 #include "ui/pane_nav.h"
 #include "ui/bench_metrics.h"
 #include "ui/effective_settings.h"
+#include "ui/settings_field.h"
 #include "ui/a11y_text.h"
 #include "ui/bg_image.h"
 #include "ui/task_owner.h"
@@ -155,6 +156,8 @@ extern char **environ;
 
 #include "ui/markdown/md_parse.h"
 #include "ui/diagnostics.h"
+#include "ui/fb_rail_keys.h"   /* which keys a Code Editor tab's rail takes */
+#include "ui/editor_primary.h" /* when the editor's selection is published as X11's PRIMARY */
 #include "cJSON.h"
 
 extern void sidebar_load_hosts(Vault *v);
@@ -3602,6 +3605,12 @@ static void liu_lifecycle_atexit(void) {
      * actually goes away. Stopping capture here makes the light go out with
      * the window. */
     platform_audio_capture_stop();
+#ifdef PLATFORM_LINUX
+    /* A copy only Liu holds goes with it: hand it to the desktop's clipboard
+     * manager when there is one (bounded; nothing happens when there is none).
+     * Last, after everything above is saved. */
+    platform_clipboard_hand_off();
+#endif
 }
 
 /* SIGTERM / SIGINT / SIGHUP terminate the process WITHOUT running atexit, so
@@ -8231,7 +8240,7 @@ static void app_fb_status(AppState *app, FbStatusKind kind, const char *fmt, ...
     /* An action done for an SFTP tab's pane says it in that pane's footer.
      * The text stays here too (a prompt that could not start an operation
      * copies it), but the explorer's line does not show it. */
-    if (app->fb_actor.id) {
+    if (app->fb_actor.id && !(app->fb_actor.id & FB_ACTOR_RAIL)) {
         sftp_tab_say(app, app->fb_actor.id, app->fb_actor.pane,
                      kind == FB_STATUS_ERROR ? SFTP_MSG_ERROR : kind == FB_STATUS_OK ? SFTP_MSG_OK : SFTP_MSG_INFO,
                      app->fb_status);
@@ -8244,6 +8253,14 @@ static void app_fb_status(AppState *app, FbStatusKind kind, const char *fmt, ...
     app->fb_status_kind  = (u8)kind;
     app->fb_status_since = now;
     app->fb_status_until = now + fb_status_hold_sec(kind);
+    /* The rail of a Code Editor tab has no status line of its own: the
+     * explorer's is on screen only while the sidebar is up, so otherwise the
+     * result is a notice. */
+    if (app->fb_actor.id & FB_ACTOR_RAIL) {
+        if (!(app->sidebar_visible && app->sidebar_width >= 150.0f * app->dpi_scale))
+            app_show_toast_kind(app, kind == FB_STATUS_ERROR ? NOTIFY_ERROR : NOTIFY_SUCCESS,
+                                app->fb_status);
+    }
 }
 
 /* The neutral form: progress, and what Copy / Cut put on the clipboard. */
@@ -8252,14 +8269,23 @@ static void app_fb_set_status(AppState *app, const char *msg) {
 }
 
 /* ---- Which browser the explorer's file operations act on -----------------
- * The docked explorer, or a pane of an SFTP tab while AppState.fb_actor names
- * one (set around a call made for it, kept with the prompt it opened and with
- * the task it started — ui/sftp_tab.h). A pane that has gone is a browser
- * with nothing in it: the action finds no row and does nothing. */
+ * The docked explorer, a pane of an SFTP tab, or the rail of a Code Editor
+ * tab while AppState.fb_actor names one (set around a call made for it, kept
+ * with the prompt it opened and with the task it started — ui/sftp_tab.h). A
+ * pane or rail that has gone is a browser with nothing in it: the action finds
+ * no row and does nothing. */
 static FileBrowser g_fb_gone;
 static FileBrowser *app_fb_actor_fb(AppState *app, SftpActor actor) {
     if (!actor.id) return &app->filebrowser;
-    FileBrowser *fb = sftp_tab_actor_fb(app, actor.id, actor.pane);
+    FileBrowser *fb = NULL;
+    if (actor.id & FB_ACTOR_RAIL) {
+        for (i32 i = 0; i < app->tab_count && !fb; i++) {
+            const Tab *t = &app->tabs[i];
+            if (t->kind == TAB_FILEBROWSER && t->fb && (FB_ACTOR_RAIL | t->fb_uid) == actor.id) fb = t->fb;
+        }
+    } else {
+        fb = sftp_tab_actor_fb(app, actor.id, actor.pane);
+    }
     if (fb) return fb;
     memset(&g_fb_gone, 0, sizeof g_fb_gone);
     g_fb_gone.selected = -1;
@@ -12162,6 +12188,8 @@ static void app_fb_delete_request(AppState *app, i32 index) {
     i32 idx[FB_CLIP_MAX];
     i32 n = app_fb_delete_collect(app, index, idx, FB_CLIP_MAX);
     if (n <= 0) return;
+    /* A Code Editor tab's rail lists this machine. */
+    if ((app->fb_actor.id & FB_ACTOR_RAIL) && fb->source != FB_SOURCE_LOCAL) return;
     bool remote = fb->source == FB_SOURCE_SFTP && fb->sftp_handle;
     if (remote || !app_fb_trash_available(app)) { app_fb_delete_ask(app, index, n, ""); return; }
 
@@ -13101,6 +13129,26 @@ static FileBrowser *app_editor_drag_live(AppState *a) {
     return fb;
 }
 
+#ifndef PLATFORM_MACOS
+/* X11's PRIMARY: a selection made in the code editor is what a middle click
+ * pastes, here and in every other X application, as one made in a pane is.
+ * Published once per change of the selection, when no button is down (a drag
+ * in progress is not published at every move). */
+static void app_editor_publish_primary(AppState *a) {
+    FileBrowser *fb = app_editing_fb(a);
+    if (!fb || !fb_editor_sel_active(fb)) return;
+    u64 sig = editor_primary_sig(fb, fb->view_edit_gen, fb->sel_line, fb->sel_col,
+                                 fb->cursor_line, fb->cursor_col);
+    if (sig == a->ed_primary_sig) return;
+    a->ed_primary_sig = sig;
+    usize n = 0;
+    char *t = fb_editor_sel_text(fb, &n);
+    if (!t) return;
+    if (n) (void)platform_primary_set(t);
+    free(t);
+}
+#endif
+
 /* A left-button event to the program, at a VISUAL cell: a program that grabbed
  * the mouse painted the screen itself and its protocol names physical cells. */
 /* Ctrl and Alt as they were held when the press that is being forwarded went
@@ -13130,7 +13178,28 @@ static void app_mouse_fwd_button(AppState *app, Terminal *t, Session *s, i32 col
  * pane, through the paste path Ctrl+Shift+V takes, and gives it the keyboard
  * as a click would. */
 static void app_middle_click(AppState *app, f32 x, f32 y, u32 mods, bool pressed) {
-    if (ui_hit_test(app, x, y).type != HIT_TERMINAL) return;
+    HitResult hit = ui_hit_test(app, x, y);
+    /* Over a document being edited (docked, or in a Code Editor tab) the press
+     * puts the caret at the click and inserts the PRIMARY selection there, as
+     * a text field does; it is one undo step. */
+    {
+        Tab *at = app_active_tab(app);
+        FileBrowser *efb = hit.type == HIT_VIEWER ? &app->filebrowser
+                         : (hit.type == HIT_FBTAB_VIEWER && at && at->kind == TAB_FILEBROWSER) ? at->fb
+                         : NULL;
+        if (efb && efb->editor_mode && efb->view_content) {
+            if (!pressed) return;
+            const char *prim = platform_primary_get();
+            efb->kbd_away = false;
+            if (fb_editor_press(efb, x, y, 1, false) && prim && prim[0]) {
+                fb_editor_push_undo(efb);
+                fb_editor_insert_text(efb, prim, strlen(prim));
+                fb_editor_push_undo(efb);
+            }
+            return;
+        }
+    }
+    if (hit.type != HIT_TERMINAL) return;
     Tab *tab = app_active_tab(app);
     if (!tab || tab->sleeping) return;
     i32 pane = app_pane_index_at(app, tab, x, y);
@@ -16395,6 +16464,7 @@ static void liu_script_state(AppState *a, PlatformWindow *pw) {
         SAYI("fb_view_scroll_px", (i32)fb->view_scroll_px);   /* the rendered Markdown view, in pixels */
         SAYI("fb_cursor_line", fb->cursor_line);
         SAYI("fb_cursor_col", fb->cursor_col);
+        SAYI("fb_vcol", fb_editor_cursor_vcol(fb));        /* where the caret is on screen, in columns */
         SAYI("fb_md_sel", fb_md_selection_active(fb));
         {   /* the rendered note's selection, as far as the screen goes ("|" for a break) */
             char *mt = fb_md_selection_text_visible(fb);
@@ -16423,6 +16493,26 @@ static void liu_script_state(AppState *a, PlatformWindow *pw) {
         SAYI("fb_find", fb->find_active);
         liu_script_kv("fb_cwd", fb->cwd);
         liu_script_kv("fb_file", fb->view_path);
+        /* A Code Editor tab's rail: who has the keyboard, where its rows are
+         * (the origin of the first row, the header and row heights, the
+         * scroll) and what they are called. */
+        if (tab->kind == TAB_FILEBROWSER && tab->fb) {
+            SAYI("fb_rail_keys", fb->kbd_away);
+            f32 dpi = a->dpi_scale;
+            f32 ox = (a->sidebar_visible ? a->sidebar_width : 0.0f) + a->padding;
+            f32 oy = a->tab_bar_height + a->config.style.terminal_top_gap * dpi;
+            liu_script_say("fb_rail=%.2f,%.2f,%.2f,%.2f,%.2f\n", (double)ox, (double)oy,
+                           (double)fb_list_hdr_h(dpi), (double)fb_list_row_h(dpi),
+                           (double)fb->scroll_offset_px);
+            /* fb_entry.N is the rail's row N (".." is no row). */
+            i32 first = fb_list_first(fb);
+            for (i32 i = first; i < fb->entry_count && i - first < 64; i++) {
+                char k[24];
+                snprintf(k, sizeof k, "fb_entry.%d", i - first);
+                liu_script_kv(k, fb->entries[i].name);
+            }
+            liu_script_say("fb_selected=%d,%d\n", fb->selected, fb->selection_count);
+        }
     }
     /* The SFTP tab: each pane's folder and rows (the view, in its order) and
      * the rectangles its last paint laid out — rows have no fixed place a
@@ -16576,6 +16666,21 @@ static void liu_script_state(AppState *a, PlatformWindow *pw) {
     SAYI("settings_tab", a->settings.active_tab);
     SAYI("cfg.resume_agents", a->config.resume_agents);
     SAYI("cfg.restore_screen", a->config.restore_screen);
+    /* The text fields the last frame of Settings drew, kind then x,y,w,h in pixels. */
+    SAYI("settings_fields", a->settings.field_probe_n);
+    liu_script_kv("settings_vault_status", a->settings.vault_status);
+    /* Appearance's - / + boxes, top to bottom, in pixels. */
+    SAYI("settings_steppers", a->settings.stepper_probe_n);
+    for (i32 i = 0; i < a->settings.stepper_probe_n && i < 6; i++)
+        liu_script_say("settings_stepper.%d=%.0f,%.0f,%.0f,%.0f\n", i,
+                       a->settings.stepper_probe[i].x, a->settings.stepper_probe[i].y,
+                       a->settings.stepper_probe[i].w, a->settings.stepper_probe[i].h);
+    for (i32 i = 0; i < a->settings.field_probe_n && i < 8; i++) {
+        liu_script_say("settings_field.%d=%s,%.0f,%.0f,%.0f,%.0f\n", i,
+                       settings_field_policy((SettingsFieldKind)a->settings.field_probe[i].kind)->name,
+                       a->settings.field_probe[i].x, a->settings.field_probe[i].y,
+                       a->settings.field_probe[i].w, a->settings.field_probe[i].h);
+    }
     {   /* Settings > Translate's Model menu: what it lists, which row is the
          * active one and which the configured model's, and where the last
          * frame put the chip, the card and the window's first row (pixels) —
@@ -16897,6 +17002,12 @@ static void liu_script_state(AppState *a, PlatformWindow *pw) {
     SAYI("group_menu", a->group_ctx_menu_active);
     SAYI("fb_menu", a->fb_ctx_menu_active);
     liu_script_kv("fb_status", a->fb_status);     /* the explorer's status line: what was done, refused or failed */
+    {   /* ...and the card it was last drawn as: lines|columns|x,y,w,h in pixels of a dump, "0|" before it is */
+        char card[96];
+        snprintf(card, sizeof card, "%d|%d|%.0f,%.0f,%.0f,%.0f", (int)a->fb_status_lines, (int)a->fb_status_cols, (double)a->fb_status_x,
+                 (double)a->fb_status_y, (double)a->fb_status_w, (double)a->fb_status_h);
+        liu_script_kv("fb_status_card", a->fb_status_lines > 0 ? card : "0|");
+    }
     SAYI("fb_prompt", a->fb_prompt_active);
     SAYI("agent_picker", a->agent_picker_active);
     if (a->agent_picker_active && a->agent_picker_rows) {
@@ -17093,6 +17204,11 @@ static void liu_script_screen(AppState *a, const char *arg) {
  * pressed (the window is never key, so no other reaches it). */
 static bool liu_script_drop_real(const PlatformEvent *ev) {
     if (s_find_demo_own_event) { s_find_demo_own_event = false; return false; }
+    /* A drive that moves the pointer itself (xdotool on X11, in a container)
+     * and reads the app back through the script keeps its mouse. */
+    static i32 real_mouse = -1;
+    if (real_mouse < 0) real_mouse = liu_dev_env("LIU_E2E_REAL_MOUSE") != NULL;
+    if (real_mouse) return false;
     return ev->type == EVENT_MOUSE_DOWN || ev->type == EVENT_MOUSE_UP ||
            ev->type == EVENT_MOUSE_MOVE || ev->type == EVENT_SCROLL;
 }
@@ -17247,8 +17363,10 @@ static bool liu_script_next(AppState *a, PlatformEvent *ev, PlatformWindow *pw, 
         /* `press x y cmd`: the button goes down with Cmd held, which is how a
          * pane is picked up. `shift`: Shift is held — the bypass that makes a
          * pane whose program grabbed the mouse select text itself. A `move`
-         * and a `release` carry it too, as a hand holding the key would. */
-        u32 mods = strcmp(what, "cmd") == 0 ? MOD_SUPER : strcmp(what, "shift") == 0 ? MOD_SHIFT : 0;
+         * and a `release` carry it too, as a hand holding the key would. `ctrl`
+         * is the application's own modifier on X11. */
+        u32 mods = strcmp(what, "cmd") == 0 ? MOD_SUPER : strcmp(what, "shift") == 0 ? MOD_SHIFT :
+                   strcmp(what, "ctrl") == 0 ? MOD_CTRL : 0;
         if (line[0] != 'r')
             liu_script_push_mouse_mods(EVENT_MOUSE_MOVE, 0, x, y, line[0] == 'm' ? mods : 0);
         if (line[0] == 'c' || line[0] == 'p') liu_script_push_mouse_mods(EVENT_MOUSE_DOWN, button, x, y, mods);
@@ -17337,6 +17455,22 @@ static bool liu_script_next(AppState *a, PlatformEvent *ev, PlatformWindow *pw, 
         liu_script_say("ok %d\n", line_no);
         return true;
     }
+    if (!strcmp(line, "fbtrash")) {
+        /* `fbtrash <folder>`: the explorer's deletes move into that folder
+         * instead of the Trash — a scripted run must not leave its fixtures in
+         * the user's. `fbtrash none`: a place with no Trash, so a delete asks
+         * first in the prompt. */
+        if (!arg[0]) { liu_script_say("err %d wants a folder or none\n", line_no); return false; }
+        if (!strcmp(arg, "none")) {
+            a->fb_no_trash = true;
+        } else {
+            snprintf(s_fb_fake_trash, sizeof s_fb_fake_trash, "%s", arg);
+            mkdir(s_fb_fake_trash, 0700);
+            a->fb_no_trash = false;
+        }
+        liu_script_say("ok %d\n", line_no);
+        return false;
+    }
     if (!strcmp(line, "fbnav")) {
         /* `fbnav <folder>`: the explorer is taken to a folder, as a click on
          * it in the list would take it. (Rows have no fixed place a script
@@ -17417,6 +17551,21 @@ static bool liu_script_next(AppState *a, PlatformEvent *ev, PlatformWindow *pw, 
             if (k == NOTIFY_KIND_COUNT) { liu_script_say("err %d no such kind\n", line_no); return false; }
             app_show_toast_kind(a, k, text);
         }
+        liu_script_say("ok %d\n", line_no);
+        return liu_script_paint(ev, pw);
+    }
+    if (!strcmp(line, "fbstatus")) {
+        /* `fbstatus <info|ok|error> <text>`: the explorer's status card, as
+         * app_fb_status raises it (the card is drawn while the sidebar is). */
+        char *sp = strchr(arg, ' ');
+        if (!sp || !sp[1]) { liu_script_say("err %d wants a kind and a text\n", line_no); return false; }
+        *sp = '\0';
+        FbStatusKind k = !strcmp(arg, "ok") ? FB_STATUS_OK : !strcmp(arg, "error") ? FB_STATUS_ERROR : FB_STATUS_INFO;
+        if (strcmp(arg, "ok") && strcmp(arg, "error") && strcmp(arg, "info")) {
+            liu_script_say("err %d no such kind\n", line_no);
+            return false;
+        }
+        app_fb_status(a, k, "%s", sp + 1);
         liu_script_say("ok %d\n", line_no);
         return liu_script_paint(ev, pw);
     }
@@ -24798,6 +24947,7 @@ int main(int argc, char **argv) {
                          * handled in the key handler below). */
                         if (cp == 's' || cp == 'S') fb_editor_save(efb_char);
                     } else if (!(last_key_mods & MOD_CTRL)) {
+                        efb_char->kbd_away = false;      /* typing takes the keyboard from a Code Editor tab's rail */
                         fb_editor_insert_char(efb_char, cp);
                         app_ac_update(&app, efb_char);   /* refresh wiki/tag autocomplete */
                     }
@@ -25746,6 +25896,44 @@ int main(int argc, char **argv) {
                     }
                 }
 
+                /* The same keys in the rail of a Code Editor tab, while the rail
+                 * has the keyboard (a click in it gave it: kbd_away of the
+                 * tab's browser). Delete and Cmd+Backspace take what is
+                 * selected to the Trash, or ask first — the explorer's own
+                 * delete, run with the rail as the acting browser. */
+                {
+                    Tab *rt = app_active_tab(&app);
+                    if (rt && rt->kind == TAB_FILEBROWSER && rt->fb && rt->fb_uid) {
+                        FbRailKeyIn rk = {
+                            .rail_has_keys  = rt->fb->kbd_away,
+                            .plain_list     = rt->fb->view_mode != FVIEW_GRAPH,
+                            .modal_open     = app.fb_ctx_menu_active || app.ssh_dialog_active ||
+                                              app.palette_active || app.search_active ||
+                                              app.create_theme_active || app.kbi_dialog_active ||
+                                              app.fb_prompt_active,
+                            .forward_delete = key == KEY_DELETE,
+                            .backspace      = key == KEY_BACKSPACE,
+                            .app_mod        = (mods & MOD_APP) != 0,
+                            .any_mod        = mods != 0,
+                        };
+                        if (fb_rail_key(&rk) == FB_RAIL_KEY_DELETE) {
+                            SftpActor was = app.fb_actor;
+                            app.fb_actor = (SftpActor){ FB_ACTOR_RAIL | rt->fb_uid, 0 };
+                            app_fb_delete_request(&app, rt->fb->selected);
+                            app.fb_actor = was;
+                            needs_redraw = true;
+#ifndef PLATFORM_MACOS
+                            /* The key's text comes with its timestamp: dropped
+                             * like a shortcut's, or the DEL it types lands in
+                             * the document once the rail gives the keyboard
+                             * back. */
+                            app.shortcut_char_time = event.timestamp;
+#endif
+                            break;
+                        }
+                    }
+                }
+
                 /* SSH dialog input handling */
                 if (app.ssh_dialog_active) {
                     char *field = app.ssh_field == 0 ? app.ssh_host :
@@ -26097,6 +26285,11 @@ int main(int argc, char **argv) {
                         case KEY_X: case KEY_Z: case KEY_D:
                             if (!(mods & MOD_APP)) fconsumed = false;
                             break;
+                        /* Select All is a text command too: it would select
+                         * the document under the bar, whose fields take none. */
+                        case KEY_A:
+                            if (!(mods & MOD_APP)) fconsumed = false;
+                            break;
                         case KEY_DELETE:
                             break;
                         default: fconsumed = false; break;
@@ -26111,6 +26304,14 @@ int main(int argc, char **argv) {
                 FileBrowser *efb_key = app_editing_fb(&app);
                 if (efb_key) {
                     bool consumed = true;
+
+                    /* A key the document takes gives it the keyboard back from
+                     * the rail of a Code Editor tab (never set on the docked
+                     * document: app_editing_fb is NULL while it is away). */
+                    if (efb_key->kbd_away && !app_translate_is_modifier_key(key)) {
+                        efb_key->kbd_away = false;
+                        needs_redraw = true;
+                    }
 
                     /* Autocomplete popup steals navigation/accept keys. */
                     if (efb_key->ac_active && !(mods & (MOD_SUPER | MOD_CTRL | MOD_ALT))) {
@@ -26145,8 +26346,8 @@ int main(int argc, char **argv) {
                                      key != KEY_LEFT && key != KEY_RIGHT &&
                                      key != KEY_UP && key != KEY_DOWN &&
                                      key != KEY_BACKSPACE && key != KEY_DELETE;
-                    if (app_chord && key == KEY_HOME) { fb_editor_goto_doc_start(efb_key); break; }
-                    if (app_chord && key == KEY_END)  { fb_editor_goto_doc_end(efb_key);   break; }
+                    if (app_chord && key == KEY_HOME) { fb_editor_motion(efb_key, FB_MOVE_DOC_START, (mods & MOD_SHIFT) != 0); break; }
+                    if (app_chord && key == KEY_END)  { fb_editor_motion(efb_key, FB_MOVE_DOC_END, (mods & MOD_SHIFT) != 0);   break; }
                     if (app_chord && key == KEY_Y)    { fb_editor_redo(efb_key);           break; }
 #endif
                     /* Shift extends the selection on every motion key; the editor
@@ -28642,6 +28843,7 @@ int main(int argc, char **argv) {
                      * (possibly new) cwd via app_refresh_fb_tab_title. */
                     Tab *atab = app_active_tab(&app);
                     if (!atab || atab->kind != TAB_FILEBROWSER || !atab->fb) break;
+                    atab->fb->kbd_away = true;          /* a click in the rail: it has the keyboard */
                     f32 cw_ui   = 8.0f * app.dpi_scale;
                     /* The header lives at x = ox..ox+list_w. Take list_w from
                      * fb_tab_split — the same helper the renderer and the
@@ -28687,6 +28889,12 @@ int main(int argc, char **argv) {
                     FileBrowser *fb = atab->fb;
                     i32 idx = hit.index;
                     if (idx < 0 || idx >= fb->entry_count) break;
+                    /* A click in the rail gives the rail the keyboard — Delete
+                     * is then the file list's, and the document draws no caret
+                     * (FileBrowser.kbd_away). Opening a file hands the keyboard
+                     * to its document (fb_open_file), so it is taken again
+                     * below. */
+                    fb->kbd_away = true;
                     /* Plain clicks expand folders or open files; modifiers select. */
                     u32 mods = event.mouse.mods;
                     if (mods & MOD_APP) {
@@ -28708,6 +28916,7 @@ int main(int argc, char **argv) {
                     bool was_graph = (fb->view_mode == FVIEW_GRAPH);
                     bool is_dir    = fb->entries[idx].is_dir;
                     bool opened = fb_open_file(fb, idx);
+                    fb->kbd_away = true;
                     if (was_graph && is_dir) {
                         /* Folder filter: entering a folder re-scopes the
                          * graph to it (recursively), so a codebase's many
@@ -28729,6 +28938,7 @@ int main(int argc, char **argv) {
                     if (!atab || atab->kind != TAB_FILEBROWSER || !atab->fb) break;
                     fb_sel_clear(atab->fb);
                     atab->fb->selected = -1;
+                    atab->fb->kbd_away = true;
                     break;
                 }
                 case HIT_FBTAB_DIVIDER:
@@ -28753,6 +28963,7 @@ int main(int argc, char **argv) {
                                      "%s", atab->fb->view_path);
                         }
                     } else if (atab && atab->kind == TAB_FILEBROWSER && atab->fb) {
+                        atab->fb->kbd_away = false;     /* a click in the document takes the keyboard back */
                         if (fb_graph_active(atab->fb)) {
                             if (fb_graph_panel_press(atab->fb, mx, my)) {
                                 needs_redraw = true; break;
@@ -31736,6 +31947,10 @@ int main(int argc, char **argv) {
             }
         }
 
+#ifndef PLATFORM_MACOS
+        if (!mouse_down_now) app_editor_publish_primary(&app);
+#endif
+
         bool needs_session_poll = poll_needs_service(
             fd_fires, had_event, had_saturated_pane_last_frame,
             pty_reader_backlog(), any_write_pending);
@@ -32462,8 +32677,10 @@ int main(int argc, char **argv) {
             for (i32 i = 0; i < app.tab_count; i++) {
                 Session *panes[MAX_SPLIT_PANES];
                 i32 np = pane_sessions_collect(&app.tabs[i], panes);
-                for (i32 pi = 0; pi < np; pi++)
+                for (i32 pi = 0; pi < np; pi++) {
                     session_keepalive_check(panes[pi], tick_now);
+                    session_forward_tick(panes[pi]);
+                }
             }
         }
 
@@ -32649,6 +32866,9 @@ int main(int argc, char **argv) {
                 platform_ime_reset(g_liu_wins[wi].pw);
                 g_liu_wins[wi].needs_redraw = true;
             }
+            /* A field that is ASCII by construction takes no input method
+             * while it has the keyboard (ui_ime_field_off). */
+            platform_ime_allow(g_liu_wins[wi].pw, !(ws->ime_field_now && ws->ime_field_off));
         }
 #endif
         for (i32 wi = 0; wi < g_liu_win_count; wi++) {

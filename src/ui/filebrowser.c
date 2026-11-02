@@ -2428,14 +2428,14 @@ static FbCodeSlice fb_code_visible_slice(const char *line, i32 len, i32 first, i
     if (columns < 0) columns = 0;
     i32 pos = 0, col = 0;
     while (pos < len) {
-        EditorCell c = editor_cell_at(line, len, pos, col, FB_TAB_COLS);
+        EditorCell c = editor_cell_at(line, len, pos, col, FB_CODE_COLS);
         if (col + c.cols > first) break;
         pos += c.bytes;
         col += c.cols;
     }
     FbCodeSlice slice = {.begin=pos, .column=col};
     while (pos < len && col < first + columns) {
-        EditorCell c = editor_cell_at(line, len, pos, col, FB_TAB_COLS);
+        EditorCell c = editor_cell_at(line, len, pos, col, FB_CODE_COLS);
         pos += c.bytes;
         col += c.cols;
     }
@@ -5152,14 +5152,14 @@ static f32 fb_live_layout(FileBrowser *fb, bool locate, f32 mx, f32 target_y,
             if (caret_y && line == fb->cursor_line && fb->cursor_col >= at &&
                 (fb->cursor_col < stop || stop == len)) {
                 *caret_y = y; *caret_h = lh;
-                i32 column = editor_col_at(p + at, stop - at, fb->cursor_col - at, 1);
+                i32 column = editor_col_at(p + at, stop - at, fb->cursor_col - at, FB_LIVE_COLS);
                 if (cls.code || cls.fence) column -= fb->view_scroll_x;
                 fb->live_cursor_x = fb->md_origin_x + column * cw;
             }
             if (locate && !found && target_y < y + lh) {
                 f32 col = (mx - fb->md_origin_x) / cw;
                 if (cls.code || cls.fence) col += fb->view_scroll_x;
-                i32 byte = editor_byte_at_point(p + at, stop - at, col, 1);
+                i32 byte = editor_byte_at_point(p + at, stop - at, col, FB_LIVE_COLS);
                 /* A click at a soft row's right edge belongs to that row. */
                 if (at + byte == stop && stop < len && byte > 0)
                     byte -= editor_char_back(p + at, stop - at, byte);
@@ -5221,7 +5221,7 @@ static f32 fb_live_inline(Renderer *r, const Theme *th, const char *s, i32 len,
     i32 i = 0;
 #define LIV_RUN(from,to,col) do { for (i32 _k=(from); _k<(to);) { u32 _cp; \
         u32 _nb=utf8_decode((const u8*)s+_k,(usize)(len-_k),&_cp); if(!_nb){_k++;continue;} \
-        if(_cp>=32){ renderer_push_glyph(r,x,y,_cp,(col)); x+=cw; } _k+=_nb; } } while(0)
+        if(_cp>=32){ renderer_push_glyph(r,x,y,_cp,(col)); x+=cw*(f32)editor_cp_cols(_cp); } _k+=_nb; } } while(0)
     while (i < len) {
         unsigned char c = (unsigned char)s[i];
         if (c=='*' && i+1<len && s[i+1]=='*') {                 /* **bold** */
@@ -5235,7 +5235,7 @@ static f32 fb_live_inline(Renderer *r, const Theme *th, const char *s, i32 len,
         if (c=='`') {                                           /* `code` */
             i32 j=i+1; while(j<len && s[j]!='`') j++;
             if (j<len) {
-                f32 span=(f32)utf8_len((const u8*)s+i+1,(usize)(j-i-1))*cw;
+                f32 span=(f32)editor_cols(s+i+1,j-i-1,FB_LIVE_COLS)*cw;
                 renderer_draw_rect(r, x-1.0f, y-1.0f, span+2.0f, ch+2.0f, codebg);
                 LIV_RUN(i+1,j,codefg); i=j+1; continue;
             }
@@ -5247,7 +5247,7 @@ static f32 fb_live_inline(Renderer *r, const Theme *th, const char *s, i32 len,
         if (c=='=' && i+1<len && s[i+1]=='=') {                 /* ==highlight== */
             i32 j=i+2; while(j+1<len && !(s[j]=='='&&s[j+1]=='=')) j++;
             if (j+1<len) {
-                f32 span=(f32)utf8_len((const u8*)s+i+2,(usize)(j-i-2))*cw;
+                f32 span=(f32)editor_cols(s+i+2,j-i-2,FB_LIVE_COLS)*cw;
                 renderer_draw_rect(r, x-1.0f, y, span+2.0f, ch, hlbg);
                 LIV_RUN(i+2,j,fg); i=j+2; continue;
             }
@@ -5273,7 +5273,7 @@ static f32 fb_live_inline(Renderer *r, const Theme *th, const char *s, i32 len,
             LIV_RUN(i,j,tagc); i=j; continue;
         }
         { u32 cp; u32 nb=utf8_decode((const u8*)s+i,(usize)(len-i),&cp);
-          if(!nb){i++;continue;} if(cp>=32){ renderer_push_glyph(r,x,y,cp,fg); x+=cw; } i+=nb; }
+          if(!nb){i++;continue;} if(cp>=32){ renderer_push_glyph(r,x,y,cp,fg); x+=cw*(f32)editor_cp_cols(cp); } i+=nb; }
     }
 #undef LIV_RUN
     return x;
@@ -5285,15 +5285,15 @@ static f32 fb_live_inline(Renderer *r, const Theme *th, const char *s, i32 len,
  * wrong for code — in `wp_http_validate_url(` the two underscores would be an
  * emphasis pair, hidden, with `http` dimmed between them, and a fence line
  * `` ```php `` an empty inline-code span followed by a backtick. One cell per
- * character, as the caret on the active line counts them (a tab is one cell
- * here), the first `dim_len` bytes in `dim` (a fence's marks) and the rest in
- * `base`. */
+ * character (two for a wide one), as the caret on the active line counts them
+ * (a tab is one cell here), the first `dim_len` bytes in `dim` (a fence's
+ * marks) and the rest in `base`. */
 static void fb_live_literal(Renderer *r, const char *s, i32 len, i32 dim_len,
                             f32 x, f32 y, f32 cw, Color base, Color dim) {
     for (i32 k = 0; k < len; ) {
-        EditorCell c = editor_cell_at(s, len, k, 0, 1);
+        EditorCell c = editor_cell_at(s, len, k, 0, FB_LIVE_COLS);
         if (c.cp) renderer_push_glyph(r, x, y, c.cp, k < dim_len ? dim : base);
-        x += cw;
+        x += (f32)c.cols * cw;
         k += c.bytes;
     }
 }
@@ -5320,8 +5320,8 @@ static void fb_live_inline_raw(Renderer *r, const Theme *th, const char *s, i32 
      * it one cell left of where the caret says it is. (Tab width 1: in this
      * view a tab is one cell, as its caret counts it.) */
 #define RAW_RUN(from,to,col) do { for (i32 _k=(from); _k<(to);) { \
-        EditorCell _c=editor_cell_at(s,len,_k,0,1); \
-        if(_c.cp) renderer_push_glyph(r,gx,y,_c.cp,(col)); gx+=cw; _k+=_c.bytes; } } while(0)
+        EditorCell _c=editor_cell_at(s,len,_k,0,FB_LIVE_COLS); \
+        if(_c.cp) renderer_push_glyph(r,gx,y,_c.cp,(col)); gx+=cw*(f32)_c.cols; _k+=_c.bytes; } } while(0)
     i32 i = 0;
     if (marker_len > 0) { i32 m = marker_len < len ? marker_len : len; RAW_RUN(0,m,dim); i = m; }
     while (i < len) {
@@ -5337,7 +5337,7 @@ static void fb_live_inline_raw(Renderer *r, const Theme *th, const char *s, i32 
         if (c=='`') {                                           /* `code` */
             i32 j=i+1; while(j<len && s[j]!='`') j++;
             if (j<len) {
-                f32 span=(f32)utf8_len((const u8*)s+i,(usize)(j+1-i))*cw;
+                f32 span=(f32)editor_cols(s+i,j+1-i,FB_LIVE_COLS)*cw;
                 renderer_draw_rect(r, gx-1.0f, y-1.0f, span+2.0f, ch+2.0f, codebg);
                 RAW_RUN(i,i+1,dim); RAW_RUN(i+1,j,codefg); RAW_RUN(j,j+1,dim); i=j+1; continue;
             }
@@ -5349,7 +5349,7 @@ static void fb_live_inline_raw(Renderer *r, const Theme *th, const char *s, i32 
         if (c=='=' && i+1<len && s[i+1]=='=') {                 /* ==highlight== */
             i32 j=i+2; while(j+1<len && !(s[j]=='='&&s[j+1]=='=')) j++;
             if (j+1<len) {
-                f32 span=(f32)utf8_len((const u8*)s+i,(usize)(j+2-i))*cw;
+                f32 span=(f32)editor_cols(s+i,j+2-i,FB_LIVE_COLS)*cw;
                 renderer_draw_rect(r, gx-1.0f, y, span+2.0f, ch, hlbg);
                 RAW_RUN(i,i+2,dim); RAW_RUN(i+2,j,base); RAW_RUN(j,j+2,dim); i=j+2; continue;
             }
@@ -5374,8 +5374,8 @@ static void fb_live_inline_raw(Renderer *r, const Theme *th, const char *s, i32 
             i32 j=i+1; while(j<len && (isalnum((unsigned char)s[j])||s[j]=='_'||s[j]=='-'||s[j]=='/')) j++;
             RAW_RUN(i,j,tagc); i=j; continue;
         }
-        { EditorCell cell = editor_cell_at(s, len, i, 0, 1);
-          if (cell.cp) renderer_push_glyph(r,gx,y,cell.cp,base); gx+=cw; i+=cell.bytes; }
+        { EditorCell cell = editor_cell_at(s, len, i, 0, FB_LIVE_COLS);
+          if (cell.cp) renderer_push_glyph(r,gx,y,cell.cp,base); gx+=cw*(f32)cell.cols; i+=cell.bytes; }
     }
 #undef RAW_RUN
 }
@@ -5844,8 +5844,8 @@ void fb_render_viewer(FileBrowser *fb, Renderer *r, f32 x, f32 y, f32 w, f32 h,
                         if (in_sel) {
                             i32 sb = li == sl0 ? sc0 : 0, eb = li == sl1 ? sc1 : ll;
                             sb = sb > at ? sb : at; eb = eb < stop ? eb : stop;
-                            i32 vs = editor_col_at(p + at, stop - at, sb - at, 1);
-                            i32 ve = editor_col_at(p + at, stop - at, eb - at, 1);
+                            i32 vs = editor_col_at(p + at, stop - at, sb - at, FB_LIVE_COLS);
+                            i32 ve = editor_col_at(p + at, stop - at, eb - at, FB_LIVE_COLS);
                             if (stop == ll && li < sl1) ve++;
                             if (ve > vs) renderer_draw_rect(r, lx + vs * lcw, cy, (ve - vs) * lcw, lch, live_sel_col);
                         }
@@ -5853,7 +5853,7 @@ void fb_render_viewer(FileBrowser *fb, Renderer *r, f32 x, f32 y, f32 w, f32 h,
                             fb_find_draw_line(fb, r, (usize)(p + at - fb->view_content), stop - at, lx, cy, lcw, lch, theme);
                         fb_live_literal(r, p + at, stop - at, 0, lx, cy, lcw, fg, dimc);
                         if (active && fb->cursor_col >= at && (fb->cursor_col < stop || stop == ll)) {
-                            i32 vc = editor_col_at(p + at, stop - at, fb->cursor_col - at, 1);
+                            i32 vc = editor_col_at(p + at, stop - at, fb->cursor_col - at, FB_LIVE_COLS);
                             f32 cx = lx + vc * lcw;
                             if (!fb->kbd_away) {
                                 renderer_flush_glyphs(r);
@@ -5873,7 +5873,7 @@ void fb_render_viewer(FileBrowser *fb, Renderer *r, f32 x, f32 y, f32 w, f32 h,
             }
             f32 saved_lx = lx;
             if (code_line || is_fence) {
-                i32 columns = editor_cols(p, ll, 1);
+                i32 columns = editor_cols(p, ll, FB_LIVE_COLS);
                 if (columns > fb->code_max_vis_cols) fb->code_max_vis_cols = columns;
                 lx -= fb->view_scroll_x * lcw;
             }
@@ -5895,14 +5895,9 @@ void fb_render_viewer(FileBrowser *fb, Renderer *r, f32 x, f32 y, f32 w, f32 h,
                 renderer_draw_rect(r, lx-2.0f*dpi, cy-1.0f*dpi, maxx-lx+4.0f*dpi, lch+2.0f*dpi, (Color){1,1,1,0.05f});
 
             if (in_sel) {
-                i32 vs = 0, ve = 0;
                 i32 sb = li == sl0 ? sc0 : 0, eb = li == sl1 ? sc1 : ll;
-                for (i32 k = 0; k < ll; ) {
-                    if (k < sb) vs++;
-                    if (k < eb) ve++;
-                    u32 cpq; u32 nbq = utf8_decode((const u8*)p + k, (usize)(ll - k), &cpq);
-                    k += nbq ? (i32)nbq : 1;
-                }
+                i32 vs = editor_col_at(p, ll, sb, FB_LIVE_COLS);
+                i32 ve = editor_col_at(p, ll, eb, FB_LIVE_COLS);
                 if (li < sl1) ve++;                              /* the break is selected */
                 f32 sx0 = lx + (f32)vs * lcw, sx1 = lx + (f32)ve * lcw;
                 if (sx1 > maxx) sx1 = maxx;
@@ -5924,12 +5919,8 @@ void fb_render_viewer(FileBrowser *fb, Renderer *r, f32 x, f32 y, f32 w, f32 h,
                 if (active) {
                 i32 cb = fb->cursor_col; if (cb < 0) cb = 0; if (cb > ll) cb = ll;
                 /* cursor_col is a BYTE offset; the caret's visual column is the
-                 * count of codepoints before it (a multi-byte char is 1 column). */
-                i32 vcol = 0;
-                for (i32 k = 0; k < cb; ) {
-                    u32 cp2; u32 nb2 = utf8_decode((const u8*)p+k,(usize)(ll-k),&cp2);
-                    k += nb2 ? (i32)nb2 : 1; vcol++;
-                }
+                 * columns of the characters before it (a wide one is two). */
+                i32 vcol = editor_col_at(p, ll, cb, FB_LIVE_COLS);
                 renderer_flush_glyphs(r);
                 Color cur = theme ? theme->cursor : (Color){0.8f,0.8f,0.85f,0.9f}; cur.a = 0.9f;
                 /* A caret says "keys land here" — not while they land in the
@@ -6108,7 +6099,7 @@ void fb_render_viewer(FileBrowser *fb, Renderer *r, f32 x, f32 y, f32 w, f32 h,
                                                  line_off, brk) - line_off);
             f32 ly = content_y + vi * ch;
             line_num++;
-            i32 line_cols = editor_cols(line, len, FB_TAB_COLS);
+            i32 line_cols = editor_cols(line, len, FB_CODE_COLS);
             if (line_cols > max_vis_len) max_vis_len = line_cols;
 
             /* Warm only the visible UTF-8 slice (plus the partial edge cell)
@@ -6142,7 +6133,7 @@ void fb_render_viewer(FileBrowser *fb, Renderer *r, f32 x, f32 y, f32 w, f32 h,
                 i32 indent_cols = 0;
                 i32 wi = 0;
                 while (wi < len && (line[wi] == ' ' || line[wi] == '\t')) {
-                    indent_cols += editor_cell_at(line, len, wi, indent_cols, FB_TAB_COLS).cols;
+                    indent_cols += editor_cell_at(line, len, wi, indent_cols, FB_CODE_COLS).cols;
                     wi++;
                 }
                 if (wi < len) {   /* not a blank/whitespace-only line */
@@ -6163,8 +6154,8 @@ void fb_render_viewer(FileBrowser *fb, Renderer *r, f32 x, f32 y, f32 w, f32 h,
             if (sel_draw) {
                 i32 abs_line = fb->view_scroll + vi;
                 if (abs_line >= sl0 && abs_line <= sl1) {
-                    i32 vs = editor_col_at(line, len, abs_line == sl0 ? sc0 : 0, FB_TAB_COLS);
-                    i32 ve = editor_col_at(line, len, abs_line == sl1 ? sc1 : len, FB_TAB_COLS);
+                    i32 vs = editor_col_at(line, len, abs_line == sl0 ? sc0 : 0, FB_CODE_COLS);
+                    i32 ve = editor_col_at(line, len, abs_line == sl1 ? sc1 : len, FB_CODE_COLS);
                     if (abs_line < sl1) ve += 1;
                     f32 sx0 = text_x + (f32)(vs - fb->view_scroll_x) * cw;
                     f32 sx1 = text_x + (f32)(ve - fb->view_scroll_x) * cw;
@@ -6210,8 +6201,11 @@ void fb_render_viewer(FileBrowser *fb, Renderer *r, f32 x, f32 y, f32 w, f32 h,
                  * is drawn (U+FFFD) in a column of its own — the same column
                  * the caret counts, so a Latin-1 file keeps its accented
                  * letters and the caret stays on them. */
-                EditorCell cell = editor_cell_at(line, len, ci, col, FB_TAB_COLS);
-                if (cell.cp && cx >= text_x - 0.5f)
+                EditorCell cell = editor_cell_at(line, len, ci, col, FB_CODE_COLS);
+                /* A wide character that would stand half outside the viewer
+                 * is left out, not drawn over what is beside it. */
+                if (cell.cp && cx >= text_x - 0.5f &&
+                    (cell.cols < 2 || cx + (f32)cell.cols * cw <= x + w))
                     renderer_push_glyph(r, cx, ly, cell.cp, cc);
                 cx += (f32)cell.cols * cw;
                 col += cell.cols;
@@ -6233,7 +6227,7 @@ void fb_render_viewer(FileBrowser *fb, Renderer *r, f32 x, f32 y, f32 w, f32 h,
                 /* cursor_col is a byte offset — the visual column is the sum
                  * of the cells before it, from the painter's own walk. */
                 const char *cls = editor_line_start(fb, fb->cursor_line);
-                i32 vcol = editor_col_at(cls, line_len, cur_col, FB_TAB_COLS);
+                i32 vcol = editor_col_at(cls, line_len, cur_col, FB_CODE_COLS);
                 f32 cur_x = text_x + (f32)(vcol - fb->view_scroll_x) * cw;
                 f32 cur_y = content_y + cline * ch;
                 Color cur_clr = theme ? theme->cursor : (Color){0.8f, 0.8f, 0.85f, 0.9f};
@@ -6289,7 +6283,7 @@ void fb_render_viewer(FileBrowser *fb, Renderer *r, f32 x, f32 y, f32 w, f32 h,
                 i32 cur_col = fb->cursor_col;
                 if (cur_col < 0) cur_col = 0;
                 if (cur_col > line_len) cur_col = line_len;
-                i32 vcol = editor_col_at(cls, line_len, cur_col, FB_TAB_COLS);
+                i32 vcol = editor_col_at(cls, line_len, cur_col, FB_CODE_COLS);
                 snprintf(left_buf, sizeof left_buf, "Ln %d, Col %d",
                          fb->cursor_line + 1, vcol + 1);
             } else if (fb->view_mode == FVIEW_MARKDOWN && !fb->md_doc) {
@@ -7580,12 +7574,12 @@ bool fb_md_live_locate(FileBrowser *fb, f32 mx, f32 my) {
     return true;
 }
 
-/* How wide this view draws a tab. The code and text editor runs it to the next
- * stop; the Markdown live editor draws one cell for it (fb_live_inline_raw),
- * and the column arithmetic has to be the painter's or the caret leaves the
- * glyphs. */
-static i32 editor_tab_cols(const FileBrowser *fb) {
-    return fb->view_mode == FVIEW_MARKDOWN ? 1 : FB_TAB_COLS;
+/* How this view counts columns. The code and text editor runs a tab to the
+ * next stop and gives a wide character two columns; the Markdown live editor
+ * draws one cell for each (fb_live_inline_raw), and the column arithmetic has
+ * to be the painter's or the caret leaves the glyphs. */
+static EditorCols editor_cols_of(const FileBrowser *fb) {
+    return fb->view_mode == FVIEW_MARKDOWN ? FB_LIVE_COLS : FB_CODE_COLS;
 }
 
 /* Visual column of the cursor — cursor_col is a byte offset. The sum of the
@@ -7597,7 +7591,11 @@ static i32 editor_cursor_vcol(FileBrowser *fb) {
     i32 cc = fb->cursor_col;
     if (cc < 0) cc = 0;
     if (cc > ll) cc = ll;
-    return editor_col_at(ls, ll, cc, editor_tab_cols(fb));
+    return editor_col_at(ls, ll, cc, editor_cols_of(fb));
+}
+
+i32 fb_editor_cursor_vcol(FileBrowser *fb) {
+    return (fb && fb->view_content) ? editor_cursor_vcol(fb) : 0;
 }
 
 /* Keep the caret horizontally visible: follow view_scroll_x the same way the
@@ -7624,8 +7622,8 @@ static void editor_hfollow(FileBrowser *fb) {
  * malformed byte one of its own, a tab as wide as it is drawn — so "the same
  * column" on two lines is the same place on screen. Always a character
  * boundary. */
-static i32 editor_byte_for_vcol(const char *line, i32 line_len, i32 vcol, i32 tab) {
-    return editor_snap_boundary(line, editor_byte_at_col(line, line_len, vcol, tab), line_len);
+static i32 editor_byte_for_vcol(const char *line, i32 line_len, i32 vcol, EditorCols m) {
+    return editor_snap_boundary(line, editor_byte_at_col(line, line_len, vcol, m), line_len);
 }
 
 void fb_editor_move(FileBrowser *fb, i32 dcol, i32 drow) {
@@ -7653,7 +7651,7 @@ void fb_editor_move(FileBrowser *fb, i32 dcol, i32 drow) {
      * of the two lines holds a multi-byte character, and the byte offset can
      * fall in the middle of one. */
     if (drow != 0 && line_start)
-        fb->cursor_col = editor_byte_for_vcol(line_start, line_len, want, editor_tab_cols(fb));
+        fb->cursor_col = editor_byte_for_vcol(line_start, line_len, want, editor_cols_of(fb));
 
     /* Horizontal motion steps whole codepoints (cursor_col is a byte offset). */
     if (dcol > 0) {
@@ -8820,7 +8818,7 @@ bool fb_editor_click_caret(FileBrowser *fb, f32 mx, f32 my) {
     if (!ls) return false;
     i32 ll = editor_line_len(fb, line);
     fb->cursor_line = line;
-    fb->cursor_col  = editor_byte_at_point(ls, ll, want, FB_TAB_COLS);
+    fb->cursor_col  = editor_byte_at_point(ls, ll, want, FB_CODE_COLS);
     return true;
 }
 

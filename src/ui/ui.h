@@ -579,8 +579,11 @@ struct SftpTab;
 
 /* Which browser the explorer's file operations act on: the docked explorer
  * (id 0), or a pane of an SFTP tab — named by the tab's id, never by a
- * pointer, because the work it starts can outlive the tab. */
+ * pointer, because the work it starts can outlive the tab. An id with
+ * FB_ACTOR_RAIL set names the rail of the Code Editor tab whose Tab.fb_uid is
+ * the rest of it (pane 0). */
 typedef struct { u64 id; i32 pane; } SftpActor;
+#define FB_ACTOR_RAIL ((u64)1 << 63)
 
 typedef struct {
     char       title[128];
@@ -616,6 +619,9 @@ typedef struct {
      * freed by app_close_tab. The viewer state (view_mode, view_content,
      * …) lives inside FileBrowser already. */
     FileBrowser *fb;
+    /* Names this tab's rail to the explorer's file operations (SftpActor with
+     * FB_ACTOR_RAIL); 0 until set by app_new_filebrowser_tab. */
+    u64          fb_uid;
     /* When the FB tab has a file open, the right-side viewer takes this
      * fraction of the tab content area. Stored per-tab so each FB tab
      * remembers its own divider position. 0 = use VIEWER_WIDTH_RATIO. */
@@ -1722,6 +1728,7 @@ typedef struct AppState {
     bool        ime_spot_valid;
     bool        ime_field_now;    /* a field claimed the spot this frame */
     bool        ime_field_prev;   /* ... the frame before: the pane draws none */
+    bool        ime_field_off;    /* ... and it takes no input method (ui_ime_field_off) */
     const void *ime_field_owner;  /* that field (its buffer), as an identity */
     ImeTarget   ime_target;       /* where a composition belongs (ui/ime_target.h) */
     /* Why app_init() returned false, in words for the startup alert (the
@@ -1855,6 +1862,10 @@ typedef struct AppState {
     i32       ed_drag_dir;
     f32       ed_drag_x;
     f64       ed_drag_next;
+    /* X11: what the editor's selection was when it last became the PRIMARY
+     * selection (a hash of the document, its generation and the two ends), so
+     * it is published once per change. */
+    u64       ed_primary_sig;
 
     /* Passphrase prompt dialog (shown when key auth needs passphrase) */
     bool      passphrase_dialog_active;
@@ -2045,10 +2056,12 @@ typedef struct AppState {
      * file operation did, by name, or why it did not (kind = FbStatusKind). */
     /* LIU_FBMENU_DEMO only: behave as a place with no Trash, so a delete asks. */
     bool      fb_no_trash;
-    char      fb_status[128];
+    char      fb_status[256];         /* the card wraps it to NOTICE_WRAP_MAX lines (ui/notice_wrap.h) */
     u8        fb_status_kind;
     f64       fb_status_since;        /* wall-clock seconds */
     f64       fb_status_until;        /* absolute wall-clock seconds */
+    i32       fb_status_lines, fb_status_cols;   /* the card as last drawn: its lines, their width and its rect (the driver reads them) */
+    f32       fb_status_x, fb_status_y, fb_status_w, fb_status_h;
 
     /* Background paste/transfer task. The worker thread runs a snapshot of
      * the clipboard against a shimmed destination so a GB-scale transfer no
@@ -2739,6 +2752,12 @@ f32 ui_draw_edit_field(Renderer *r, AppState *app, const char *buf, i32 len,
                        f32 x, f32 y, f32 cw, f32 ch, i32 max_cells,
                        Color fg, Color caret_c, Color sel_c,
                        bool mask, bool show_caret);
+/* ... for a field that takes no input method: `ime_off` claims the keyboard
+ * through ui_ime_field_off instead of ui_ime_field_caret. */
+f32 ui_draw_edit_field_ex(Renderer *r, AppState *app, const char *buf, i32 len,
+                          f32 x, f32 y, f32 cw, f32 ch, i32 max_cells,
+                          Color fg, Color caret_c, Color sel_c,
+                          bool mask, bool show_caret, bool ime_off);
 /* Shared caret blink phase (macOS cadence, strong floor). */
 f32 ui_caret_alpha(void);
 /* The text field that has the keyboard, at its caret (x, y: the caret's top;
@@ -2749,6 +2768,11 @@ f32 ui_caret_alpha(void);
  * caret calls it where it draws the caret. */
 void ui_ime_field_caret(Renderer *r, AppState *app, const void *owner,
                         f32 x, f32 y, f32 cw, f32 ch, bool mask);
+/* The same claim for a field that takes no input method (an ASCII-only value:
+ * a key, a URL, an id): the pane still draws no composition under it, the field
+ * draws none, and the loop asks the platform to stand the window's input
+ * context down while it has the keyboard (AppState.ime_field_off). */
+void ui_ime_field_off(AppState *app, const void *owner, f32 x, f32 y, f32 ch);
 
 /* Text-area registry: which parts of the chrome are editable text.
  *

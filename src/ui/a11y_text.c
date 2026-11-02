@@ -4,6 +4,7 @@
 #include "ui/a11y_text.h"
 
 #include "core/utf8.h"
+#include "renderer/renderer.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -100,10 +101,113 @@ static bool grow(void **p, u32 *cap, u32 need, usize elem) {
     return true;
 }
 
+/* ---- cell styles ------------------------------------------------------------- */
+
+#define A11Y_STYLE_MAX   4096u     /* distinct styles on one screen; past it a cell reads plain */
+#define A11Y_STYLE_SLOTS 8192u     /* the hash over them: a power of two, twice the above */
+
+static inline u32 style_slot(const PlatformA11yStyle *s) {
+    u64 h = 0xCBF29CE484222325ull;
+    h = (h ^ s->fg) * 0x100000001B3ull;
+    h = (h ^ s->bg) * 0x100000001B3ull;
+    h = (h ^ (((u64)s->flags << 8) | s->underline)) * 0x100000001B3ull;
+    return (u32)(h ^ (h >> 32));
+}
+
+static inline bool style_eq(const PlatformA11yStyle *a, const PlatformA11yStyle *b) {
+    return a->fg == b->fg && a->bg == b->bg && a->flags == b->flags && a->underline == b->underline;
+}
+
+/* The index of `k` in the table, added when it is new. */
+static u16 style_intern(A11yTextBuf *b, const PlatformA11yStyle *k) {
+    u32 mask = A11Y_STYLE_SLOTS - 1u;
+    u32 i = style_slot(k) & mask;
+    for (u16 e; (e = b->style_hash[i]) != 0; i = (i + 1u) & mask)
+        if (style_eq(&b->styles[e - 1u], k)) return (u16)(e - 1u);
+    if (b->style_count >= A11Y_STYLE_MAX) return 0;
+    if (!grow((void **)&b->styles, &b->style_cap, b->style_count + 1u, sizeof(PlatformA11yStyle))) {
+        b->styles_on = false;
+        return 0;
+    }
+    b->styles[b->style_count] = *k;
+    b->style_hash[i] = (u16)(b->style_count + 1u);
+    return (u16)b->style_count++;
+}
+
+/* What the cell looks like: its colours as the grid holds them (atspi_attrs.h
+ * resolves them), the flags that change how it is drawn, and — for an
+ * underline — its style, which the cell itself does not say (the sparse map
+ * beside the grid does, for rows of the live grid only; anywhere else it is
+ * the plain single underline, as the decoration pass draws it). */
+static PlatformA11yStyle cell_style_key(Terminal *t, const Cell *c, i32 x, i32 logical_row) {
+    PlatformA11yStyle k;
+    memset(&k, 0, sizeof(k));
+    u16 f = c->attr.flags;
+    k.fg = c->attr.fg;
+    k.bg = c->attr.bg;
+    if (f & ATTR_BOLD)          k.flags |= A11Y_STYLE_BOLD;
+    if (f & ATTR_DIM)           k.flags |= A11Y_STYLE_DIM;
+    if (f & ATTR_ITALIC)        k.flags |= A11Y_STYLE_ITALIC;
+    if (f & ATTR_INVERSE)       k.flags |= A11Y_STYLE_INVERSE;
+    if (f & ATTR_STRIKETHROUGH) k.flags |= A11Y_STYLE_STRIKE;
+    if (f & ATTR_UNDERLINE) {
+        u32 ucolor = 0;
+        u8 ustyle = 0;
+        if (logical_row >= 0) terminal_get_underline(t, x, logical_row, &ucolor, &ustyle);
+        k.underline = ustyle ? ustyle : 1u;
+    }
+    return k;
+}
+
+static inline u32 pack_rgb(Color c) {
+    f32 v[3] = { c.r, c.g, c.b };
+    u32 o = 0;
+    for (i32 i = 0; i < 3; i++) {
+        f32 x = v[i];
+        u32 q = !(x > 0.0f) ? 0u : x >= 1.0f ? 255u : (u32)(x * 255.0f + 0.5f);
+        o = (o << 8) | q;
+    }
+    return o;
+}
+
+/* The pane's palette the way the row builder resolves an index: the program's
+ * own entry (OSC 4) when it set one, else the theme's. */
+static void palette_rgb_fill(const Terminal *t, u32 out[256]) {
+    for (u32 i = 0; i < 256u; i++) {
+        u32 entry = t->palette ? t->palette[i] : 0;
+        out[i] = pack_rgb(entry ? color_resolve(entry, i) : g_ansi_colors[i]);
+    }
+}
+
+/* Start a build's table: the plain cell is style 0. */
+static bool styles_begin(A11yTextBuf *b, const Terminal *t) {
+    b->style_count = 0;
+    b->cur_style = 0;
+    if (!b->style_hash) {
+        b->style_hash = malloc((usize)A11Y_STYLE_SLOTS * sizeof(u16));
+        if (!b->style_hash) return false;
+    }
+    memset(b->style_hash, 0, (usize)A11Y_STYLE_SLOTS * sizeof(u16));
+    palette_rgb_fill(t, b->palette_rgb);
+    b->styles_on = true;
+    PlatformA11yStyle plain;
+    memset(&plain, 0, sizeof(plain));
+    plain.fg = FG_DEFAULT;
+    plain.bg = BG_DEFAULT;
+    style_intern(b, &plain);
+    return b->styles_on;
+}
+
 /* Append one cell's bytes, all of whose UTF-16 units map to column `col`. */
 static bool put_unit_bytes(A11yTextBuf *b, const u8 *bytes, u32 n, u32 units, u16 col) {
     if (!grow((void **)&b->text, &b->text_cap, b->text_len + n + 1u, 1)) return false;
     if (!grow((void **)&b->col16, &b->col_cap, b->len16 + units, sizeof(u16))) return false;
+    if (b->styles_on) {
+        if (!grow((void **)&b->style16, &b->style16_cap, b->len16 + units, sizeof(u16)))
+            b->styles_on = false;
+        else
+            for (u32 i = 0; i < units; i++) b->style16[b->len16 + i] = b->cur_style;
+    }
     memcpy(b->text + b->text_len, bytes, n);
     b->text_len += n;
     for (u32 i = 0; i < units; i++) b->col16[b->len16++] = col;
@@ -165,6 +269,12 @@ bool a11y_text_build(Terminal *t, A11yTextBuf *b, PlatformA11yText *out) {
         b->line_cap = rows + 1;
     }
     if (!grow((void **)&b->text, &b->text_cap, 1u, 1)) return false;
+    b->styles_on = false;
+    if (b->want_styles) styles_begin(b, t);
+    PlatformA11yStyle last_key;
+    u16  last_id = 0;
+    bool have_last = false;
+    memset(&last_key, 0, sizeof(last_key));
 
     /* Once, before the per-cell tests: selection_contains deliberately does
      * not sync (it is the renderer's per-cell test), selection_active does. */
@@ -201,6 +311,15 @@ bool a11y_text_build(Terminal *t, A11yTextBuf *b, PlatformA11yText *out) {
             u32 cp = c->codepoint;
             u32 a = b->len16;
             if (cp == 0 || (c->attr.flags & ATTR_HIDDEN)) cp = ' ';
+            if (b->styles_on) {
+                PlatformA11yStyle k = cell_style_key(t, c, x, r - t->scroll_offset);
+                if (!have_last || !style_eq(&k, &last_key)) {
+                    last_id = style_intern(b, &k);
+                    last_key = k;
+                    have_last = true;
+                }
+                b->cur_style = last_id;
+            }
             if (cp < 128u) {
                 u8 ch = (u8)((cp < 32u || cp == 0x7Fu) ? ' ' : cp);
                 if (!put_unit_bytes(b, &ch, 1, 1, (u16)x)) return false;
@@ -231,6 +350,7 @@ bool a11y_text_build(Terminal *t, A11yTextBuf *b, PlatformA11yText *out) {
 
         if (!wraps && r + 1 < rows) {
             u8 nl = '\n';
+            b->cur_style = 0;   /* the plain cell: a line break has no colour of its own */
             if (!put_unit_bytes(b, &nl, 1, 1, (u16)end_col)) return false;
         }
     }
@@ -246,6 +366,14 @@ bool a11y_text_build(Terminal *t, A11yTextBuf *b, PlatformA11yText *out) {
     out->line_end_col    = b->line_end_col;
     out->line_text_end16 = b->line_text_end16;
     out->cols            = cols;
+    if (b->styles_on) {
+        out->styles          = b->styles;
+        out->style_count     = b->style_count;
+        out->style16         = b->style16;
+        out->palette_rgb     = b->palette_rgb;
+        out->default_fg_rgb  = b->palette_rgb[FG_DEFAULT];
+        out->default_bg_rgb  = b->palette_rgb[BG_DEFAULT];
+    }
 
     if (sel_on) {
         out->has_selection = true;
@@ -282,5 +410,8 @@ void a11y_text_buf_free(A11yTextBuf *b) {
     free(b->line_text_end16);
     free(b->line_end_col);
     free(b->sel_text);
+    free(b->styles);
+    free(b->style16);
+    free(b->style_hash);
     memset(b, 0, sizeof(*b));
 }

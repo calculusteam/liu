@@ -586,6 +586,9 @@ void session_proc_scan_stats(u64 *out_sweeps, f64 *out_seconds) {
 #include "ssh/port_forward.h"
 #include "ssh/sftp.h"          /* sftp_io_yield / sftp_io_breathe live here */
 #include "ssh/streamlocal_open.h" /* a Unix-socket forward's channel open */
+#include "ssh/streamlocal_sched.h" /* whose open is next, and how many connections a rule holds */
+#include "ssh/socket_owner.h"    /* which socket file a forward bound, and the exit sweep */
+#include "ssh/forward_keep.h"    /* the dialog's rules, kept for the next connection */
 #include "ssh/auth_second_factor.h" /* a key plus a code: the second step */
 #include "ssh/relay_watch.h"     /* when a relay's socket wakes the loop */
 #include "ssh/link_sees.h"       /* a server prompt waiting on the user is not a failure */
@@ -840,12 +843,22 @@ typedef struct {
 typedef SocketChannelRelay RemoteForwardConn;
 
 typedef struct {
-    int                listen_fd;
-    int                pending_fd;   /* accepted; its channel is still opening */
-    char               local_socket[512];
-    char               remote_socket[512];
-    SocketChannelRelay relay;
+    int                 listen_fd;
+    bool                listen_watched;               /* the loop is woken for it (only while it has room) */
+    int                 pending_fd[SLS_PENDING_CAP];  /* accepted, their channel still to open; oldest first */
+    f64                 pending_at[SLS_PENDING_CAP];  /* when each was accepted */
+    i32                 pending_n;
+    char                local_socket[512];
+    char                remote_socket[512];
+    SockIdent           local_ident;                  /* the socket file this forward bound (ssh/socket_owner.h) */
+    SocketChannelRelay *relay[SLS_RELAY_CAP];         /* an open connection each; heap, NULL = free */
 } StreamLocalRuntime;
+
+/* A session's Unix-socket rules and the order they take channel opens in. */
+typedef struct {
+    StreamLocalRuntime rule[SLS_RULES];
+    StreamSched        sched;
+} StreamLocalSet;
 
 #define MAX_REMOTE_LISTENERS  MAX_PORT_FORWARDS
 #define MAX_REMOTE_FWD_CONNS  64
@@ -971,7 +984,7 @@ struct Session {
     atomic_bool     agent_active;
 
     /* StreamLocal forwarding */
-    StreamLocalRuntime *stream_fwds;     /* heap [4], main-thread polled */
+    StreamLocalSet *stream_fwds;         /* heap, main-thread polled */
     i32             stream_fwd_count;
     bool            stream_fwd_active;
     /* The config's LocalForward lines were started on this connection
@@ -3548,6 +3561,15 @@ static void *ssh_connect_worker(void *arg) {
  * allows each call. */
 #define SSH_SHARED_CALL_TIMEOUT_MS 8000
 
+/* libssh2 carries one channel open per session and continues it whatever the
+ * next call asks for. A pane joining a shared connection reserves it and waits
+ * this long for an open already in flight on it (a forward's) to end before it
+ * opens its channels; past that it connects on its own. */
+#define SSH_SHARED_OPEN_WAIT_MS 4000
+/* The longest a pane that leaves a shared connection waits for its forwards' open
+ * in flight to answer. */
+#define SSH_SETTLE_OPEN_MS 2000
+
 typedef struct { LIBSSH2_SESSION *ssh; long timeout; } SharedBlocking;
 
 /* Blocking mode and a short bound for the next calls on a shared connection.
@@ -3629,6 +3651,29 @@ static int ssh_do_reuse_connect(Session *s) {
         pthread_mutex_unlock(&owner->io_lock);
         return -1;
     }
+    /* A forward's channel open may be in flight on this connection (a connection
+     * to a slow target): the channel opened below would be handed ITS channel,
+     * and the forward's connection would lose it. Reserved first, so nothing new
+     * starts, and the lock is let go while the open that is there ends. */
+    forward_open_reserve(ssh, true);
+    for (f64 give_up = platform_time_sec() + SSH_SHARED_OPEN_WAIT_MS / 1000.0;
+         !forward_open_idle(ssh);) {
+        if (atomic_load_explicit(&s->connect_cancel, memory_order_acquire) ||
+            platform_time_sec() > give_up) {
+            forward_open_reserve(ssh, false);
+            pthread_mutex_unlock(&owner->io_lock);
+            return -1;
+        }
+        pthread_mutex_unlock(&owner->io_lock);
+        struct timespec nap = { 0, 10 * 1000 * 1000 };
+        nanosleep(&nap, NULL);
+        pthread_mutex_lock(&owner->io_lock);
+        if (owner->ssh_session != ssh) {
+            forward_open_reserve(ssh, false);
+            pthread_mutex_unlock(&owner->io_lock);
+            return -1;
+        }
+    }
     SharedBlocking blk;
     shared_blocking_begin(&blk, ssh);
 
@@ -3687,6 +3732,7 @@ done:
         s->sock = -1;
     }
     shared_blocking_end(&blk);
+    forward_open_reserve(ssh, false);
     pthread_mutex_unlock(&owner->io_lock);
     if (rc == 0) {
         pthread_mutex_lock(&s->status_lock);
@@ -4123,6 +4169,10 @@ void session_release(Session *s) {
     }
 }
 
+#ifndef PLATFORM_WIN32
+static void session_streamlocal_settle(Session *s);
+#endif
+
 /* The owner's pane is leaving, but other sessions still use its connection
  * (ControlMaster): end what belongs to the pane — its forwards, X11, shell
  * channel and SFTP handle — and keep the libssh2 session, the socket and the io
@@ -4136,6 +4186,12 @@ static void session_retire_pane(Session *s) {
     if (ssh) {
         SharedBlocking blk;
         shared_blocking_begin(&blk, ssh);
+        /* What the forwards have in flight on the connection is finished before
+         * they are dropped: the connection stays, and so would the open. */
+#ifndef PLATFORM_WIN32
+        session_streamlocal_settle(s);
+#endif
+        forward_open_settle(ssh);
         session_stop_stream_forwards(s);
         if (s->x11_relays) {
             for (i32 i = 0; i < s->x11_relay_count; i++)
@@ -6523,6 +6579,13 @@ bool session_dynamic_forward_start(Session *s, i32 local_port) {
     if (!s->ssh_session) return false;
     if (pthread_mutex_trylock(&ssh_connection_owner(s)->io_lock) != 0) return false;
     bool ok = forward_add_socks5(s->ssh_session, local_port) >= 0;
+    /* Kept like the dialog's local forwards (session_local_forward_start):
+     * a reconnect puts the proxy back. */
+    if (ok && s->config &&
+        forward_keep_may_add(s->config->socks_forwards, s->config->socks_forward_count, local_port)) {
+        PortForwardSpec *p = ssh_config_push_socks_forward(s->config);
+        if (p) p->bind_port = local_port;
+    }
     pthread_mutex_unlock(&ssh_connection_owner(s)->io_lock);
     return ok;
 }
@@ -6579,19 +6642,32 @@ bool session_local_forward_get(Session *s, i32 index, PortForwardInfo *info) {
     return true;
 }
 
-void session_local_forward_remove(Session *s, i32 index) {
-    if (!s || s->type != SESSION_SSH || !s->ssh_session) return;
-    if (pthread_mutex_trylock(&ssh_connection_owner(s)->io_lock) != 0) return;
-    /* A removed forward is not started again by the next reconnect. */
-    ForwardRule rule;
-    if (forward_get(s->ssh_session, index, &rule) && rule.type == FWD_LOCAL && s->config) {
-        i32 at = config_local_forward_index(s->config, rule.local_port);
+/* The rule is no longer one a reconnect puts back. */
+static void config_forward_forget(SSHConfig *c, const ForwardRule *rule) {
+    if (!c) return;
+    if (rule->type == FWD_LOCAL) {
+        i32 at = config_local_forward_index(c, rule->local_port);
         if (at >= 0) {
-            SSHConfig *c = s->config;
             memmove(&c->local_forwards[at], &c->local_forwards[at + 1],
                     (usize)(c->local_forward_count - at - 1) * sizeof c->local_forwards[0]);
             c->local_forward_count--;
         }
+    } else if (rule->type == FWD_DYNAMIC) {
+        (void)forward_keep_drop(c->socks_forwards, &c->socks_forward_count, rule->local_port);
+    }
+}
+
+void session_local_forward_remove(Session *s, i32 index) {
+    if (!s || s->type != SESSION_SSH || !s->ssh_session) return;
+    if (pthread_mutex_trylock(&ssh_connection_owner(s)->io_lock) != 0) return;
+    /* A removed forward is not started again by the next reconnect. The rules
+     * belong to the connection, so the pane that started it may be another one
+     * than the pane the dialog is open on: both forget it. */
+    ForwardRule rule;
+    if (forward_get(s->ssh_session, index, &rule)) {
+        config_forward_forget(s->config, &rule);
+        Session *o = ssh_connection_owner(s);
+        if (o != s) config_forward_forget(o->config, &rule);
     }
     forward_remove(s->ssh_session, index);
     pthread_mutex_unlock(&ssh_connection_owner(s)->io_lock);
@@ -6750,6 +6826,11 @@ static void session_start_config_forwards_locked(Session *s) {
             fprintf(stderr, "liu: LocalForward %d %s:%d not started (is the port taken?)\n",
                     p->bind_port, p->dest_host, p->dest_port);
     }
+    for (i32 i = 0; i < c->socks_forward_count; i++) {
+        if (forward_add_socks5(s->ssh_session, c->socks_forwards[i].bind_port) < 0)
+            fprintf(stderr, "liu: SOCKS proxy on %d not started (is the port taken?)\n",
+                    c->socks_forwards[i].bind_port);
+    }
 #ifndef PLATFORM_WIN32
     if (c->stream_forward_count > 0) session_start_stream_forwards(s);
 #endif
@@ -6863,6 +6944,13 @@ void session_remote_forward_poll(Session *s) {
     if (!session_io_trylock(s)) return;
     session_remote_forward_poll_locked(s);
     session_io_unlock(s);
+}
+
+void session_forward_tick(Session *s) {
+    if (!s || s->type != SESSION_SSH ||
+        session_status(s) != SESSION_CONNECTED || !s->ssh_session) return;
+    (void)session_local_forward_poll(s);
+    session_remote_forward_poll(s);
 }
 
 /* =========================================================================
@@ -7033,6 +7121,11 @@ static bool ssh_config_strings_valid(const SSHConfig *c) {
         if (!memchr(p->bind_host, '\0', sizeof p->bind_host) ||
             !memchr(p->dest_host, '\0', sizeof p->dest_host)) return false;
     }
+    for (i32 i = 0; i < c->socks_forward_count; i++) {
+        const PortForwardSpec *p = &c->socks_forwards[i];
+        if (!memchr(p->bind_host, '\0', sizeof p->bind_host) ||
+            !memchr(p->dest_host, '\0', sizeof p->dest_host)) return false;
+    }
     for (i32 i = 0; i < c->env_count; i++) {
         if (!memchr(c->env[i].name, '\0', sizeof(c->env[i].name)) ||
             !memchr(c->env[i].value, '\0', sizeof(c->env[i].value)))
@@ -7084,6 +7177,16 @@ PortForwardSpec *ssh_config_push_remote_forward(SSHConfig *cfg) {
     return slot;
 }
 
+PortForwardSpec *ssh_config_push_socks_forward(SSHConfig *cfg) {
+    if (!cfg || cfg->socks_forward_count < 0 ||
+        cfg->socks_forward_count == INT32_MAX) return NULL;
+    if (!grow_array((void **)&cfg->socks_forwards, &cfg->socks_forward_cap,
+                    cfg->socks_forward_count + 1, sizeof(PortForwardSpec))) return NULL;
+    PortForwardSpec *slot = &cfg->socks_forwards[cfg->socks_forward_count++];
+    memset(slot, 0, sizeof *slot);
+    return slot;
+}
+
 SSHEnvVar *ssh_config_push_env(SSHConfig *cfg) {
     if (!cfg || cfg->env_count < 0 || cfg->env_count == INT32_MAX) return NULL;
     if (!grow_array((void **)&cfg->env, &cfg->env_cap,
@@ -7105,6 +7208,7 @@ bool ssh_config_clone(SSHConfig *dst, const SSHConfig *src) {
         src->local_forward_count < 0 || src->remote_forward_count < 0 ||
         src->local_forward_count > MAX_PORT_FORWARDS ||
         src->remote_forward_count > MAX_PORT_FORWARDS ||
+        src->socks_forward_count < 0 || src->socks_forward_count > MAX_PORT_FORWARDS ||
         src->env_count < 0 || src->env_count > SSH_CONFIG_MAX_ENV_VARS ||
         src->key_pem_len > SSH_CONFIG_MAX_KEY_PEM ||
         src->auth_method < AUTH_PASSWORD || src->auth_method > AUTH_GSSAPI ||
@@ -7112,6 +7216,7 @@ bool ssh_config_clone(SSHConfig *dst, const SSHConfig *src) {
         (src->proxy_chain_len > 0 && !src->proxy_chain) ||
         (src->local_forward_count > 0 && !src->local_forwards) ||
         (src->remote_forward_count > 0 && !src->remote_forwards) ||
+        (src->socks_forward_count > 0 && !src->socks_forwards) ||
         (src->env_count > 0 && !src->env) ||
         (src->key_pem_len > 0 && !src->key_pem)) {
         return false;
@@ -7126,6 +7231,7 @@ bool ssh_config_clone(SSHConfig *dst, const SSHConfig *src) {
     dst->proxy_chain     = NULL; dst->proxy_chain_cap = 0;
     dst->local_forwards  = NULL; dst->local_forward_cap = 0;
     dst->remote_forwards = NULL; dst->remote_forward_cap = 0;
+    dst->socks_forwards  = NULL; dst->socks_forward_cap = 0;
     dst->env             = NULL; dst->env_cap = 0;
     dst->key_pem         = NULL; dst->key_pem_len = 0;
 
@@ -7152,6 +7258,12 @@ bool ssh_config_clone(SSHConfig *dst, const SSHConfig *src) {
                          src->remote_forward_count,
                          sizeof(*dst->remote_forwards))) goto fail;
         dst->remote_forward_cap = src->remote_forward_count;
+    }
+    if (src->socks_forward_count > 0) {
+        if (!clone_array((void **)&dst->socks_forwards, src->socks_forwards,
+                         src->socks_forward_count,
+                         sizeof(*dst->socks_forwards))) goto fail;
+        dst->socks_forward_cap = src->socks_forward_count;
     }
     if (src->env_count > 0) {
         if (!clone_array((void **)&dst->env, src->env, src->env_count,
@@ -7191,6 +7303,7 @@ void ssh_config_dispose(SSHConfig *cfg) {
     free(cfg->proxy_chain);
     free(cfg->local_forwards);
     free(cfg->remote_forwards);
+    free(cfg->socks_forwards);
     memset(cfg, 0, sizeof *cfg);
 }
 
@@ -7539,9 +7652,50 @@ void session_pool_unregister(Session *s) {
 
 #ifndef PLATFORM_WIN32
 
-/* Create a listening Unix domain socket at the given path.
- * Refuses to unlink anything except a socket owned by this uid. */
-static int create_unix_listener(const char *path) {
+/* The Unix sockets the forwards of this process have bound. Quitting runs
+ * exit(), which does not destroy the panes, so the stop that removes a
+ * forward's socket does not run for the forwards still up at a quit; the sweep
+ * below runs from atexit and removes their files. The lock is because a pane
+ * is destroyed on the tab-trash worker as well as the main thread. */
+static SockRegistry    g_stream_socks;
+static pthread_mutex_t g_stream_socks_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t  g_stream_socks_once = PTHREAD_ONCE_INIT;
+static pid_t           g_stream_socks_pid;
+
+static void stream_socks_sweep_at_exit(void) {
+    /* A forked child that exits without exec (a pane's shell that failed to
+     * start) shares this table: the sockets are the parent's. */
+    if (getpid() != g_stream_socks_pid) return;
+    if (pthread_mutex_trylock(&g_stream_socks_mu) != 0) return;   /* never wait at exit */
+    (void)sock_reg_sweep(&g_stream_socks);
+    pthread_mutex_unlock(&g_stream_socks_mu);
+}
+
+static void stream_socks_register_atexit(void) {
+    g_stream_socks_pid = getpid();
+    atexit(stream_socks_sweep_at_exit);
+}
+
+static void stream_socks_note_bound(const char *path, SockIdent id) {
+    (void)pthread_once(&g_stream_socks_once, stream_socks_register_atexit);
+    pthread_mutex_lock(&g_stream_socks_mu);
+    (void)sock_reg_add(&g_stream_socks, path, id);
+    pthread_mutex_unlock(&g_stream_socks_mu);
+}
+
+/* The forward at `path` ends: its socket goes — when the path is still the
+ * file it bound — and the exit sweep forgets it. */
+static void stream_socks_release(const char *path, const SockIdent *id) {
+    pthread_mutex_lock(&g_stream_socks_mu);
+    sock_reg_forget(&g_stream_socks, path, id);
+    pthread_mutex_unlock(&g_stream_socks_mu);
+    (void)sock_unlink_if_ours(path, id);
+}
+
+/* Create a listening Unix domain socket at the given path, and say which file
+ * it is in `*ident`. Refuses to unlink anything except a socket owned by this
+ * uid. */
+static int create_unix_listener(const char *path, SockIdent *ident) {
     struct sockaddr_un addr;
     if (!path || !path[0] || strlen(path) >= sizeof(addr.sun_path)) return -1;
 
@@ -7565,9 +7719,15 @@ static int create_unix_listener(const char *path) {
         return -1;
     }
 
-    if (chmod(path, 0600) != 0 || listen(fd, 4) < 0) {
+    if (chmod(path, 0600) != 0 || listen(fd, 32) < 0) {
         close(fd);
         unlink(path);
+        return -1;
+    }
+    /* The file as it now is: what the stop and the exit sweep may remove. */
+    SockIdent bound = sock_ident_at(path);
+    if (!bound.valid) {
+        close(fd);
         return -1;
     }
 
@@ -7585,6 +7745,7 @@ static int create_unix_listener(const char *path) {
         return -1;
     }
 
+    if (ident) *ident = bound;
     return fd;
 }
 
@@ -7608,70 +7769,180 @@ static LIBSSH2_CHANNEL *streamlocal_channel_open(LIBSSH2_SESSION *session,
     return ch;
 }
 
+/* The pane that owns the Unix-socket forwards is leaving a connection that goes
+ * on being used: an open of theirs that is in flight is carried to its end here
+ * (the session is in blocking mode) and its channel closed. libssh2 cannot
+ * cancel it, and the next open on the connection — a forward's, a pane's shell —
+ * would be handed it. */
+static void session_streamlocal_settle(Session *s) {
+    if (!s || !s->stream_fwds || !s->ssh_session) return;
+    const StreamSched *sc = &s->stream_fwds->sched;
+    if (sc->inflight < 0 || sc->inflight >= SLS_RULES) return;
+    long timeout = libssh2_session_get_timeout(s->ssh_session);
+    libssh2_session_set_timeout(s->ssh_session, SSH_SETTLE_OPEN_MS);
+    bool would_block = false;
+    LIBSSH2_CHANNEL *ch = streamlocal_channel_open(
+        s->ssh_session, s->stream_fwds->rule[sc->inflight].remote_socket, &would_block);
+    libssh2_session_set_timeout(s->ssh_session, timeout);
+    if (ch) {
+        libssh2_channel_close(ch);
+        libssh2_channel_free(ch);
+    }
+}
+
+/* A connection's end of a Unix-socket forward is a heap relay (32 KB of
+ * buffers): a rule holds several, and most are never needed. */
+static void streamlocal_relay_free(StreamLocalRuntime *rt, i32 j) {
+    socket_channel_relay_close(rt->relay[j]);
+    free(rt->relay[j]);
+    rt->relay[j] = NULL;
+}
+
+/* Takes what waits on a rule's listener, as far as the rule has room. */
+static void streamlocal_accept(StreamLocalSet *set, i32 rule, f64 now) {
+    StreamLocalRuntime *rt = &set->rule[rule];
+    while (rt->listen_fd >= 0 && sls_may_accept(&set->sched, rule)) {
+        int client = accept(rt->listen_fd, NULL, NULL);
+        if (client < 0) break;
+        int flags = fcntl(client, F_GETFL, 0);
+        if (flags < 0 || fcntl(client, F_SETFL, flags | O_NONBLOCK) != 0) {
+            close(client);
+            continue;
+        }
+        flags = fcntl(client, F_GETFD, 0);
+        if (flags < 0 || fcntl(client, F_SETFD, flags | FD_CLOEXEC) != 0) {
+            close(client);
+            continue;
+        }
+#ifdef SO_NOSIGPIPE
+        int one = 1;
+        (void)setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#endif
+        rt->pending_at[rt->pending_n] = now;
+        rt->pending_fd[rt->pending_n++] = client;
+        sls_accepted(&set->sched, rule);
+    }
+}
+
+/* The oldest client of a rule that is waiting for its channel. */
+static int streamlocal_pending_take(StreamLocalRuntime *rt) {
+    if (rt->pending_n <= 0) return -1;
+    int fd = rt->pending_fd[0];
+    rt->pending_n--;
+    for (i32 i = 0; i < rt->pending_n; i++) {
+        rt->pending_fd[i] = rt->pending_fd[i + 1];
+        rt->pending_at[i] = rt->pending_at[i + 1];
+    }
+    rt->pending_fd[rt->pending_n] = -1;
+    return fd;
+}
+
 static void session_streamlocal_poll(Session *s) {
     if (!s || !s->stream_fwd_active || !s->stream_fwds || !s->ssh_session)
         return;
-    /* libssh2 keeps ONE channel open in progress per session, and the next
-     * libssh2_channel_open_ex continues it whatever it is asked for: while one
-     * rule's connection waits for its channel, no other rule takes one. */
-    StreamLocalRuntime *opening = NULL;
-    for (i32 i = 0; i < 4; i++)
-        if (s->stream_fwds[i].pending_fd >= 0) { opening = &s->stream_fwds[i]; break; }
+    StreamLocalSet *set = s->stream_fwds;
+    StreamSched *sc = &set->sched;
+    f64 now = platform_time_sec();
 
-    for (i32 i = 0; i < 4; i++) {
-        StreamLocalRuntime *rt = &s->stream_fwds[i];
-        if (rt->listen_fd < 0) continue;
-        if (rt->relay.active && !socket_channel_relay_poll(&rt->relay))
-            socket_channel_relay_close(&rt->relay);
-        if (rt->relay.active) {                /* one connection per rule at a time */
-            socket_channel_relay_note_more(&rt->relay);
-            continue;
-        }
-
-        if (rt->pending_fd < 0) {
-            if (opening) continue;
-            int client = accept(rt->listen_fd, NULL, NULL);
-            if (client < 0) continue;
-            int flags = fcntl(client, F_GETFL, 0);
-            if (flags < 0 || fcntl(client, F_SETFL, flags | O_NONBLOCK) != 0) {
-                close(client);
-                continue;
+    /* The open connections: each is its own channel and moves on its own. */
+    for (i32 i = 0; i < SLS_RULES; i++) {
+        StreamLocalRuntime *rt = &set->rule[i];
+        for (i32 j = 0; j < SLS_RELAY_CAP; j++) {
+            if (!rt->relay[j]) continue;
+            if (!socket_channel_relay_poll(rt->relay[j])) {
+                streamlocal_relay_free(rt, j);
+                sls_relay_closed(sc, i);
+            } else {
+                socket_channel_relay_note_more(rt->relay[j]);
             }
-            flags = fcntl(client, F_GETFD, 0);
-            if (flags < 0 || fcntl(client, F_SETFD, flags | FD_CLOEXEC) != 0) {
-                close(client);
-                continue;
-            }
-#ifdef SO_NOSIGPIPE
-            int one = 1;
-            (void)setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
-#endif
-            rt->pending_fd = client;
-            opening = rt;
         }
+    }
 
+    /* No client waits longer than SLS_OPEN_SEC for its channel, whichever rule's open is in
+     * the way: behind one the server does not answer the others would hang for ever. */
+    for (i32 i = 0; i < SLS_RULES; i++) {
+        StreamLocalRuntime *rt = &set->rule[i];
+        while (rt->pending_n > 0 && sls_wait_over(rt->pending_at[0], now)) {
+            close(streamlocal_pending_take(rt));
+            sls_gave_up_waiting(sc, i);
+        }
+    }
+
+    for (i32 i = 0; i < SLS_RULES; i++) streamlocal_accept(set, i, now);
+
+    /* The channel opens go ONE AT A TIME, in turn (ssh/streamlocal_sched.h):
+     * libssh2 carries one per session and continues it whatever the next
+     * call asks for, so an open in flight is asked for again with its own
+     * rule's path and nothing else starts until it has answered. */
+    for (i32 turn = 0; turn < SLS_OPENS_PER_POLL; turn++) {
+        /* ...and the TCP / SOCKS forwards (ssh/port_forward.c) share that one
+         * open: while theirs is in flight no Unix-socket open starts, or it
+         * would be handed their channel. */
+        if (sc->inflight < 0 && forward_open_busy(s->ssh_session, set)) break;
+        i32 rule = sls_pick(sc, now);
+        if (rule < 0) break;
+        StreamLocalRuntime *rt = &set->rule[rule];
         bool would_block = false;
         LIBSSH2_CHANNEL *ch = streamlocal_channel_open(s->ssh_session, rt->remote_socket,
                                                        &would_block);
-        StreamlocalOpenStep step = streamlocal_open_step(ch != NULL, would_block);
-        if (step == STREAMLOCAL_OPEN_WAIT) continue;
-        int client = rt->pending_fd;
-        rt->pending_fd = -1;
-        opening = NULL;
-        if (step == STREAMLOCAL_OPEN_FAILED) { close(client); continue; }
+        SlsAction act = sls_step(sc, rule, streamlocal_open_step(ch != NULL, would_block), now);
+        if (act == SLS_WAIT) break;
+        if (act == SLS_ABANDON || act == SLS_DROP_CLIENT) {
+            int client = streamlocal_pending_take(rt);
+            if (client >= 0) close(client);
+            if (act == SLS_ABANDON) break;        /* libssh2 still carries the open */
+            continue;
+        }
+        if (act == SLS_DISCARD) {
+            libssh2_channel_close(ch);
+            libssh2_channel_free(ch);
+            continue;
+        }
+        if (act != SLS_RELAY) continue;
+
+        int client = streamlocal_pending_take(rt);
+        i32 slot = 0;
+        while (slot < SLS_RELAY_CAP && rt->relay[slot]) slot++;
+        SocketChannelRelay *rel = slot < SLS_RELAY_CAP ? calloc(1, sizeof *rel) : NULL;
+        if (!rel || client < 0) {
+            free(rel);
+            if (client >= 0) close(client);
+            libssh2_channel_close(ch);
+            libssh2_channel_free(ch);
+            sls_relay_closed(sc, rule);
+            continue;
+        }
         libssh2_channel_set_blocking(ch, 0);
-        memset(&rt->relay, 0, sizeof rt->relay);
-        rt->relay.channel = ch;
-        rt->relay.fd = client;
-        rt->relay.active = true;
+        rel->channel = ch;
+        rel->fd = client;
+        rel->active = true;
+        rt->relay[slot] = rel;
         /* Moved along at once. The server answers an open with the confirmation,
          * the service's first bytes and often its EOF back to back, and the pass
          * that sees the confirmation may be the one that has already read the
          * rest off the socket (the pane's read comes first): no descriptor
          * announces what libssh2 now holds, so a connection left for the next
          * pass would wait until something else woke the loop. */
-        if (!socket_channel_relay_poll(&rt->relay)) socket_channel_relay_close(&rt->relay);
-        else socket_channel_relay_note_more(&rt->relay);
+        if (!socket_channel_relay_poll(rel)) {
+            streamlocal_relay_free(rt, slot);
+            sls_relay_closed(sc, rule);
+        } else {
+            socket_channel_relay_note_more(rel);
+        }
+    }
+
+    forward_open_hold(s->ssh_session, set, sc->inflight >= 0);
+
+    /* A rule's listener wakes the loop only while the rule would take what is
+     * waiting on it: this pass may have filled it or emptied it. */
+    for (i32 i = 0; i < SLS_RULES; i++) {
+        StreamLocalRuntime *rt = &set->rule[i];
+        if (rt->listen_fd < 0) continue;
+        bool want = sls_wants_listen_watch(sc, i);
+        if (want == rt->listen_watched) continue;
+        if (want) platform_watch_socket(rt->listen_fd);
+        else      platform_unwatch_socket(rt->listen_fd);
+        rt->listen_watched = want;
     }
 }
 
@@ -7685,15 +7956,15 @@ void session_start_stream_forwards(Session *s) {
     if (s->stream_fwd_active) return;
 
 #ifndef PLATFORM_WIN32
-    StreamLocalRuntime *runtimes = calloc(4, sizeof(*runtimes));
+    StreamLocalSet *runtimes = calloc(1, sizeof(*runtimes));
     if (!runtimes) return;
-    for (i32 i = 0; i < 4; i++) {
-        runtimes[i].listen_fd = -1;
-        runtimes[i].pending_fd = -1;
-        runtimes[i].relay.fd = -1;
+    sls_init(&runtimes->sched);
+    for (i32 i = 0; i < SLS_RULES; i++) {
+        runtimes->rule[i].listen_fd = -1;
+        for (i32 j = 0; j < SLS_PENDING_CAP; j++) runtimes->rule[i].pending_fd[j] = -1;
     }
 
-    for (i32 i = 0; i < s->config->stream_forward_count && i < 4; i++) {
+    for (i32 i = 0; i < s->config->stream_forward_count && i < SLS_RULES; i++) {
         const StreamLocalForward *fwd = &s->config->stream_forwards[i];
         usize local_len = strnlen(fwd->local_socket, sizeof(fwd->local_socket));
         usize remote_len = strnlen(fwd->remote_socket, sizeof(fwd->remote_socket));
@@ -7702,16 +7973,19 @@ void session_start_stream_forwards(Session *s) {
 
         if (fwd->is_local_to_remote) {
             /* Listen on local Unix socket, forward to remote */
-            StreamLocalRuntime *rt = &runtimes[i];
+            StreamLocalRuntime *rt = &runtimes->rule[i];
             if (local_len >= sizeof(rt->local_socket) ||
                 remote_len >= sizeof(rt->remote_socket)) continue;
             memcpy(rt->local_socket, fwd->local_socket, local_len + 1);
             memcpy(rt->remote_socket, fwd->remote_socket, remote_len + 1);
 
-            int fd = create_unix_listener(rt->local_socket);
+            int fd = create_unix_listener(rt->local_socket, &rt->local_ident);
             if (fd < 0) continue;
             rt->listen_fd = fd;
+            stream_socks_note_bound(rt->local_socket, rt->local_ident);
             platform_watch_socket(fd);    /* a connection wakes the loop */
+            rt->listen_watched = true;
+            sls_set_listening(&runtimes->sched, i, true);
             s->stream_fwd_count++;
         }
         /* Remote->local forwarding requires libssh2_channel_forward_listen
@@ -7734,25 +8008,29 @@ void session_stop_stream_forwards(Session *s) {
 
 #ifndef PLATFORM_WIN32
     if (s->stream_fwds) {
-        for (i32 i = 0; i < 4; i++) {
-            StreamLocalRuntime *rt = &s->stream_fwds[i];
-            socket_channel_relay_close(&rt->relay);
-            if (rt->pending_fd >= 0) {
-                close(rt->pending_fd);
-                rt->pending_fd = -1;
+        for (i32 i = 0; i < SLS_RULES; i++) {
+            StreamLocalRuntime *rt = &s->stream_fwds->rule[i];
+            for (i32 j = 0; j < SLS_RELAY_CAP; j++)
+                if (rt->relay[j]) streamlocal_relay_free(rt, j);
+            for (i32 j = 0; j < rt->pending_n; j++) {
+                close(rt->pending_fd[j]);
+                rt->pending_fd[j] = -1;
             }
+            rt->pending_n = 0;
             if (rt->listen_fd >= 0) {
                 platform_unwatch_socket(rt->listen_fd);
                 close(rt->listen_fd);
                 rt->listen_fd = -1;
             }
-            if (rt->local_socket[0]) {
-                struct stat st;
-                if (lstat(rt->local_socket, &st) == 0 && S_ISSOCK(st.st_mode) &&
-                    st.st_uid == geteuid())
-                    (void)unlink(rt->local_socket);
+            /* Only the file this forward bound: the path may name another
+             * program's socket by now (another window's forward, one the
+             * user made), which a stop must leave alone. */
+            if (rt->local_socket[0] && rt->local_ident.valid) {
+                stream_socks_release(rt->local_socket, &rt->local_ident);
+                rt->local_ident.valid = false;
             }
         }
+        if (s->ssh_session) forward_open_hold(s->ssh_session, s->stream_fwds, false);
         free(s->stream_fwds);
         s->stream_fwds = NULL;
     }

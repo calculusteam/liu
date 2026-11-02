@@ -83,10 +83,17 @@ bool app_a11y_provider(PlatformWindow *w, void *user, PlatformA11yText *out,
     else
         snprintf(g_a11y_label, sizeof(g_a11y_label), "Terminal");
 
+    g_a11y_buf.want_styles = PLATFORM_A11Y_STYLES != 0;
     bool ok = a11y_text_build(t, &g_a11y_buf, out);   /* starts from a clean `out` */
     out->source = (u64)(uintptr_t)t;
     out->label = g_a11y_label;
     if (!ok) return false;
+    if (out->style16) {
+        /* The configuration the cells are drawn with (term_row_style). */
+        out->bold_bright = app->config.bold_is_bright;
+        out->font_file = app->config.font_path;
+        out->font_pt = app->config.font_size;
+    }
 
     f32 dpi = app->dpi_scale > 0.0f ? app->dpi_scale : 1.0f;
     f32 cw = app->renderer.font.cell_width, ch = app->renderer.font.cell_height;

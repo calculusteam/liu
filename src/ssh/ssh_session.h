@@ -113,6 +113,11 @@ typedef struct SSHConfig_tag {
     PortForwardSpec *remote_forwards;
     i32  remote_forward_count;
     i32  remote_forward_cap;
+    /* SOCKS5 proxies the Port Forwarding dialog added (`bind_port` only), kept
+     * so a reconnect starts them again. */
+    PortForwardSpec *socks_forwards;
+    i32  socks_forward_count;
+    i32  socks_forward_cap;
 
     /* Smart Vault — secret references. When non-empty, the UI layer
      * reveals the secret from the vault just-in-time and populates the
@@ -174,6 +179,7 @@ StreamLocalForward *ssh_config_push_stream_forward(SSHConfig *cfg);
 ProxyHop           *ssh_config_push_proxy_hop(SSHConfig *cfg);
 PortForwardSpec    *ssh_config_push_local_forward(SSHConfig *cfg);
 PortForwardSpec    *ssh_config_push_remote_forward(SSHConfig *cfg);
+PortForwardSpec    *ssh_config_push_socks_forward(SSHConfig *cfg);
 SSHEnvVar          *ssh_config_push_env(SSHConfig *cfg);
 
 typedef struct Session Session;
@@ -717,6 +723,11 @@ i32  session_local_forward_count(Session *s);
 bool session_local_forward_get(Session *s, i32 index, PortForwardInfo *info);
 void session_local_forward_remove(Session *s, i32 index);
 void session_remote_forward_poll(Session *s);
+/* The forwards' clocks, once a second: a channel open the server has not
+ * answered gives up its client at its deadline. The polls that move a forward
+ * run only when something announced work, and a server that does not answer
+ * announces nothing. */
+void session_forward_tick(Session *s);
 void session_keepalive_check(Session *s, f64 now_sec);
 
 /* =========================================================================

@@ -313,6 +313,7 @@ elseif(UNIX)
         OpenSSL::SSL
         OpenSSL::Crypto
         m
+        ${CMAKE_DL_LIBS}   # dlopen of libXcursor / libXinerama on a glibc that keeps it in libdl
     )
     # XRandR is how a client learns the panel's real refresh rate; without it
     # the vsync-off present pace is stuck at the 60 Hz floor even on a 144 Hz

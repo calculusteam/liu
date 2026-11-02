@@ -6518,6 +6518,7 @@ void platform_set_ime_cursor_pos(f32 x, f32 y, f32 cell_w, f32 cell_h) {
 }
 
 void platform_ime_reset(PlatformWindow *w) { (void)w; }
+void platform_ime_allow(PlatformWindow *w, bool allowed) { (void)w; (void)allowed; }
 
 /* =========================================================================
  * File dialog (native NSOpenPanel)

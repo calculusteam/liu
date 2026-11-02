@@ -35,6 +35,16 @@ typedef struct {
     u16  *line_end_col;
     i32   line_cap;
     char *sel_text;
+    /* Cell styles (platform_a11y.h): built only when the caller sets
+     * `want_styles` before a build. The AT-SPI bridge's provider does
+     * (PLATFORM_A11Y_STYLES); VoiceOver reads none, so macOS pays nothing. */
+    bool  want_styles;
+    bool  styles_on;            /* this build is making them */
+    PlatformA11yStyle *styles;  u32 style_count, style_cap;
+    u16  *style16;              u32 style16_cap;
+    u16  *style_hash;           /* styles[] by content: index + 1, 0 = free */
+    u16   cur_style;            /* the style of the cell being emitted */
+    u32   palette_rgb[256];
 } A11yTextBuf;
 
 /* The two change counters, without building anything and without touching

@@ -31,6 +31,7 @@
 #include "core/types.h"
 #include "core/utf8.h"
 #include "platform/platform_a11y.h"
+#include "platform/atspi_attrs.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -80,6 +81,7 @@ typedef struct {
     u16  *line_end_col; /* lines */
     char *label;
     char *sel_text;
+    AtspiAttrs attrs;   /* each character's style, when the provider gave them */
 
     u32   cap_chars, cap_u16, cap_bytes, cap_label, cap_sel;
     i32   cap_lines;
@@ -149,6 +151,7 @@ static inline void atspi_text_free(AtspiText *t) {
     free(t->cp); free(t->byte_of); free(t->u16_of); free(t->char_of_u16);
     free(t->col); free(t->text); free(t->line_start); free(t->line_text_end);
     free(t->line_end_col); free(t->label); free(t->sel_text);
+    atspi_attrs_free(&t->attrs);
     memset(t, 0, sizeof(*t));
 }
 
@@ -190,6 +193,7 @@ static inline void atspi_text_set_empty(AtspiText *t, const PlatformA11yText *sr
     t->n = 0;
     t->len16 = 0;
     t->pad_at = t->pad_len = 0;
+    atspi_attrs_clear(&t->attrs);
     t->text_bytes = 0;
     if (atspi_text_grow((void **)&t->text, &t->cap_bytes, 1, 1)) t->text[0] = '\0';
     if (atspi_text_reserve_chars(t, 1)) { t->byte_of[0] = 0; t->u16_of[0] = 0; }
@@ -256,6 +260,8 @@ static inline bool atspi_text_load(AtspiText *t, const PlatformA11yText *src) {
     nchars += pad;
 
     if (!atspi_text_reserve_chars(t, nchars + 1u)) goto oom;
+    atspi_attrs_begin(&t->attrs, src);
+    atspi_attrs_reserve(&t->attrs, nchars + 1u);
     if (!atspi_text_grow((void **)&t->char_of_u16, &t->cap_u16, units + 1u, sizeof(u32))) goto oom;
     /* A noncharacter of 4 bytes becomes U+FFFD of 3: never longer. */
     if (!atspi_text_grow((void **)&t->text, &t->cap_bytes, src->text_bytes + pad + 1u, 1)) goto oom;
@@ -286,6 +292,7 @@ static inline bool atspi_text_load(AtspiText *t, const PlatformA11yText *src) {
                 t->byte_of[ci] = bo;
                 t->u16_of[ci] = u16i;
                 t->col[ci] = (u16)(src->line_end_col[pad_row] + k);
+                atspi_attrs_put(&t->attrs, ci, 0);
                 t->text[bo++] = ' ';
             }
             pad = 0;
@@ -299,12 +306,14 @@ static inline bool atspi_text_load(AtspiText *t, const PlatformA11yText *src) {
         t->byte_of[ci] = bo;
         t->u16_of[ci] = u16i;
         t->col[ci] = src->col16[u16i];
+        atspi_attrs_put(&t->attrs, ci, src->style16 ? src->style16[u16i] : 0);
         for (u32 j = 0; j < w; j++) t->char_of_u16[u16i + j] = ci;
         bo += utf8_encode(sc, (u8 *)t->text + bo);
         u16i += w;
         ci++;
         i += k;
     }
+    atspi_attrs_end(&t->attrs, nchars);
     t->byte_of[nchars] = bo;
     t->u16_of[nchars] = units;
     t->char_of_u16[units] = nchars;
@@ -348,6 +357,10 @@ static inline bool atspi_text_load(AtspiText *t, const PlatformA11yText *src) {
     s.label           = t->label;
     s.sel_text        = (src->sel_text && src->sel_text_bytes) ? t->sel_text : NULL;
     s.sel_text_bytes  = s.sel_text ? (u32)strlen(s.sel_text) : 0;
+    /* The style tables live in the provider's buffers; t->attrs holds the copy. */
+    s.styles = NULL; s.style16 = NULL; s.palette_rgb = NULL; s.font_file = NULL;
+    s.font_family = NULL;
+    s.style_count = 0;
     if (s.has_selection) {
         u32 a = src->sel_start16 > units ? units : src->sel_start16;
         u32 e = src->sel_len16 > units - a ? units : a + src->sel_len16;

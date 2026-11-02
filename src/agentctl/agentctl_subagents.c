@@ -18,6 +18,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -159,6 +160,18 @@ static i64 ts_ms(const struct timespec *t) { return (i64)t->tv_sec * 1000 + t->t
 
 static bool same_time(const struct timespec *a, const struct timespec *b) {
     return a->tv_sec == b->tv_sec && a->tv_nsec == b->tv_nsec;
+}
+
+/* A file system stamps a change from a clock coarser than its changes (a
+ * Linux kernel's tick is a few ms, some volumes keep whole seconds), so a
+ * change in the same tick as the last look leaves the time as it was. A time
+ * this close to now is not trusted: the next pass looks again. */
+#define SUB_TIME_SLACK_MS 2000
+
+static bool time_settled(const struct timespec *t) {
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    return ts_ms(t) <= ts_ms(&now) - SUB_TIME_SLACK_MS;
 }
 
 bool agentctl_subagents_supported(i32 tool) {
@@ -545,7 +558,7 @@ static void read_meta(SubJob *j, LineBuf *lb) {
     if (!j->meta[0]) return;
     struct stat st;
     if (stat(j->meta, &st) != 0) return;
-    if (j->meta_ok && same_time(&j->meta_mt, &ST_MTIM(st))) return;
+    if (j->meta_ok && same_time(&j->meta_mt, &ST_MTIM(st)) && time_settled(&j->meta_mt)) return;
     usize n = 0;
     struct timespec mt;
     char *buf = slurp(j->meta, SUB_META_MAX, &n, &mt);
@@ -722,7 +735,7 @@ static int found_order(const void *a, const void *b) {
 static bool dir_changed(const char *dir, bool *ok, struct timespec *mt) {
     struct stat st;
     if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) { *ok = false; return false; }
-    if (*ok && same_time(mt, &ST_MTIM(st))) return false;
+    if (*ok && same_time(mt, &ST_MTIM(st)) && time_settled(mt)) return false;
     *ok = true;
     *mt = ST_MTIM(st);
     return true;
@@ -1395,7 +1408,9 @@ static void look_droid(SubPane *p, i64 now, FoundList *fl) {
     if (!p->sdir[0]) {
         const char *home = home_dir();
         if (!home || p->wreg.cwd[0] != '/') return;
-        char real[1024], key[1024];
+        /* PATH_MAX: realpath() may write that much, and a fortified C library
+         * ends the process when the buffer is smaller. */
+        char real[PATH_MAX], key[PATH_MAX];
         if (!realpath(p->wreg.cwd, real)) snprintf(real, sizeof real, "%s", p->wreg.cwd);
         usize k = 0;
         const char *c = real;

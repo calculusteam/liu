@@ -116,6 +116,10 @@ bool             platform_draws_own_window_controls(void);
 void             platform_window_minimize(PlatformWindow *w);
 void             platform_window_toggle_maximize(PlatformWindow *w);
 bool             platform_window_is_maximized(PlatformWindow *w);
+/* At quit: give what Liu copied to the desktop's clipboard manager, if one is
+ * listening (the X11 CLIPBOARD_MANAGER / SAVE_TARGETS protocol), so the copy
+ * outlives the process. Bounded, silent when there is no manager, once. */
+void             platform_clipboard_hand_off(void);
 /* What the window manager's close does: EVENT_CLOSE for that window. */
 void             platform_window_request_close(PlatformWindow *w);
 #endif
@@ -964,6 +968,13 @@ void platform_set_ime_cursor_pos(f32 x, f32 y, f32 cell_w, f32 cell_h);
  * for it arrives as CHAR_INPUT marked ime_reset. No-op where the platform
  * keeps no input context of its own (macOS). */
 void platform_ime_reset(PlatformWindow *w);
+
+/* Whether window `w`'s input method may take part while a text field has the
+ * keyboard: false for a field that is ASCII by construction (ui_ime_field_off),
+ * where the input context stands down — nothing is composed, no candidate list
+ * opens, and the letters go in as typed. True again when the keyboard leaves
+ * it. No-op where the platform keeps no input context of its own (macOS). */
+void platform_ime_allow(PlatformWindow *w, bool allowed);
 
 /* =========================================================================
  * Cursor

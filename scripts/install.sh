@@ -9,10 +9,15 @@
 # Usage:
 #   curl -fsSL https://github.com/calculusteam/liu/releases/latest/download/install.sh | bash             # latest
 #   curl -fsSL https://github.com/calculusteam/liu/releases/latest/download/install.sh | bash -s 0.1.0    # specific version
+#   curl -fsSL https://github.com/calculusteam/liu/releases/latest/download/install.sh | bash -s -- --uninstall   # Linux: remove it again
+#   install.sh --help                    # the same, and what --uninstall removes
 #
 # Env:
 #   LIU_FEED_URL          override the appcast feed URL
 #   LIU_APP_DIR           macOS install dir (default: /Applications, else ~/Applications)
+#   LIU_PREFIX            Linux install prefix (default: /opt/liu, else ~/.local/liu); --uninstall looks there
+#   LIU_BIN_DIR           Linux: where the `liu` link goes (default: /usr/local/bin, else ~/.local/bin)
+#   LIU_DATA_DIR          Linux: the data dir for icons and the desktop entry (default: /usr/share, else ~/.local/share)
 #   LIU_NO_OPEN=1         don't launch Liu / don't run a post-install check
 #   LIU_INSECURE_SKIP_SIG=1
 #                         EXPLICIT opt-out: install WITHOUT Ed25519 signature
@@ -76,7 +81,464 @@ err()  { printf 'Error: %s\n' "$1" >&2; exit 1; }
 note() { printf '%s\n' "$1" >&2; }
 warn() { printf 'WARNING: %s\n' "$1" >&2; }
 
-TARGET="${1:-}"
+# --- install manifest + uninstall (Linux) -----------------------------------------
+# What a Linux install wrote is listed in <prefix>/.install-manifest, one record a
+# line, fields separated by a TAB (a path with a TAB or a newline is never
+# recorded). `install.sh --uninstall` removes exactly that list:
+#   version  <v>                    the version that was installed
+#   prefix   <dir>                  the install prefix
+#   d  <dir>                        a directory the install had to create
+#   f  <path>  <sha256>             a file it wrote; removed only while it still has that content
+#   l  <path>  <target>             a symbolic link; removed only while it still points there
+#   cache  <dir>                    an icon theme whose cache the install refreshed
+TAB="$(printf '\t')"
+NL="$(printf '\n_')"; NL="${NL%_}"
+MF_NAME=".install-manifest"
+
+usage() {
+    cat <<'EOF'
+Liu installer
+
+  install.sh [VERSION]                install the latest (or the given) signed build
+  install.sh --uninstall [--dry-run]  remove what a previous install.sh run installed (Linux)
+  install.sh --help                   this text
+
+Install
+  macOS   Liu.app -> /Applications (or ~/Applications).
+  Linux   the release tree -> /opt/liu, or ~/.local/liu without write access to /opt;
+          a `liu` link in /usr/local/bin or ~/.local/bin; the terminfo entry xterm-liu;
+          the icons (<data>/icons/hicolor) and <data>/applications/liu.desktop, where
+          <data> is /usr/share, or ~/.local/share without write access to it.
+          Everything written is listed in <prefix>/.install-manifest.
+
+Uninstall (Linux)
+  Removes what the manifest lists, and nothing else: a file only while it still has the
+  content that was installed, a link only while it points into the prefix, a directory
+  only if it is empty and the install created it. A prefix holding other files stays,
+  with them. An install without a manifest (an older install.sh, or one the in-app
+  updater has since rewritten) is removed by its known layout; the prefix must hold
+  VERSION and bin/Liu. Installs by apt, dnf or zypper are refused (use the package
+  manager); so is anything else that is not a Liu install. Settings and data
+  (~/.config/Liu, ~/.local/share/liu) are never touched.
+  Looks in /opt/liu and ~/.local/liu, or only in $LIU_PREFIX. With nothing installed it
+  says so and exits 0; a $LIU_PREFIX that holds no install, a refusal and a failed
+  removal exit 1. --dry-run lists what would be removed and changes nothing.
+
+Environment
+  LIU_FEED_URL      override the appcast feed URL
+  LIU_APP_DIR       macOS install dir
+  LIU_PREFIX        Linux install prefix (also tells --uninstall where to look)
+  LIU_BIN_DIR       Linux: where the `liu` link goes (/usr/local/bin, else ~/.local/bin)
+  LIU_DATA_DIR      Linux: the data dir for icons and the desktop entry (/usr/share, else ~/.local/share)
+  LIU_NO_OPEN=1     don't launch Liu / don't run a post-install check
+  LIU_INSECURE_SKIP_SIG=1   install without Ed25519 verification (UNSAFE; see the header)
+EOF
+}
+
+# sha256 of one file, lowercase hex
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then _sh="$(sha256sum -- "$1")" || return 1
+    elif command -v shasum >/dev/null 2>&1; then _sh="$(shasum -a 256 -- "$1")" || return 1
+    else return 1
+    fi
+    printf '%s\n' "${_sh%% *}"
+}
+
+# an absolute path that can be written to the manifest and read back
+path_ok() {
+    case "$1" in /*) ;; *) return 1 ;; esac
+    case "$1" in *"$TAB"*|*"$NL"*) return 1 ;; esac
+    case "$1" in */..|*/../*|*/.|*/./*|*//*) return 1 ;; esac
+    return 0
+}
+
+# --- install side: record what is written ------------------------------------------
+mf_add() {   # mf_add <kind> <path> [extra]
+    [ -n "${MF:-}" ] || return 0
+    if ! path_ok "$2"; then
+        warn "not recording $2 (an unusual path): install.sh --uninstall will not remove it."
+        return 0
+    fi
+    if [ -n "${3:-}" ]; then printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$MF" || true
+    else printf '%s\t%s\n' "$1" "$2" >> "$MF" || true
+    fi
+    return 0
+}
+mf_file() {   # a file just written: its checksum goes with it
+    _h="$(sha256_of "$1" 2>/dev/null)" || _h=""
+    if [ -n "$_h" ]; then mf_add f "$1" "$_h"; else warn "couldn't checksum $1: install.sh --uninstall will leave it."; fi
+    return 0
+}
+mf_mkdir_p() {   # mkdir -p that records each directory it had to create, shallowest first
+    _missing=""; _d="$1"
+    while [ -n "$_d" ] && [ "$_d" != "/" ] && [ "$_d" != "." ] && [ ! -e "$_d" ] && [ ! -L "$_d" ]; do
+        _missing="$_d
+$_missing"
+        _d="$(dirname "$_d")"
+    done
+    mkdir -p "$1" || return 1
+    printf '%s' "$_missing" | while IFS= read -r _m; do
+        [ -n "$_m" ] && [ -d "$_m" ] && mf_add d "$_m"
+    done
+    return 0
+}
+
+# where `tic -x` may have put the entry: $TERMINFO, ~/.terminfo and the system directories
+ti_dirs() {
+    {
+        [ -n "${TERMINFO:-}" ] && printf '%s\n' "$TERMINFO"
+        [ -n "${HOME:-}" ] && printf '%s\n' "$HOME/.terminfo"
+        infocmp -D 2>/dev/null
+        printf '%s\n' /etc/terminfo /lib/terminfo /usr/share/terminfo /usr/lib/terminfo /usr/local/share/terminfo /usr/local/lib/terminfo
+    } | awk 'NF && !seen[$0]++'
+}
+ti_state() {   # one line per candidate: dir, dir exists, x/ exists, checksum of x/xterm-liu or -
+    ti_dirs | while IFS= read -r _t; do
+        _e=-; [ -f "$_t/x/xterm-liu" ] && [ ! -L "$_t/x/xterm-liu" ] && _e="$(sha256_of "$_t/x/xterm-liu" 2>/dev/null || echo -)"
+        _a=0; [ -d "$_t" ] && _a=1
+        _b=0; [ -d "$_t/x" ] && _b=1
+        printf '%s\t%s\t%s\t%s\n' "$_t" "$_a" "$_b" "$_e"
+    done
+}
+ti_record() {   # ti_record <state before>: whatever tic wrote or replaced
+    ti_state | while IFS="$TAB" read -r _t _a _b _e; do
+        [ "$_e" != "-" ] || continue
+        _old="$(awk -F'\t' -v d="$_t" '$1 == d { print $4; exit }' "$1")"
+        [ "$_old" != "$_e" ] || continue
+        _oa="$(awk -F'\t' -v d="$_t" '$1 == d { print $2; exit }' "$1")"
+        _ob="$(awk -F'\t' -v d="$_t" '$1 == d { print $3; exit }' "$1")"
+        [ "$_oa" = 1 ] || mf_add d "$_t"
+        [ "$_ob" = 1 ] || mf_add d "$_t/x"
+        mf_add f "$_t/x/xterm-liu" "$_e"
+    done
+}
+
+# the finished manifest: the tree, then the records written along the way, then the older
+# install's records outside this prefix (a reinstall must not forget what the first made)
+mf_finish() {   # mf_finish <prefix> <version> <older manifest or ""> <records file> <out>
+    _p="$1"; _v="$2"; _old="$3"; _rec="$4"; _out="$5"
+    {
+        printf '# liu install manifest 1 -- written by install.sh, read by install.sh --uninstall\n'
+        printf 'version\t%s\n' "$_v"
+        printf 'prefix\t%s\n' "$_p"
+        ( cd "$_p" && find . -mindepth 1 -type d | LC_ALL=C sort ) \
+            | awk -v p="$_p" 'index($0, "\t") == 0 { sub(/^\.\//, ""); printf "d\t%s/%s\n", p, $0 }'
+        ( cd "$_p" && if command -v sha256sum >/dev/null 2>&1; then find . -type f -exec sha256sum {} +
+                      else find . -type f -exec shasum -a 256 {} +; fi ) \
+            | LC_ALL=C sort -k2 \
+            | awk -v p="$_p" '{ h = $1; sub(/^[0-9a-f]+ [ *]\.\//, ""); if (index($0, "\t") == 0) printf "f\t%s/%s\t%s\n", p, $0, h }'
+        ( cd "$_p" && find . -type l ) | while IFS= read -r _l; do
+            _l="${_l#./}"; _t="$(readlink "$_p/$_l")" || continue
+            path_ok "$_p/$_l" && printf 'l\t%s/%s\t%s\n' "$_p" "$_l" "$_t"
+        done
+        {
+            cat "$_rec"
+            [ -n "$_old" ] && awk -F'\t' -v p="$_p/" '($1 == "d" || $1 == "f" || $1 == "l" || $1 == "cache") && substr($2, 1, length(p)) != p' "$_old"
+        } | awk -F'\t' '!seen[$1 FS $2]++'
+    } > "$_out"
+}
+
+# --- uninstall side ----------------------------------------------------------------
+UN_REMOVED=0; UN_LEFT=0; UN_FAILED=0; UN_DRY=0
+un_say() { printf '%s\n' "$1" >&2; }
+un_rm_file() {   # un_rm_file <path> [quiet]
+    if [ "$UN_DRY" = 1 ]; then
+        [ "${2:-}" = quiet ] || un_say "  would remove $1"
+        printf '%s\n' "$1" >> "$UN_TMP/gone"; UN_REMOVED=$((UN_REMOVED + 1)); return 0
+    fi
+    rm -f -- "$1" 2>/dev/null
+    if [ ! -e "$1" ] && [ ! -L "$1" ]; then
+        [ "${2:-}" = quiet ] || un_say "  removed $1"
+        UN_REMOVED=$((UN_REMOVED + 1))
+    else
+        un_say "  could not remove $1"; UN_FAILED=$((UN_FAILED + 1))
+    fi
+    return 0
+}
+un_rmdir() {   # un_rmdir <dir> [quiet]: a directory goes only if it is a real directory and empty
+    [ -d "$1" ] && [ ! -L "$1" ] || return 0
+    if [ "$UN_DRY" = 1 ]; then   # empty once everything listed as removed is gone
+        _uempty=1
+        ls -A "$1" > "$UN_TMP/ls" 2>/dev/null
+        while IFS= read -r _ue; do grep -qxF -- "$1/$_ue" "$UN_TMP/gone" || _uempty=0; done < "$UN_TMP/ls"
+        if [ "$_uempty" = 1 ]; then
+            [ "${2:-}" = quiet ] || un_say "  would remove directory $1"
+            printf '%s\n' "$1" >> "$UN_TMP/gone"
+        else
+            un_say "  would keep directory $1 (not empty)"
+        fi
+        return 0
+    fi
+    if rmdir -- "$1" 2>/dev/null; then [ "${2:-}" = quiet ] || un_say "  removed directory $1"
+    else un_say "  kept directory $1 (not empty)"; UN_LEFT=$((UN_LEFT + 1)); fi
+    return 0
+}
+un_under() {   # un_under <path> <dir>: the path is inside the directory, by name
+    case "$1" in "$2"/*) return 0 ;; esac
+    return 1
+}
+un_inside_phys() {   # the directory holding $1 really is inside the prefix (no link leads out of it)
+    _ud="$(cd "$(dirname "$1")" 2>/dev/null && pwd -P)" || return 1
+    case "$_ud" in "$UN_PHYS"|"$UN_PHYS"/*) return 0 ;; esac
+    return 1
+}
+un_shape_ok() {   # a path outside the prefix that install.sh could have written
+    case "$1" in
+        */applications/liu.desktop|*/icons/hicolor/*/apps/liu.png|*/icons/hicolor/icon-theme.cache) return 0 ;;
+        */?/xterm-liu|*/??/xterm-liu) return 0 ;;
+    esac
+    return 1
+}
+un_file() {   # un_file <path> <sha256>: remove it if it is still the file that was installed
+    [ -e "$1" ] || [ -L "$1" ] || return 0
+    path_ok "$1" || { un_say "  skipped $1 (not a plain path)"; return 0; }
+    if un_under "$1" "$UN_PREFIX"; then
+        if ! un_inside_phys "$1"; then un_say "  left $1 (a link leads out of the prefix)"; UN_LEFT=$((UN_LEFT + 1)); return 0; fi
+        _uq=quiet
+    else
+        if ! un_shape_ok "$1"; then un_say "  skipped $1 (not a path install.sh writes)"; UN_LEFT=$((UN_LEFT + 1)); return 0; fi
+        _uq=""
+    fi
+    if [ -L "$1" ] || [ ! -f "$1" ]; then un_say "  left $1 (no longer the file install.sh wrote)"; UN_LEFT=$((UN_LEFT + 1)); return 0; fi
+    _uh="$(sha256_of "$1" 2>/dev/null)" || _uh=""
+    if [ "$_uh" != "$2" ]; then un_say "  left $1 (changed since it was installed)"; UN_LEFT=$((UN_LEFT + 1)); return 0; fi
+    un_rm_file "$1" "$_uq"
+    return 0
+}
+un_link() {   # un_link <path> <target>: remove it if it still points where install.sh pointed it
+    [ -L "$1" ] || return 0
+    path_ok "$1" || { un_say "  skipped $1 (not a plain path)"; return 0; }
+    if un_under "$1" "$UN_PREFIX"; then
+        un_inside_phys "$1" || return 0
+    else
+        case "$1" in */liu) ;; *) un_say "  skipped $1 (not a path install.sh writes)"; UN_LEFT=$((UN_LEFT + 1)); return 0 ;; esac
+        if ! un_under "$2" "$UN_PREFIX"; then un_say "  skipped $1 (it does not point into $UN_PREFIX)"; UN_LEFT=$((UN_LEFT + 1)); return 0; fi
+    fi
+    if [ "$(readlink "$1" 2>/dev/null)" != "$2" ]; then un_say "  left $1 (it points somewhere else now)"; UN_LEFT=$((UN_LEFT + 1)); return 0; fi
+    if un_under "$1" "$UN_PREFIX"; then un_rm_file "$1" quiet; else un_rm_file "$1"; fi
+    return 0
+}
+un_pkg_owner() {   # the package manager that owns a file, if dpkg or rpm knows it
+    if command -v dpkg >/dev/null 2>&1 && dpkg -S "$1" >/dev/null 2>&1; then echo "dpkg: apt remove liu"; return 0; fi
+    if command -v rpm >/dev/null 2>&1 && rpm -qf "$1" >/dev/null 2>&1; then echo "rpm: dnf remove liu (zypper remove liu)"; return 0; fi
+    return 1
+}
+un_refresh_icons() {   # the install refreshed this icon theme's cache: refresh it again
+    [ "$UN_DRY" = 1 ] && return 0
+    [ -f "$1/icon-theme.cache" ] && [ -f "$1/index.theme" ] || return 0
+    command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q "$1" 2>/dev/null
+    return 0
+}
+un_tree() {   # un_tree <dir>: a directory of the prefix, file by file and then folder by folder
+    [ -d "$1" ] && [ ! -L "$1" ] || return 0
+    if [ "$(cd "$1" && pwd -P)" != "$UN_PHYS/${1##*/}" ]; then un_say "  left $1 (a link leads out of the prefix)"; return 0; fi
+    _un="$(find "$1" ! -type d 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "$UN_DRY" = 1 ]; then
+        un_say "  would remove $1 ($_un files)"; UN_REMOVED=$((UN_REMOVED + _un))
+        find "$1" >> "$UN_TMP/gone" 2>/dev/null; return 0
+    fi
+    find "$1" ! -type d -exec rm -f -- {} + 2>/dev/null
+    find "$1" -depth -type d -exec rmdir -- {} + 2>/dev/null
+    if [ -e "$1" ] || [ -L "$1" ]; then
+        _uleft="$(find "$1" ! -type d 2>/dev/null | wc -l | tr -d ' ')"
+        if [ "$_uleft" != 0 ]; then un_say "  could not remove all of $1 ($_uleft files left)"; UN_FAILED=$((UN_FAILED + 1)); fi
+        UN_REMOVED=$((UN_REMOVED + _un - _uleft))
+    else
+        UN_REMOVED=$((UN_REMOVED + _un))
+    fi
+    return 0
+}
+
+# what install.sh puts in the prefix, by name: used where there is no (current) manifest
+un_layout() {
+    for _ul in bin/Liu bin/liu-notify bin/liu-history VERSION liu.terminfo LICENSE NOTICE THIRD_PARTY_NOTICES.md "$MF_NAME"; do
+        if [ -f "$UN_PREFIX/$_ul" ] || [ -L "$UN_PREFIX/$_ul" ]; then
+            un_inside_phys "$UN_PREFIX/$_ul" && un_rm_file "$UN_PREFIX/$_ul" quiet
+        fi
+    done
+    un_tree "$UN_PREFIX/assets"
+    un_tree "$UN_PREFIX/share"
+    un_rmdir "$UN_PREFIX/bin" quiet
+}
+
+# outside the prefix, for an install with no manifest: only what provably is Liu's
+un_legacy_outside() {
+    for _ud in "${LIU_BIN_DIR:-}" /usr/local/bin "${HOME:-}/.local/bin"; do
+        [ -n "$_ud" ] && [ -L "$_ud/liu" ] && un_link "$_ud/liu" "$UN_PREFIX/bin/Liu"
+    done
+    for _ud in "${LIU_DATA_DIR:-}" /usr/share "${HOME:-}/.local/share"; do
+        [ -n "$_ud" ] || continue
+        _uf="$_ud/applications/liu.desktop"
+        if [ -f "$_uf" ] && [ ! -L "$_uf" ] && grep -qxF "Exec=$UN_PREFIX/bin/Liu" "$_uf" && grep -qx 'StartupWMClass=liu' "$_uf"; then
+            un_rm_file "$_uf"
+        fi
+        if [ -d "$UN_PREFIX/share/icons/hicolor" ] && [ -d "$_ud/icons/hicolor" ]; then
+            ( cd "$UN_PREFIX/share/icons/hicolor" && find . -type f -name liu.png ) > "$UN_TMP/icons.list" 2>/dev/null
+            while IFS= read -r _ui; do
+                _ui="${_ui#./}"; _uf="$_ud/icons/hicolor/$_ui"
+                if [ -f "$_uf" ] && [ ! -L "$_uf" ] && cmp -s "$_uf" "$UN_PREFIX/share/icons/hicolor/$_ui"; then un_rm_file "$_uf"; fi
+            done < "$UN_TMP/icons.list"
+            un_refresh_icons "$_ud/icons/hicolor"
+        fi
+    done
+    # the compiled terminfo entry: byte for byte what tic makes of this prefix's liu.terminfo
+    # (the install ran the same tic on the same file), and not a package's
+    if [ -f "$UN_PREFIX/liu.terminfo" ] && command -v tic >/dev/null 2>&1 \
+            && tic -x -o "$UN_TMP/ti" "$UN_PREFIX/liu.terminfo" >/dev/null 2>&1 && [ -f "$UN_TMP/ti/x/xterm-liu" ]; then
+        ti_dirs > "$UN_TMP/ti.list"
+        while IFS= read -r _ut; do
+            _uf="$_ut/x/xterm-liu"
+            [ -f "$_uf" ] && [ ! -L "$_uf" ] || continue
+            if ! cmp -s "$_uf" "$UN_TMP/ti/x/xterm-liu"; then un_say "  left $_uf (not what this install's liu.terminfo compiles to)"; UN_LEFT=$((UN_LEFT + 1)); continue; fi
+            if un_pkg_owner "$_uf" >/dev/null; then un_say "  left $_uf (a package owns it)"; UN_LEFT=$((UN_LEFT + 1)); continue; fi
+            un_rm_file "$_uf"
+        done < "$UN_TMP/ti.list"
+        find "$UN_TMP/ti" ! -type d -exec rm -f -- {} + 2>/dev/null
+        find "$UN_TMP/ti" -depth -type d -exec rmdir -- {} + 2>/dev/null
+    fi
+}
+
+# an install with a manifest: its records, nothing else
+un_by_manifest() {
+    _um="$UN_PREFIX/$MF_NAME"
+    awk -F'\t' '$1 == "f" && NF == 3 { print $2 "\t" $3 }' "$_um" > "$UN_TMP/f.list"
+    awk -F'\t' '$1 == "l" && NF == 3 { print $2 "\t" $3 }' "$_um" > "$UN_TMP/l.list"
+    awk -F'\t' '$1 == "d" && NF == 2 { print length($2) "\t" $2 }' "$_um" | LC_ALL=C sort -t "$TAB" -k1,1nr -k2 | cut -f2- > "$UN_TMP/d.list"
+    awk -F'\t' '$1 == "cache" && NF == 2 { print $2 }' "$_um" > "$UN_TMP/c.list"
+    # outside the prefix first (that is what points into it), then the tree
+    while IFS="$TAB" read -r _up _uh; do un_under "$_up" "$UN_PREFIX" || un_file "$_up" "$_uh"; done < "$UN_TMP/f.list"
+    while IFS="$TAB" read -r _up _ut; do un_under "$_up" "$UN_PREFIX" || un_link "$_up" "$_ut"; done < "$UN_TMP/l.list"
+    _ucur="$(tr -d '[:space:]' < "$UN_PREFIX/VERSION" 2>/dev/null)"
+    _uver="$(awk -F'\t' '$1 == "version" { print $2; exit }' "$_um")"
+    if [ "$_ucur" = "$_uver" ]; then
+        while IFS="$TAB" read -r _up _uh; do un_under "$_up" "$UN_PREFIX" && un_file "$_up" "$_uh"; done < "$UN_TMP/f.list"
+        while IFS="$TAB" read -r _up _ut; do un_under "$_up" "$UN_PREFIX" && un_link "$_up" "$_ut"; done < "$UN_TMP/l.list"
+    else
+        un_say "  (the tree is $_ucur, the manifest says $_uver: an update replaced it; removing the tree by its layout)"
+        un_layout
+    fi
+    while IFS= read -r _uc; do un_refresh_icons "$_uc"; done < "$UN_TMP/c.list"
+    if [ "$UN_FAILED" = 0 ]; then
+        if [ -f "$_um" ] && un_inside_phys "$_um"; then un_rm_file "$_um" quiet; fi
+        while IFS= read -r _ud; do
+            path_ok "$_ud" || continue
+            if un_under "$_ud" "$UN_PREFIX" || [ "$_ud" = "$UN_PREFIX" ]; then un_rmdir "$_ud" quiet; else un_rmdir "$_ud"; fi
+        done < "$UN_TMP/d.list"
+    else
+        un_say "  kept $_um (something could not be removed; run this again once that is fixed)"
+    fi
+}
+
+un_cleanup() {   # the scratch directory holds only the lists written above
+    rm -f -- "$UN_TMP/f.list" "$UN_TMP/l.list" "$UN_TMP/d.list" "$UN_TMP/c.list" "$UN_TMP/icons.list" "$UN_TMP/ti.list" \
+        "$UN_TMP/gone" "$UN_TMP/ls"
+    rmdir -- "$UN_TMP" 2>/dev/null
+    return 0
+}
+
+# one prefix. Returns 0 removed, 1 could not, 2 not ours to remove, 3 nothing there.
+un_prefix() {
+    UN_PREFIX="$1"
+    while [ "${UN_PREFIX%/}" != "$UN_PREFIX" ] && [ -n "${UN_PREFIX%/}" ]; do UN_PREFIX="${UN_PREFIX%/}"; done
+    if ! path_ok "$UN_PREFIX"; then un_say "Refusing '$UN_PREFIX': not a plain absolute path."; return 2; fi
+    case "$UN_PREFIX" in
+        /|/usr|/usr/local|/bin|/sbin|/lib|/etc|/var|/home|/opt|/root|/tmp|"${HOME:-/nonexistent}")
+            un_say "Refusing $UN_PREFIX: not a Liu install directory."; return 2 ;;
+    esac
+    if [ -L "$UN_PREFIX" ]; then un_say "Refusing $UN_PREFIX: it is a symbolic link. Set LIU_PREFIX to the directory it leads to."; return 2; fi
+    if [ ! -d "$UN_PREFIX" ]; then un_say "No Liu install at $UN_PREFIX."; return 3; fi
+    # A Liu tree holds VERSION and bin/Liu; its own manifest also says so (a removal that
+    # stopped half way has taken those files already and is finished by running this again).
+    if { [ ! -f "$UN_PREFIX/VERSION" ] || [ ! -f "$UN_PREFIX/bin/Liu" ] || [ -L "$UN_PREFIX/bin/Liu" ]; } \
+            && ! { [ -f "$UN_PREFIX/$MF_NAME" ] && [ ! -L "$UN_PREFIX/$MF_NAME" ] \
+                   && head -n 1 "$UN_PREFIX/$MF_NAME" | grep -q '^# liu install manifest 1 '; }; then
+        un_say "Not removing $UN_PREFIX: it has no VERSION and bin/Liu, so it is not a Liu install."; return 2
+    fi
+    if _uo="$(un_pkg_owner "$UN_PREFIX/bin/Liu")"; then
+        un_say "$UN_PREFIX belongs to a package (${_uo%%:*}): remove it with '${_uo#*: }' (as root), not with this script."; return 2
+    fi
+    if [ "$UN_DRY" != 1 ] && [ ! -w "$UN_PREFIX" ]; then
+        un_say "$UN_PREFIX is not writable by you. It was installed by another user, probably root: run this as that user (sudo)."; return 1
+    fi
+    UN_PHYS="$(cd "$UN_PREFIX" && pwd -P)"
+    UN_TMP="$(mktemp -d "${TMPDIR:-/tmp}/liu-uninstall.XXXXXX")" || { un_say "couldn't create a temporary directory."; return 1; }
+    UN_REMOVED=0; UN_LEFT=0; UN_FAILED=0; : > "$UN_TMP/gone"
+    _uv="$(tr -d '[:space:]' < "$UN_PREFIX/VERSION" 2>/dev/null)"
+    if [ "$UN_DRY" = 1 ]; then un_say "Would remove Liu ${_uv} from $UN_PREFIX:"; else un_say "Removing Liu ${_uv} from $UN_PREFIX:"; fi
+    if [ -f "$UN_PREFIX/$MF_NAME" ]; then
+        if ! head -n 1 "$UN_PREFIX/$MF_NAME" | grep -q '^# liu install manifest 1 '; then
+            un_say "Not removing $UN_PREFIX: $MF_NAME is in a format this script does not know."; un_cleanup; return 2
+        fi
+        if [ "$(awk -F'\t' '$1 == "prefix" { print $2; exit }' "$UN_PREFIX/$MF_NAME")" != "$UN_PREFIX" ]; then
+            un_say "Not removing $UN_PREFIX: its manifest was written for another location (was it moved?)."; un_cleanup; return 2
+        fi
+        un_by_manifest
+    else
+        un_say "  (no $MF_NAME: an install from before it existed, or one the updater rewrote; removing by the known layout)"
+        un_legacy_outside
+        un_layout
+        un_rmdir "$UN_PREFIX" quiet
+    fi
+    un_cleanup
+    if [ -d "$UN_PREFIX" ] && [ "$UN_DRY" != 1 ] && [ -n "$(ls -A "$UN_PREFIX" 2>/dev/null)" ]; then
+        un_say "  $UN_PREFIX stays: it holds files Liu did not install."
+    fi
+    _usum="$UN_REMOVED files"; [ "$UN_DRY" = 1 ] && _usum="$_usum would be removed" || _usum="$_usum removed"
+    [ "$UN_LEFT" = 0 ] || _usum="$_usum, $UN_LEFT left alone"
+    un_say "  $_usum."
+    [ "$UN_FAILED" = 0 ] || return 1
+    return 0
+}
+
+uninstall_main() {
+    set +e
+    _ufound=0; _ubad=0
+    if [ -n "${LIU_PREFIX:-}" ]; then
+        _uwhere="$LIU_PREFIX"
+        _ufound=1
+        un_prefix "$LIU_PREFIX" || _ubad=1
+    else
+        _uwhere="/opt/liu or ${HOME:-~}/.local/liu"
+        for _uc in /opt/liu "${HOME:-/nonexistent}/.local/liu"; do
+            un_prefix "$_uc"; _urc=$?
+            case "$_urc" in 0) _ufound=1 ;; 3) ;; *) _ufound=1; _ubad=1 ;; esac
+        done
+    fi
+    if [ "$_ufound" = 0 ]; then
+        un_say "Liu is not installed here (looked in $_uwhere); nothing to remove."
+        un_say "Another prefix: LIU_PREFIX=<dir> install.sh --uninstall"
+        return 0
+    fi
+    if [ "$_ubad" = 0 ]; then
+        if [ "$UN_DRY" = 1 ]; then
+            un_say "Dry run: nothing was changed."
+        else
+            un_say "Done. Your settings and data (~/.config/Liu, ~/.local/share/liu) were not touched."
+            if command -v pgrep >/dev/null 2>&1 && pgrep -x Liu >/dev/null 2>&1; then un_say "A running Liu keeps running until you quit it."; fi
+        fi
+    fi
+    return "$_ubad"
+}
+
+# --- command line ------------------------------------------------------------
+UNINSTALL=0; TARGET=""
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help) usage; exit 0 ;;
+        --uninstall) UNINSTALL=1 ;;
+        --dry-run|-n) UN_DRY=1 ;;
+        -*) err "Unknown option: $arg (see --help)" ;;
+        *) [ -z "$TARGET" ] || err "Unexpected argument: $arg (see --help)"; TARGET="$arg" ;;
+    esac
+done
+[ "$UN_DRY" = 0 ] || [ "$UNINSTALL" = 1 ] || err "--dry-run goes with --uninstall."
+if [ "$UNINSTALL" = 1 ]; then
+    [ -z "$TARGET" ] || err "--uninstall takes no version."
+    [ "$(uname -s)" = "Linux" ] \
+        || err "--uninstall removes what this script installs on Linux. On macOS, drag Liu.app (in /Applications or ~/Applications) to the Trash."
+    uninstall_main
+    exit $?
+fi
 if [ -n "$TARGET" ] && ! printf '%s' "$TARGET" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][^[:space:]]+)?$'; then
     err "Invalid version format: $TARGET (expected X.Y.Z)"
 fi
@@ -465,8 +927,14 @@ else
     else
         PREFIX="$HOME/.local/liu"
     fi
-    mkdir -p "$PREFIX" 2>/dev/null || err "can't create install prefix $PREFIX."
+    # What gets written is recorded as it is (see "install manifest" above), for --uninstall.
+    MF="$TMP/install-manifest.records"; : > "$MF"
+    mf_mkdir_p "$PREFIX" 2>/dev/null || err "can't create install prefix $PREFIX."
     [ -w "$PREFIX" ] || err "install prefix $PREFIX is not writable."
+    # The swap below replaces an existing prefix whole: only a Liu install may be.
+    if [ -n "$(ls -A "$PREFIX" 2>/dev/null)" ] && [ ! -f "$PREFIX/VERSION" ] && [ ! -f "$PREFIX/$MF_NAME" ]; then
+        err "$PREFIX is not empty and is not a Liu install (no VERSION file), so it is not replaced. Use another LIU_PREFIX, or empty it first."
+    fi
 
     # --- signed-downgrade guard (Linux) --------------------------------------
     # Linux has no Info.plist to read: the guard compares against the VERSION
@@ -511,6 +979,12 @@ else
     if [ -n "$ICON_SRC" ]; then mkdir -p "$STAGE/share"; cp -p "$ICON_SRC" "$STAGE/share/liu.png" 2>/dev/null || true; fi
     printf '%s\n' "$VER" > "$STAGE/VERSION"
 
+    # An earlier install's manifest outlives the swap only as its records outside the prefix.
+    OLD_MF=""
+    if [ -f "$PREFIX/$MF_NAME" ] && cp "$PREFIX/$MF_NAME" "$TMP/install-manifest.old" 2>/dev/null; then
+        OLD_MF="$TMP/install-manifest.old"
+    fi
+
     # Swap: move old aside, move staged into place, restore old on failure.
     OLD=""
     if [ -e "$PREFIX" ]; then OLD="$PREFIX.old-$$"; rm -rf "$OLD"; mv "$PREFIX" "$OLD"; fi
@@ -529,11 +1003,16 @@ else
     else
         BINDIR="$HOME/.local/bin"
     fi
-    mkdir -p "$BINDIR" 2>/dev/null || true
+    mf_mkdir_p "$BINDIR" 2>/dev/null || true
     if [ -w "$BINDIR" ] 2>/dev/null || [ -d "$BINDIR" ]; then
-        ln -sf "$PREFIX/bin/Liu" "$BINDIR/liu" 2>/dev/null \
-            && note "  Symlinked $BINDIR/liu -> $PREFIX/bin/Liu" \
-            || warn "couldn't create the $BINDIR/liu symlink (add $PREFIX/bin to PATH manually)."
+        if [ -e "$BINDIR/liu" ] && [ ! -L "$BINDIR/liu" ]; then
+            warn "$BINDIR/liu exists and is not a link, so it is left alone (add $PREFIX/bin to PATH, or move it away and run this again)."
+        elif ln -sf "$PREFIX/bin/Liu" "$BINDIR/liu" 2>/dev/null; then
+            mf_add l "$BINDIR/liu" "$PREFIX/bin/Liu" || true
+            note "  Symlinked $BINDIR/liu -> $PREFIX/bin/Liu"
+        else
+            warn "couldn't create the $BINDIR/liu symlink (add $PREFIX/bin to PATH manually)."
+        fi
         case ":$PATH:" in
             *":$BINDIR:"*) ;;
             *) warn "$BINDIR is not on your PATH — add it to use the 'liu' command." ;;
@@ -546,28 +1025,48 @@ else
     # ("term": "xterm-liu"); installing it here makes that name resolve.
     # Best-effort: tic may be absent on a minimal box.
     if [ -f "$PREFIX/liu.terminfo" ] && command -v tic >/dev/null 2>&1; then
-        tic -x "$PREFIX/liu.terminfo" >/dev/null 2>&1 \
-            && note "  Installed the Liu terminfo entry (xterm-liu)." \
-            || warn "couldn't compile liu.terminfo with tic (TERM=xterm-liu will not resolve)."
+        # tic decides where the entry goes ($TERMINFO, ~/.terminfo or the system's);
+        # what it wrote is found by looking at those places before and after.
+        ti_state > "$TMP/terminfo.before" 2>/dev/null || true
+        if tic -x "$PREFIX/liu.terminfo" >/dev/null 2>&1; then
+            ti_record "$TMP/terminfo.before" || true
+            note "  Installed the Liu terminfo entry (xterm-liu)."
+        else
+            warn "couldn't compile liu.terminfo with tic (TERM=xterm-liu will not resolve)."
+        fi
     fi
 
     # --- icons, by name -------------------------------------------------------
     # The hicolor PNGs go where the icon theme looks (an XDG data dir), so the
     # entry below can say Icon=liu and the app's banners (notify-send
     # --icon=liu) find the same icon. Same place as the .desktop entry.
-    if [ -w /usr/share/applications ] 2>/dev/null; then
+    if [ -n "${LIU_DATA_DIR:-}" ]; then
+        DATADIR="$LIU_DATA_DIR"
+    elif [ -w /usr/share/applications ] 2>/dev/null; then
         DATADIR="/usr/share"
     else
         DATADIR="$HOME/.local/share"
     fi
     ICON_NAMED=0
     if [ -d "$PREFIX/share/icons/hicolor" ]; then
-        mkdir -p "$DATADIR/icons/hicolor" 2>/dev/null || true
+        mf_mkdir_p "$DATADIR/icons/hicolor" 2>/dev/null || true
+        # the theme's folders the copy below has to create, and the files it writes
+        ( cd "$PREFIX/share/icons/hicolor" && find . -mindepth 1 -type d | LC_ALL=C sort ) > "$TMP/icons.dirs"
+        ( cd "$PREFIX/share/icons/hicolor" && find . -type f | LC_ALL=C sort ) > "$TMP/icons.files"
+        : > "$TMP/icons.newdirs"
+        while IFS= read -r _i; do
+            [ -e "$DATADIR/icons/hicolor/${_i#./}" ] || [ -L "$DATADIR/icons/hicolor/${_i#./}" ] || printf '%s\n' "${_i#./}" >> "$TMP/icons.newdirs"
+        done < "$TMP/icons.dirs"
+        CACHE_BEFORE=0; [ -e "$DATADIR/icons/hicolor/icon-theme.cache" ] && CACHE_BEFORE=1
         if cp -pR "$PREFIX/share/icons/hicolor/." "$DATADIR/icons/hicolor/" 2>/dev/null; then
             ICON_NAMED=1
+            while IFS= read -r _i; do mf_add d "$DATADIR/icons/hicolor/$_i" || true; done < "$TMP/icons.newdirs"
+            while IFS= read -r _i; do mf_file "$DATADIR/icons/hicolor/${_i#./}" || true; done < "$TMP/icons.files"
             # A theme directory with an index keeps a cache; refresh it.
             if [ -f "$DATADIR/icons/hicolor/index.theme" ] && command -v gtk-update-icon-cache >/dev/null 2>&1; then
                 gtk-update-icon-cache -q "$DATADIR/icons/hicolor" 2>/dev/null || true
+                mf_add cache "$DATADIR/icons/hicolor" || true
+                [ "$CACHE_BEFORE" = 1 ] || mf_file "$DATADIR/icons/hicolor/icon-theme.cache" || true
             fi
             note "  Installed the icons under $DATADIR/icons/hicolor"
         else
@@ -580,7 +1079,7 @@ else
     # handed, so Exec is the bare command with no field codes: a %F/%U would
     # pass paths the app does not read.
     APPDIR="$DATADIR/applications"
-    mkdir -p "$APPDIR" 2>/dev/null || true
+    mf_mkdir_p "$APPDIR" 2>/dev/null || true
     ICON_LINE="Icon=liu"
     if [ "$ICON_NAMED" != "1" ]; then
         ICON_LINE="Icon=$PREFIX/share/liu.png"
@@ -603,8 +1102,18 @@ else
             # addressed as application://liu.desktop — lands on nothing.
             printf '%s\n' 'StartupWMClass=liu'
         } > "$APPDIR/liu.desktop" 2>/dev/null \
-            && note "  Wrote $APPDIR/liu.desktop" \
+            && { mf_file "$APPDIR/liu.desktop" || true; note "  Wrote $APPDIR/liu.desktop"; } \
             || warn "couldn't write the .desktop entry to $APPDIR."
+    fi
+
+    # --- the manifest ----------------------------------------------------------
+    # Written last, into the new prefix: the tree, what was recorded above, and the
+    # records of an earlier install that this one did not write again.
+    if mf_finish "$PREFIX" "$VER" "$OLD_MF" "$MF" "$TMP/install-manifest" 2>/dev/null \
+            && cp "$TMP/install-manifest" "$PREFIX/$MF_NAME" 2>/dev/null; then
+        chmod 644 "$PREFIX/$MF_NAME" 2>/dev/null || true
+    else
+        warn "couldn't write $PREFIX/$MF_NAME: 'install.sh --uninstall' will remove this install by its known layout."
     fi
 
     # --- post-install sanity check (headless) ----------------------------------
