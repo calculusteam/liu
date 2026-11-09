@@ -714,10 +714,22 @@ static Found *found_add(FoundList *fl) {
     return f;
 }
 
-/* When a file came to be, in ns: its birth where the file system keeps one. */
+/* When a file came to be, in ns: its birth where the file system keeps one.
+ * The last write is only the fallback: a transcript is appended to as its
+ * agent works, so ordering by it reorders the job tabs while they run. */
 static i64 born_ns(const char *path) {
+    if (!path || !path[0]) return 0;
+#if defined(__linux__) && defined(STATX_BTIME)
+    struct statx sx;
+    if (statx(AT_FDCWD, path, 0, STATX_BTIME | STATX_MTIME, &sx) == 0) {
+        if (sx.stx_mask & STATX_BTIME)
+            return (i64)sx.stx_btime.tv_sec * 1000000000 + sx.stx_btime.tv_nsec;
+        if (sx.stx_mask & STATX_MTIME)
+            return (i64)sx.stx_mtime.tv_sec * 1000000000 + sx.stx_mtime.tv_nsec;
+    }
+#endif
     struct stat st;
-    if (!path || !path[0] || stat(path, &st) != 0) return 0;
+    if (stat(path, &st) != 0) return 0;
 #ifdef __APPLE__
     return (i64)st.st_birthtimespec.tv_sec * 1000000000 + st.st_birthtimespec.tv_nsec;
 #else
@@ -725,9 +737,14 @@ static i64 born_ns(const char *path) {
 #endif
 }
 
+/* Two born together go by their file's name, then by the order they were
+ * found: a folder is listed in the file system's own order, by name on one
+ * and by a hash of it on another, and the job tabs must not depend on it. */
 static int found_order(const void *a, const void *b) {
     const Found *x = a, *y = b;
     if (x->born != y->born) return x->born < y->born ? -1 : 1;
+    int by_name = strcmp(x->path, y->path);
+    if (by_name) return by_name;
     return x->seq - y->seq;
 }
 

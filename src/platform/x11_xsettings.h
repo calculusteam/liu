@@ -2,9 +2,8 @@
  * Liu - the XSETTINGS property (X11)
  *
  * A desktop that does not write Xft.dpi into the root window's
- * RESOURCE_MANAGER still publishes its scale: the settings daemons of Xfce,
- * Cinnamon, MATE and GNOME (gsd-xsettings), KDE's settings module and the
- * stand-alone xsettingsd all own the manager selection _XSETTINGS_S<screen>
+ * RESOURCE_MANAGER still publishes its scale: a desktop's settings daemon,
+ * or a stand-alone one, owns the manager selection _XSETTINGS_S<screen>
  * and keep every setting in one binary property of the selection owner's
  * window, _XSETTINGS_SETTINGS (the XSETTINGS specification, version 0.5):
  *

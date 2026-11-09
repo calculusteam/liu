@@ -1672,6 +1672,10 @@ struct PlatformWindow {
     _Atomic uint64_t     link_last_host_time;
     _Atomic uint64_t     link_period_ticks;
     _Atomic bool         link_rebind;   /* set by windowDidChangeScreen: */
+    /* The loop has no frame to make at the next ticks: they are counted and
+     * wake nothing (platform_window_set_link_wake). Zero, as calloc leaves
+     * it, is "wake". */
+    _Atomic bool         link_quiet;
     /* The last four gaps between callbacks (host ticks) — the watchdog period
      * is their MINIMUM, see frame_pacing_min_gap. */
     _Atomic uint64_t     link_gaps[4];
@@ -3179,9 +3183,16 @@ static CVReturn liu_display_link_cb(CVDisplayLinkRef link,
     atomic_fetch_add_explicit(&w->vsync_ticks, 1, memory_order_release);
     /* Wake the loop, do not draw. Deliberately NOT platform_wake_event_loop():
      * that counts as an fd fire and would make every vblank run a session
-     * poll. A vblank says "you may present", not "there are bytes". */
-    watch_post_wake_event();
+     * poll. A vblank says "you may present", not "there are bytes" — and
+     * only to a loop that has a frame to present: the tick is counted either
+     * way, so the cadence and the silence watch above stay whole. */
+    if (!atomic_load_explicit(&w->link_quiet, memory_order_acquire))
+        watch_post_wake_event();
     return kCVReturnSuccess;
+}
+
+void platform_window_set_link_wake(PlatformWindow *w, bool wake) {
+    if (w) atomic_store_explicit(&w->link_quiet, !wake, memory_order_release);
 }
 
 static void platform_window_mark_link_rebind(PlatformWindow *w) {

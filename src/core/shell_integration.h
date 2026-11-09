@@ -29,6 +29,5 @@ bool shell_integration_install(char *dir, usize cap);
 /* Return the generated zsh initialization and integration file
  * contents. */
 const char *shell_integration_zshenv_text(void);
-const char *shell_integration_zsh_text(void);
 
 #endif /* CORE_SHELL_INTEGRATION_H */

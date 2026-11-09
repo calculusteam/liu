@@ -155,39 +155,6 @@ bool serial_is_alive(SerialSession *ss) {
     return ss && ss->alive;
 }
 
-i32 serial_list_ports(char (*names)[128], i32 max) {
-    if (!names || max <= 0) return 0;
-    i32 count = 0;
-
-#ifdef PLATFORM_MACOS
-    DIR *dir = opendir("/dev");
-    if (!dir) return 0;
-    struct dirent *entry;
-    while ((entry = readdir(dir)) && count < max) {
-        if (strncmp(entry->d_name, "tty.", 4) == 0 ||
-            strncmp(entry->d_name, "cu.", 3) == 0) {
-            snprintf(names[count], 128, "/dev/%s", entry->d_name);
-            count++;
-        }
-    }
-    closedir(dir);
-#elif defined(PLATFORM_LINUX)
-    DIR *dir = opendir("/dev");
-    if (!dir) return 0;
-    struct dirent *entry;
-    while ((entry = readdir(dir)) && count < max) {
-        if (strncmp(entry->d_name, "ttyUSB", 6) == 0 ||
-            strncmp(entry->d_name, "ttyACM", 6) == 0 ||
-            strncmp(entry->d_name, "ttyS", 4) == 0) {
-            snprintf(names[count], 128, "/dev/%s", entry->d_name);
-            count++;
-        }
-    }
-    closedir(dir);
-#endif
-    return count;
-}
-
 /* Pollable fd accessor. */
 i32 serial_fd(SerialSession *ss) {
     return ss ? ss->fd : -1;

@@ -21,7 +21,4 @@ typedef struct {
  * filenames (Dockerfile, Makefile, README, LICENSE, .gitignore, …). */
 FbIcon fb_icon_for(const char *name, bool is_dir);
 
-/* Neutral fallback — generic file icon with the theme's dim fg colour. */
-FbIcon fb_icon_default_file(Color dim_fg);
-
 #endif

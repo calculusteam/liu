@@ -241,11 +241,4 @@ void bridge_history_finish(BridgeHistory *h);
  * creating an empty session the user then has to clean up. */
 bool bridge_history_is_empty(const BridgeHistory *h);
 
-/* Index of the last event of `type`, or -1. Used by adapters that must know
- * whether the conversation ends on a user turn (some targets require the
- * next turn to be the user's). */
-isize bridge_history_last_of(const BridgeHistory *h, BridgeEventType type);
-
-const char *bridge_event_type_name(BridgeEventType t);
-
 #endif /* HISTORY_BRIDGE_IR_H */

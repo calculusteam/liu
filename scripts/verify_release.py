@@ -204,7 +204,11 @@ def main():
     ap.add_argument("--feed", help="verify an original feed before merging it")
     ap.add_argument("--package-dir"); ap.add_argument("--version"); ap.add_argument("--base-url")
     ap.add_argument("--pubkey-header", default="src/core/update_pubkey.h"); ap.add_argument("--openssl", default="openssl")
+    ap.add_argument("--platforms", default="macos,linux",
+                    help="the systems this release ships, comma-separated (macos, linux); each must be whole and nothing else present")
     args = ap.parse_args()
+    platforms = {p.strip() for p in args.platforms.split(",") if p.strip()}
+    if not platforms or not platforms <= {"macos", "linux"}: ap.error("--platforms takes macos, linux or both")
     pem = public_key_pem(Path(args.pubkey_header))
     if args.feed:
         check_feed_signature(args.openssl, pem, Path(args.feed))
@@ -229,20 +233,25 @@ def main():
     # an entire platform. An artifact with no "os" is macOS, the same default
     # updater.c and install.sh apply.
     seen_pairs = {(a.get("os", "macos"), a.get("arch")) for a in entry.get("artifacts", [])}
-    required_pairs = {("macos", "arm64"), ("macos", "x86_64"), ("linux", "arm64"), ("linux", "x86_64")}
+    required_pairs = {(o, a) for o in platforms for a in ("arm64", "x86_64")}
     missing = required_pairs - seen_pairs
     if missing: fail("feed is missing " + ", ".join(f"{o}/{c}" for o, c in sorted(missing)))
+    extra = seen_pairs - required_pairs
+    if extra: fail("feed carries a system this release does not ship: " + ", ".join(f"{o}/{c}" for o, c in sorted(extra)))
     if len(seen_pairs) != len(entry.get("artifacts", [])): fail("feed has two artifacts for the same (os, arch)")
     manifest_items = [check_artifact(root, a, args.base_url, args.openssl, pem, "manifest") for a in manifest.get("artifacts", [])]
     # Every file the release page carries: a DMG and an update zip per macOS arch; the
     # updater's tarball, a .deb, an .rpm and an AppImage per Linux arch.
-    required_kinds = ({(k, a) for k in ("dmg", "zip") for a in ("arm64", "x86_64")} |
-                      {(k, a) for k in ("tarball", "deb", "rpm", "appimage") for a in ("linux-arm64", "linux-x86_64")})
+    required_kinds = set()
+    if "macos" in platforms: required_kinds |= {(k, a) for k in ("dmg", "zip") for a in ("arm64", "x86_64")}
+    if "linux" in platforms:
+        required_kinds |= {(k, a) for k in ("tarball", "deb", "rpm", "appimage") for a in ("linux-arm64", "linux-x86_64")}
     kinds = [(a.get("kind"), a.get("arch")) for a in manifest.get("artifacts", [])]
     if set(kinds) != required_kinds or len(kinds) != len(required_kinds):
-        fail("manifest must list, per arch, the macOS DMG and zip and the Linux tarball, .deb, .rpm and AppImage "
-             f"(missing: {sorted(required_kinds - set(kinds))}, unexpected: {sorted(set(kinds) - required_kinds)})")
+        fail("manifest must list, per arch, the macOS DMG and zip and/or the Linux tarball, .deb, .rpm and AppImage "
+             f"for {', '.join(sorted(platforms))} (missing: {sorted(required_kinds - set(kinds))}, "
+             f"unexpected: {sorted(set(kinds) - required_kinds)})")
     check_manifest_feed(manifest, entry)
-    print(f"release bundle verified: {args.version} ({len(manifest_items)} artifacts)")
+    print(f"release bundle verified: {args.version}, {', '.join(sorted(platforms))} ({len(manifest_items)} artifacts)")
 
 if __name__ == "__main__": main()

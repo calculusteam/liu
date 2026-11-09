@@ -120,18 +120,10 @@ void voice_tick(void);
 
 VoiceState  voice_state(void);
 
-/* Peak amplitude, 0..1, of the audio drained by the most recent voice_tick().
- *
- * The raw thing, not a meter: the platform layer's own level is smoothed with
- * an instant attack and a ~0.5 s release, which flattens a waveform drawn from
- * it into a slab. Whatever draws it does its own smoothing and owns the time
- * constants. */
-f32         voice_level(void);
-
 /* Peak amplitude since the last call, then reset to zero.
  *
  * A display that samples on a clock — the waveform pushes one bar every 55 ms
- * — must not sample voice_level() at those instants: it would read the peak of
+ * — must not sample an instantaneous level at those instants: it would read the peak of
  * whichever ~16 ms frame happened to land there and miss the rest of the
  * interval, which is a picture of the frame timing rather than of the audio.
  * This accumulates across the whole interval, so every sample the user has
@@ -152,11 +144,9 @@ f32         voice_level(void);
 #define VOICE_WAVE_BAR_MS 36
 i32         voice_wave_take(f32 *out, i32 max);
 
-f64         voice_elapsed(void);      /* seconds recorded so far            */
 f32         voice_progress(void);     /* 0..1 through transcription         */
 const char *voice_error(void);        /* "" when there is none              */
 const char *voice_backend(void);      /* "metal"/"cpu"/provider, once known */
-const char *voice_language(void);     /* detected or requested ISO code     */
 
 /* Take the finished transcript. Returns NULL unless the state is
  * VOICE_DONE; the pointer stays valid until the next voice_start(), and the

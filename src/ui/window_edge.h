@@ -4,8 +4,8 @@
 /* The edge of a floating window, drawn by Liu.
  *
  * On X11 Liu's windows carry no window-manager frame (the tab strip is the
- * title bar), and mutter and KWin draw no border or shadow for a window that
- * has none, so two Liu windows laid over each other show no line between them.
+ * title bar), and compositing window managers draw no border or shadow for a
+ * window that has none, so two Liu windows laid over each other show no line between them.
  * A floating window gets a one-device-pixel outline in the theme's divider
  * colour instead, painted over the outermost ring of the window; nothing is
  * inset, so every pane, hit test and band keeps its place. A maximized or

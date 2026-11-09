@@ -60,14 +60,6 @@ typedef struct {
     char            private_key_secret_id[48];
 } VaultHost;
 
-/* Group record */
-typedef struct {
-    char  id[64];
-    char  name[128];
-    char  parent_id[64];
-    char  color[8];
-} VaultGroup;
-
 /* Snippet record */
 typedef struct {
     char  id[64];
@@ -76,16 +68,6 @@ typedef struct {
     char  description[256];
     char  tags[256];
 } VaultSnippet;
-
-/* SSH key record */
-typedef struct {
-    char  id[64];
-    char  label[128];
-    char  algorithm[32];
-    char  public_key[2048];
-    char  fingerprint[128];
-    i64   created_at;
-} VaultKey;
 
 /* =========================================================================
  * Vault lifecycle
@@ -99,6 +81,8 @@ void   vault_close(Vault *v);
  * ========================================================================= */
 
 #define VAULT_HISTORY_MAX 50
+/* Nothing writes the command_history table any more; the rows older builds
+ * left there are pruned on open once they are this old. */
 #define VAULT_COMMAND_HISTORY_RETENTION_DAYS 30
 
 typedef struct {
@@ -114,6 +98,14 @@ bool vault_add_history(Vault *v, const char *hostname, i32 port,
                        const char *username, const char *auth_method, bool succeeded);
 bool vault_update_history_result(Vault *v, const char *hostname, i32 port,
                                  const char *username, bool succeeded);
+/* One connection attempt, stored as not connected (yet): its row id, which
+ * the attempt's own result is written to (vault_set_history_result), or 0
+ * when it could not be stored. `hostname` is the name the person asked for. */
+i64  vault_add_history_attempt(Vault *v, const char *hostname, i32 port,
+                               const char *username, const char *auth_method);
+/* Attempt `id` connected or not; `auth_method`, when not NULL or empty, is
+ * how it got in (a password asked for after a key was refused). */
+bool vault_set_history_result(Vault *v, i64 id, bool succeeded, const char *auth_method);
 i32  vault_get_history(Vault *v, VaultHistoryEntry *entries, i32 max_entries);
 bool vault_clear_history(Vault *v);
 /* Forget one destination: every row for hostname + port + username (the
@@ -122,27 +114,9 @@ bool vault_clear_history(Vault *v);
 bool vault_forget_history(Vault *v, const char *hostname, i32 port, const char *username);
 
 /* =========================================================================
- * Command History
- * ========================================================================= */
-
-typedef struct {
-    char command[4096];
-    f64  timestamp;
-} VaultCommandHistoryEntry;
-
-bool vault_add_command_history(Vault *v, const char *command);
-i32  vault_get_recent_command_history(Vault *v,
-                                      VaultCommandHistoryEntry *entries,
-                                      i32 max_entries);
-
-/* =========================================================================
  * Favorites
  * ========================================================================= */
 
-bool vault_set_favorite(Vault *v, const char *hostname, i32 port,
-                        const char *username, bool is_favorite);
-bool vault_is_favorite(Vault *v, const char *hostname, i32 port,
-                       const char *username);
 i32  vault_get_favorites(Vault *v, VaultHost *hosts, i32 max);
 
 /* =========================================================================
@@ -159,14 +133,6 @@ bool vault_host_get(Vault *v, const char *id, VaultHost *out);
 bool vault_host_get_at(Vault *v, i32 index, VaultHost *out);
 
 /* =========================================================================
- * Group CRUD
- * ========================================================================= */
-
-bool vault_group_insert(Vault *v, const VaultGroup *group);
-bool vault_group_delete(Vault *v, const char *id);
-i32  vault_group_list(Vault *v, VaultGroup *out, i32 max);
-
-/* =========================================================================
  * Snippet CRUD
  * ========================================================================= */
 
@@ -174,23 +140,11 @@ i32  vault_group_list(Vault *v, VaultGroup *out, i32 max);
  * is borrowed for the call duration only — copy what you need. */
 typedef bool (*vault_snippet_cb)(const VaultSnippet *snippet, void *user);
 
-bool vault_snippet_insert(Vault *v, const VaultSnippet *snippet);
-bool vault_snippet_update(Vault *v, const VaultSnippet *snippet);
-bool vault_snippet_delete(Vault *v, const char *id);
-i32  vault_snippet_list(Vault *v, VaultSnippet *out, i32 max);
 /* Streaming variant — emits each snippet to `cb` without materializing an
  * intermediate array. Saves the ~4.7 KB per snippet record on the caller
  * side; useful when the caller only needs label/short description and
  * doesn't keep the full record. Returns the count of rows emitted. */
 i32  vault_snippet_for_each(Vault *v, vault_snippet_cb cb, void *user);
-
-/* =========================================================================
- * Key CRUD
- * ========================================================================= */
-
-bool vault_key_insert(Vault *v, const VaultKey *key);
-bool vault_key_delete(Vault *v, const char *id);
-i32  vault_key_list(Vault *v, VaultKey *out, i32 max);
 
 /* =========================================================================
  * Smart Vault — encrypted secrets

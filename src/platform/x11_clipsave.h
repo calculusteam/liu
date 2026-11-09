@@ -10,8 +10,8 @@
  * targets to keep, then go on answering the manager's requests for the
  * CLIPBOARD (TARGETS, then each target) until its SelectionNotify says it has
  * taken the clipboard over; a property of None in that reply is a refusal. A
- * desktop with no manager (a bare window manager, KWin without Klipper) has no
- * owner of CLIPBOARD_MANAGER and the quit goes on at once.
+ * desktop with no manager (a bare window manager, a clipboard manager turned
+ * off) has no owner of CLIPBOARD_MANAGER and the quit goes on at once.
  *
  * The manager can be slow or can never answer, and the quit must not hang on
  * it: the wait ends when nothing has happened for CLIP_SAVE_IDLE_SEC, and

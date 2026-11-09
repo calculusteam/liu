@@ -223,7 +223,9 @@ bool bridge_write_cline_session(const BridgeHistory *h, const char *session_id,
                     if (name && name[0]) {
                         jsonw_obj_begin(&w, NULL);
                         jsonw_str(&w, "type", "tool_use");
-                        jsonw_str(&w, "id", b->tool_call_id);
+                        char tid[BRIDGE_WIRE_ID_MAX + 1];
+                        bridge_wire_tool_id(tid, sizeof tid, NULL, b->tool_call_id);
+                        jsonw_str(&w, "id", tid);
                         jsonw_str(&w, "name", name);
                         jsonw_raw_or_str(&w, "input",
                                          b->tool_input && b->tool_input[0]
@@ -258,7 +260,9 @@ bool bridge_write_cline_session(const BridgeHistory *h, const char *session_id,
                 if (!name) name = b->tool_name;
                 jsonw_obj_begin(&w, NULL);
                 jsonw_str(&w, "type", "tool_result");
-                jsonw_str(&w, "tool_use_id", b->tool_call_id);
+                char tid[BRIDGE_WIRE_ID_MAX + 1];
+                bridge_wire_tool_id(tid, sizeof tid, NULL, b->tool_call_id);
+                jsonw_str(&w, "tool_use_id", tid);
                 jsonw_str(&w, "name", name ? name : "Bash");
                 jsonw_str(&w, "content", b->tool_output ? b->tool_output : "");
                 jsonw_obj_end(&w);

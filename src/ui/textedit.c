@@ -274,6 +274,14 @@ bool textedit_key(TextEdit *e, TextEditUndo *u, i32 key, u32 mods) {
      * macOS Cmd+Ctrl ones. Of the Emacs set only the erasers stay — Ctrl+A is
      * select-all here. */
     if (ctrl && alt) return false;
+    /* The desktop's other copy / cut / paste keys (CUA): Ctrl+Insert,
+     * Shift+Delete, Shift+Insert — also what a compositor sends a terminal for
+     * its own copy and paste keys. Taken as Ctrl+C / X / V. */
+    if (!alt && !super && ((key == KEY_INSERT && ctrl != shift) || (key == KEY_DELETE && shift && !ctrl))) {
+        key = key == KEY_DELETE ? KEY_X : ctrl ? KEY_C : KEY_V;
+        ctrl = true;
+        shift = false;
+    }
     bool edit_chord = ctrl && !alt && !super;
     bool to_end     = false;
     bool by_word    = ctrl || alt;

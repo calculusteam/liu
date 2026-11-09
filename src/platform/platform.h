@@ -696,6 +696,12 @@ void platform_window_display_link_sync(PlatformWindow *w, bool visible,
                                        bool focused, bool wants_frames);
 bool platform_window_display_link_running(PlatformWindow *w);
 u64  platform_window_vsync_ticks(PlatformWindow *w);
+/* Whether this window's next ticks wake the loop. A running link always
+ * counts its ticks; it wakes the loop only while the window owes a frame or
+ * something on it is drawn from the clock — otherwise a pane that streams at
+ * 15 frames a second would turn the loop over at the panel's 60. Set by the
+ * loop before every wait; a window never told wakes on every tick. */
+void platform_window_set_link_wake(PlatformWindow *w, bool wake);
 /* Seconds between the most recent two display-link callbacks. Zero until
  * enough ticks arrive; this is a cadence observation, not scanout latency. */
 f64  platform_window_display_link_period_sec(PlatformWindow *w);

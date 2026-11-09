@@ -2,7 +2,7 @@
  * Liu — text that is about to be shown by a desktop notification daemon.
  *
  * The Desktop Notifications spec lets a daemon render a body as MARKUP — <b>, <i>, <u> and,
- * on GNOME Shell, KDE Plasma, dunst and mako, <a href="..."> links (some also <img>). The
+ * on most daemons, <a href="..."> links (some also <img>). The
  * banner text of liu-notify is an agent's own summary, which an injected instruction or a
  * web page the agent just read can shape, so unescaped it can put a clickable link in a
  * notification that looks like Liu's own. Plain text has to be escaped to stay plain text:

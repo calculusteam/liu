@@ -41,6 +41,7 @@
 #include "browser/browser_types.h"
 #include "ui/anim.h"
 #include "ui/lightbox.h"
+#include "ui/agent_diagram.h"
 #include "ui/sketch.h"
 #include "ui/dpi_refresh.h"
 /* Forward only: the HUD's counters are a heap block hung off AppState, and
@@ -183,6 +184,10 @@ typedef struct {
      * the scan ends in a stat() (memoised in img_link.c, but still). */
     u8            *img_rows;        /* 1 = this row names an image file */
     i32           *img_badge_cols;  /* column the badge is drawn at */
+    /* The Mermaid blocks an agent printed in this pane and the diagrams drawn
+     * over them (ui/agent_diagram.h): row summaries on the same dirty signal
+     * again, and the blocks seen whole. NULL unless the pane runs an agent. */
+    struct AgentDiagramPane *adg;
     /* 1 = a glyph in this row drew as the SPACE placeholder while the raster
      * worker finishes it, so a completed rasterisation REPAIRS this row and
      * only rows like it.
@@ -636,6 +641,8 @@ typedef struct {
     bool       active;
     bool       dirty;
     bool       history_tracked;  /* true once connection result has been recorded */
+    i64        history_row;      /* the vault row of the connect attempt that opened this tab, which
+                                  * its result is written to (0 = none: nothing is recorded) */
     bool       has_bell;       /* pending bell on this tab (cleared on focus) */
 
     /* Tab group membership (-1 = no group, 0+ = group index) */
@@ -1267,6 +1274,7 @@ typedef struct AppState {
      * is the pane slot it was grabbed in (every pane has its own bar), checked
      * against the terminal that slot holds NOW before each move. */
     f64       scrollbar_last_activity;
+    f32       scrollbar_alpha_drawn;   /* the overlay bar's opacity as last drawn (autohide) */
     bool      scrollbar_dragging;
     f32       scrollbar_drag_grab;     /* pointer y minus thumb top at the press */
     const Terminal *scrollbar_drag_term;
@@ -1299,6 +1307,13 @@ typedef struct AppState {
     i32       img_badge_count;
     /* The overlay a badge click opens. Per window — see lightbox.h. */
     Lightbox  lightbox;
+    /* Diagram cards over agents' Mermaid blocks: their controls as this
+     * frame's panes drew them (cleared at the top of render_terminal, like
+     * img_badge), how many cards were drawn, and the window's viewer. */
+    AgentDiagramHit adg_hit[ADG_MAX_HITS];
+    i32       adg_hit_count;
+    i32       adg_cards;
+    DiagramViewer dgv;
     Sketch    sketch;
     /* Rows that wanted a badge past the cap, so a full screen of image paths
      * reports the truncation instead of silently showing fewer. */
@@ -1713,7 +1728,7 @@ typedef struct AppState {
     /* The timestamp of the KEY_DOWN that just ran a shortcut, on X11. The
      * backend pushes the keystroke's CHAR_INPUT after it with the SAME
      * timestamp (Ctrl+<letter> as its control code, Alt+<key> as text), so
-     * Ctrl+Alt+D would split AND send ^D to the shell. 0 = none. */
+     * Ctrl+Shift+D would split AND send ^D to the shell. 0 = none. */
     f64       shortcut_char_time;
     /* The same pairing for a keystroke whose KEY_DOWN the focused pane's
      * keyboard protocol already encoded (terminal_key_input sent bytes):
@@ -1992,6 +2007,7 @@ typedef struct AppState {
     char      kbi_name[256];
     char      kbi_instruction[512];
     char      kbi_peer[320];       /* "user@host" whose prompt this is */
+    bool      kbi_liu;             /* Liu's own password question, not the server's words (session_kbi_is_liu) */
     f64       kbi_shown_at;        /* when the dialog came up (Enter is not an answer before it is read) */
     i32       kbi_num_prompts;
     char    (*kbi_prompts)[256];     /* heap [KBI_MAX_PROMPTS][256] when non-NULL */
@@ -2196,6 +2212,10 @@ typedef struct AppState {
     f64                agentctl_next_edge;  /* platform clock: a working job tab's next changed haze
                                                 * frame, or the hover's next minute; 0 = none */
     AgcHazeMemo        agentctl_haze_memo[AGC_HAZE_MEMO];   /* one per job drawn, found by id */
+    /* Set by the loop before each paint: nothing else in this window is drawn
+     * on the clock, so a working job tab's haze may hand the steps between its
+     * key frames to the compositor (render_job_haze, renderer_fade_note). */
+    bool               haze_handoff;
     u64                agentctl_gen_seen;        /* agentctl_cards_gen() at the last frame */
     u64                agentctl_jobs_gen_seen;   /* agentctl_jobs_gen() at the last frame */
 
@@ -2239,6 +2259,7 @@ typedef struct AppState {
     i32       close_confirm_tab;
     i32       close_confirm_pane;      /* -1 = whole tab */
     i32       close_confirm_group;     /* -1 = single tab */
+    bool      close_confirm_restart;   /* the pane is restarted, not closed */
     char      close_confirm_agent[32]; /* display name, e.g. "Claude Code" */
 
     /* Host key verification dialog */
@@ -2625,9 +2646,10 @@ typedef enum {
     TERM_MENU_SPLIT_LEFT,
     TERM_MENU_SPLIT_DOWN,
     TERM_MENU_SPLIT_UP,
+    TERM_MENU_RESTART_SHELL, /* only for a pane app_pane_restartable() takes */
 } TermMenuAction;
 
-#define TERM_MENU_MAX_ROWS 8
+#define TERM_MENU_MAX_ROWS 9
 
 /* Fill `out` with the rows to show, in order, and `sep_after[i]` with whether a
  * separator follows row i. Returns the row count. */
@@ -2758,7 +2780,9 @@ f32 ui_draw_edit_field_ex(Renderer *r, AppState *app, const char *buf, i32 len,
                           f32 x, f32 y, f32 cw, f32 ch, i32 max_cells,
                           Color fg, Color caret_c, Color sel_c,
                           bool mask, bool show_caret, bool ime_off);
-/* Shared caret blink phase (macOS cadence, strong floor). */
+/* Shared caret blink phase (macOS cadence, strong floor): a square pulse
+ * that changes only every UI_CARET_HALF_SEC of the wall clock. */
+#define UI_CARET_HALF_SEC 0.53
 f32 ui_caret_alpha(void);
 /* The text field that has the keyboard, at its caret (x, y: the caret's top;
  * cw, ch: the field's cell): an input method composes here and its candidate
@@ -2826,6 +2850,8 @@ i32  app_pane_running_agent(AppState *app, i32 tab_index, i32 pane, const char *
  * inside the (x, y, w, h) box; unused pane slots are left zeroed. */
 i32       app_tab_pane_count(const Tab *tab);
 Terminal *app_tab_pane_terminal(const Tab *tab, i32 pane);
+/* The row cache of pane `pane` (0..MAX_SPLIT_PANES-1), or NULL. */
+TermRenderCache *app_tab_pane_cache(Tab *tab, i32 pane);
 void      app_tab_pane_layout(const Tab *tab, f32 x, f32 y, f32 w, f32 h,
                               f32 dpi, PaneRect out[MAX_SPLIT_PANES]);
 /* The grid pane `pane` of `tab` fits in the rectangle it is drawn in, in this
@@ -2890,8 +2916,17 @@ void app_show_toast_about(AppState *app, const void *about, NotificationKind kin
  * tab, a stop or the end of its turn). */
 const void *app_agentctl_ask_about(u32 job);
 void app_agentctl_asks_settle(AppState *app);
-/* Whether any floating notice is up or on its way out (the loop's gates). */
+/* Whether any floating notice is up or on its way out. */
 bool app_toast_active(const AppState *app, f64 now);
+/* The loop's gates: a notice that moves (comes in, leaves, slides to its
+ * slot) owes frames; one that is only held up owes none until it starts to
+ * leave, app_toast_wake_in seconds from now (-1: nothing is up). */
+bool app_toast_moving(const AppState *app, f64 now);
+f64  app_toast_wake_in(const AppState *app, f64 now);
+/* Takes off the stack every notice that has finished leaving; true when one
+ * was. Its last frame was drawn while it still faded, so the window owes one
+ * more paint to wipe it. */
+bool app_toast_retire_finished(AppState *app, f64 now);
 /* A click at (x, y) in framebuffer pixels: dismisses the notice under it and
  * returns true (the click is spent), false when none is there. */
 bool app_toast_click(AppState *app, f32 x, f32 y);
@@ -3137,6 +3172,16 @@ i32  tab_split_pane_count(const Tab *tab);
 
 void app_close_split_pane(AppState *app, i32 tab_index, i32 pane);
 
+/* Restart Shell: the pane keeps its place in the layout and gets a new shell —
+ * a local pane in the folder its shell was in, an SSH or mosh pane on a new
+ * connection to the same host, starting in the folder the remote shell
+ * reported — on a fresh screen. The old Terminal and Session go to the trash
+ * queue as a closed pane's do, which ends whatever ran in the pane. False,
+ * with a notice and the pane untouched, when the new shell could not start.
+ * Telnet and serial panes are not restarted (nothing keeps their settings). */
+bool app_pane_restartable(const Tab *tab, i32 pane);
+bool app_restart_pane(AppState *app, i32 tab_index, i32 pane);
+
 /* Pull `pane` out of a split tab and give it its own tab — the inverse of
  * app_split_tab_from_drag. The pane's Terminal + Session are *moved* (never
  * destroyed), the source tab collapses around the hole, and the new tab is
@@ -3148,8 +3193,6 @@ i32  app_detach_pane_to_tab(AppState *app, i32 tab_index, i32 pane, i32 insert_a
  * the tab's terminal area. Handles both two-pane splits and the
  * multi-pane layout tree. */
 i32  app_pane_index_at(AppState *app, const Tab *tab, f32 x, f32 y);
-i32  app_pane_drop_zone_at(AppState *app, const Tab *tab,
-                           i32 pane, f32 x, f32 y);
 
 /* Where a Cmd-dragged pane lands. Anything outside 1..5 means "no drop". */
 enum {
@@ -3236,8 +3279,6 @@ bool app_pane_cd_to(Session *s, const char *dir);
 SessionType tab_primary_session_type(const Tab *tab);
 SessionType tab_secondary_session_type(const Tab *tab);
 
-/* Session save/restore */
-bool app_save_sessions(AppState *app);
 /* Same, for several windows at once — their tabs are folded into the one tab
  * array the file format has, WITHOUT moving or touching a single tab, so this
  * is safe to call while the app is running (window close, Cmd+Q atexit).
@@ -3284,8 +3325,6 @@ bool app_tab_job_is_chip(const AppState *app, i32 tab, i32 k);   /* the slot is 
 void app_tab_jobs_toggle_fold(AppState *app, i32 tab);           /* a click on it: fold or open them */
 /* One job tab's width in a docked tab row of height `row_h`. */
 f32  app_side_job_w(const AppState *app, f32 row_h);
-/* Whether any tab of this window shows a job tab, or its log or hover is up. */
-bool app_window_shows_jobs(const AppState *app);
 void app_agentctl_panel_open(AppState *app, u32 job);
 void app_agentctl_panel_close(AppState *app);
 /* Takes a new copy of the job when it changed; true when it did. */
@@ -3487,8 +3526,6 @@ void app_ungroup_tab_group(AppState *app, i32 group_index);
  * sessions don't survive process restart anyway. */
 void app_save_workspaces(const AppState *app);
 void app_load_workspaces(AppState *app);
-/* Built-in 8-color palette accessors */
-i32  app_group_palette_size(void);
 Color app_group_palette_color(i32 idx);
 i32  app_group_palette_match(Color c);  /* nearest palette idx, for menu highlight */
 

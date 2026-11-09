@@ -34,6 +34,7 @@
 #include "agentctl/agentctl_proto.h"
 #include "agentctl/agentctl_stream.h"
 #include "agentctl/agentctl_team.h"
+#include "core/spawn_fds.h"
 #include "notify/socket.h"
 
 #include "cJSON.h"
@@ -488,9 +489,7 @@ int agentctl_git(const char *dir, const char *const *args, char *out, usize ocap
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);
     short flags = POSIX_SPAWN_SETSIGDEF;
-#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
-    flags |= POSIX_SPAWN_CLOEXEC_DEFAULT;
-#endif
+    spawn_fds_only_stdio(&fa, &flags);
     sigset_t all;
     sigfillset(&all);
     posix_spawnattr_setflags(&attr, flags);
@@ -897,9 +896,7 @@ static TurnEnd run_turn(Spec *sp, const char *prompt, usize prompt_len) {
     sigemptyset(&none);
     sigfillset(&all);
     short flags = POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK;
-#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
-    flags |= POSIX_SPAWN_CLOEXEC_DEFAULT;   /* only the three descriptors above reach the agent */
-#endif
+    spawn_fds_only_stdio(&fa, &flags);      /* only the three descriptors above reach the agent */
     posix_spawnattr_setflags(&attr, flags);
     posix_spawnattr_setpgroup(&attr, 0);
     posix_spawnattr_setsigdefault(&attr, &all);

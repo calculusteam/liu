@@ -268,8 +268,10 @@ if want deb; then
         printf 'Installed-Size: %s\n' "$(du -sk --exclude=DEBIAN "${R}" | cut -f1)"
         printf 'Depends: %s, curl\n' "${DEPENDS}"
         # openssh-client: Liu runs the system's ssh-keygen and ssh-add for a
-        # new key, a passphrase change and a key's fingerprint.
-        printf 'Recommends: libnotify-bin, xdg-utils, openssh-client\n'
+        # new key, a passphrase change and a key's fingerprint. WebKitGTK is
+        # loaded at run time for the browser pane (not linked: without it a
+        # page goes to the system's browser).
+        printf 'Recommends: libnotify-bin, xdg-utils, openssh-client, libwebkit2gtk-4.1-0\n'
         printf 'Suggests: zenity | kdialog, pulseaudio-utils | alsa-utils, espeak-ng\n'
         printf 'Section: x11\n'
         printf 'Priority: optional\n'
@@ -314,7 +316,7 @@ if want rpm; then
         # the index.theme that makes Icon=liu resolve); without it, removing
         # Liu left them behind, owned by no package.
         printf 'Requires:  hicolor-icon-theme\n'
-        printf 'Recommends: libnotify\nRecommends: xdg-utils\nRecommends: openssh-clients\n'
+        printf 'Recommends: libnotify\nRecommends: xdg-utils\nRecommends: openssh-clients\nRecommends: webkit2gtk4.1\n'
         printf 'Suggests:  zenity\nSuggests:  pulseaudio-utils\nSuggests:  espeak-ng\n'
         # The binaries are the tarball's, already stripped and checked: no
         # debuginfo split, no strip, no build-id links that two versions'

@@ -4,11 +4,11 @@
 /* The work area of ONE monitor, when the desktop publishes one.
  *
  * EWMH gives a single _NET_WORKAREA for the whole screen: the screen less
- * every panel's strut. GNOME's top bar sits on the primary monitor only, so
- * that one rectangle starts 32 px down for the other monitors too, and a window
+ * every panel's strut. A top bar on the primary monitor only makes that one
+ * rectangle start 32 px down for the other monitors too, and a window
  * snapped on the second monitor would leave a band of it unused that the window
- * manager's own maximize fills. mutter also publishes the areas per monitor, on
- * the root window, as _GTK_WORKAREAS_D<desktop>: a CARDINAL[4 * monitors] of
+ * manager's own maximize fills. Some window managers also publish the areas
+ * per monitor, on the root window, as _GTK_WORKAREAS_D<desktop>: a CARDINAL[4 * monitors] of
  * x, y, width, height quads in root coordinates, one per monitor, the panels
  * of THAT monitor already taken off (for example 0,32,1600,968 for the monitor
  * with the bar and 1600,0,1600,1000 for the other). The order is the window

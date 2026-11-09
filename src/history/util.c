@@ -190,14 +190,6 @@ bool hist_appdata_path(char *out, usize cap, const char *rel) {
 #endif
 }
 
-bool hist_local_appdata_path(char *out, usize cap, const char *rel) {
-#if defined(__APPLE__)
-    return hist_appdata_path(out, cap, rel);   /* mac has one app-data root */
-#else
-    return hist_xdg_data_path(out, cap, rel);
-#endif
-}
-
 const char *hist_cjson_str(cJSON *obj, const char *key) {
     cJSON *v = cJSON_GetObjectItemCaseSensitive(obj, key);
     return (v && cJSON_IsString(v)) ? v->valuestring : NULL;

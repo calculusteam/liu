@@ -118,16 +118,6 @@ bool diag_needs_user(const DiagReport *r) {
     return false;
 }
 
-const char *diag_status_label(DiagStatus s) {
-    switch (s) {
-    case DIAG_OK:   return "OK";
-    case DIAG_INFO: return "Info";
-    case DIAG_WARN: return "Warning";
-    case DIAG_FAIL: return "Problem";
-    default:        return "?";
-    }
-}
-
 const char *diag_group_label(DiagGroup g) {
     switch (g) {
     case DIAG_GROUP_HOOKS:   return "Agent CLI hooks";
@@ -617,7 +607,6 @@ static void check_json_file(DiagReport *r, const char *id, const char *title,
  * spellings of the directory (`~/.terminfo/4C/` and `~/.terminfo/4c/`, which ncurses on macOS
  * writes). */
 
-
 /* =========================================================================
  * Entry points
  * ========================================================================= */
@@ -628,6 +617,7 @@ void diag_run(DiagReport *r, const char *notify_bin) {
     r->ran = true;
     {
         time_t now = time(NULL);
+
         struct tm tmv;
         localtime_r(&now, &tmv);
         strftime(r->ran_at, sizeof r->ran_at, "%H:%M:%S", &tmv);

@@ -38,8 +38,4 @@ bool whisper_cpu_decode(WhisperCpu *c, const i32 *tokens, i32 n, i32 n_past,
  * restart decoding of the same window with a different prompt. */
 void whisper_cpu_decode_reset(WhisperCpu *c);
 
-/* Encoder output, [n_audio_ctx * n_state]. Exposed so the Metal backend can
- * be diffed against this one tensor rather than only on final text. */
-const f32 *whisper_cpu_encoder_out(const WhisperCpu *c);
-
 #endif /* VOICE_WHISPER_CPU_H */

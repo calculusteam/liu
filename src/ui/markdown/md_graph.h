@@ -83,10 +83,6 @@ i32         md_graph_node_component(const MdGraph *g, i32 idx);  /* topic-cluste
 i32         md_graph_node_comp_size(const MdGraph *g, i32 idx);  /* nodes in that cluster (1 = isolated) */
 bool        md_graph_node_is_tag(const MdGraph *g, i32 idx);   /* tag pseudo-node */
 
-/* Folder clustering: each file node belongs to a group = its parent directory
- * (relative to the build root). Same-folder nodes cluster together in the
- * layout; the renderer colours each cluster distinctly + labels it. */
-i32         md_graph_node_group(const MdGraph *g, i32 idx);    /* -1 for tags */
 i32         md_graph_group_count(const MdGraph *g);
 const char *md_graph_group_name(const MdGraph *g, i32 group);  /* rel parent dir */
 bool        md_graph_group_centroid(const MdGraph *g, i32 group, f32 *wx, f32 *wy);

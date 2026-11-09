@@ -54,4 +54,22 @@ static inline SshSecondFactor ssh_auth_second_factor(const char *remaining, bool
     return SSH_SECOND_FACTOR_NONE;
 }
 
+/* Nothing has logged in, no password is known, and the person connecting gave
+ * none: what to ask them, as ssh does. `offered`: the methods the server
+ * lists. Its own prompt (keyboard-interactive) when it has one, else a
+ * password typed into Liu's dialog when it takes passwords, else nothing.
+ * Reached only when no key was named for the host (a key the person chose
+ * that is refused is not turned into a prompt). */
+typedef enum {
+    SSH_ASK_NOTHING = 0,
+    SSH_ASK_SERVER_PROMPT,     /* keyboard-interactive */
+    SSH_ASK_PASSWORD,          /* the password method, asked in Liu's dialog */
+} SshAskFor;
+
+static inline SshAskFor ssh_auth_ask_for(const char *offered) {
+    if (ssh_auth_list_has(offered, "keyboard-interactive")) return SSH_ASK_SERVER_PROMPT;
+    if (ssh_auth_list_has(offered, "password")) return SSH_ASK_PASSWORD;
+    return SSH_ASK_NOTHING;
+}
+
 #endif /* SSH_AUTH_SECOND_FACTOR_H */

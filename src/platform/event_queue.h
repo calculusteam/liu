@@ -1,5 +1,6 @@
 /* Platform event FIFO: a 256-slot fast ring with low-priority coalescing.
- * Native pumps stop before saturation. One large text commit can still emit
+ * A resize always joins the one already queued for its window; everything
+ * else folds only when the ring is full. Native pumps stop before saturation. One large text commit can still emit
  * more events; critical spill is retained in FIFO order until consumed, then
  * released. Only allocation failure may lose a critical event. Shutdown must
  * clear outstanding spill nodes. */
@@ -164,6 +165,12 @@ static inline bool platform_event_queue_push(PlatformEventQueue *q, PlatformEven
         if (depth>q->high_water) q->high_water=depth>INT32_MAX?INT32_MAX:(i32)depth;
         return true;
     }
+    /* A resize joins the one already queued for its window, full or not: the
+     * handler lays out and draws at the size the window has when it runs, so
+     * a second one would only repeat that work. A drag sends sizes faster
+     * than a frame takes them, and on X11 each handled resize also draws and
+     * presents at once. */
+    if (e.type == EVENT_RESIZE && platform_event_queue_fold_back(q, &e)) return true;
     if (q->count >= PLATFORM_EVENT_QUEUE_CAP) {
         /* 1. Fold into a queued sibling. Exact — nothing is lost. */
         if (platform_event_is_coalescable(e.type) &&

@@ -196,16 +196,6 @@ bool bidi_line_has_rtl(const Cell *cells, i32 cols) {
  * Base direction detection
  * ========================================================================= */
 
-BidiDir bidi_base_direction(const Cell *cells, i32 cols) {
-    if (!cells) return BIDI_DIR_LTR;
-    for (i32 i = 0; i < cols; i++) {
-        BidiType bt = bidi_char_type(cells[i].codepoint);
-        if (bt == BIDI_L) return BIDI_DIR_LTR;
-        if (bt == BIDI_R || bt == BIDI_AL) return BIDI_DIR_RTL;
-    }
-    return BIDI_DIR_LTR;
-}
-
 /* =========================================================================
  * Simplified BiDi reordering (UAX #9)
  *

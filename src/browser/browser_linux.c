@@ -97,7 +97,7 @@ void browser_native_stop(BrowserNative *n)       { if (n) n->loading = false; }
 bool browser_native_poll(BrowserNative *n, BrowserTab *tab) {
     if (!n || !tab) return false;
     static const char *kStatus =
-        "Linux: opened in system browser (in-app WebView deferred)";
+        "Pages open in the system browser (built without WebKitGTK)";
     bool changed = (tab->loading != n->loading) ||
                    (n->url[0] && strcmp(tab->url, n->url) != 0) ||
                    (strcmp(tab->status, kStatus) != 0);
@@ -132,6 +132,10 @@ void browser_native_set_viewport_pt(BrowserNative *n,
 
 void browser_native_set_screen_shape(BrowserNative *n, const BrowserScreenShape *shape) {
     (void)n; (void)shape;
+}
+
+void browser_native_set_holes(BrowserNative *n, const BrowserHole *holes, i32 count) {
+    (void)n; (void)holes; (void)count;
 }
 
 bool browser_native_screen_probe(BrowserNative *n, BrowserScreenProbe *out) {

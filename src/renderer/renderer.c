@@ -661,13 +661,21 @@ bool renderer_gpu_drain(Renderer *r) { (void)r; return true; }
  * one fence alive, because a newer one subsumes every older one. */
 void renderer_gl_frame_fence(Renderer *r) {
     if (!r) return;
-    if (r->gl_sync) { glDeleteSync((GLsync)r->gl_sync); r->gl_sync = NULL; }
+    if (r->gl_sync) {
+        /* The newer fence subsumes this one; whether it already signalled is
+         * still the count of finished frames. */
+        GLenum st = glClientWaitSync((GLsync)r->gl_sync, 0, 0);
+        if (st == GL_ALREADY_SIGNALED || st == GL_CONDITION_SATISFIED) r->gl_frames_done = r->gl_sync_frame;
+        glDeleteSync((GLsync)r->gl_sync);
+        r->gl_sync = NULL;
+    }
     GLsync sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
     if (!sync) return;      /* no fence: renderer_gpu_idle answers conservatively */
     /* Without this the fence can sit unflushed behind commands the driver has not
      * yet sent, and the wait below never satisfies. */
     glFlush();
     r->gl_sync = (void *)sync;
+    r->gl_sync_frame = ++r->gl_frames_fenced;
 }
 
 bool renderer_drawable_ready(Renderer *r) {
@@ -689,7 +697,7 @@ bool renderer_gpu_idle(Renderer *r) {
     if (st == GL_ALREADY_SIGNALED || st == GL_CONDITION_SATISFIED) {
         glDeleteSync((GLsync)r->gl_sync);
         r->gl_sync = NULL;
-        r->gl_frames_done++;
+        r->gl_frames_done = r->gl_sync_frame;
         return true;
     }
     return false;                 /* GL_TIMEOUT_EXPIRED or GL_WAIT_FAILED */
@@ -699,8 +707,9 @@ bool renderer_gpu_idle(Renderer *r) {
  * synchronously through glGetError, and device loss needs ARB_robustness, which is
  * not in the 3.3 core profile this context asks for. So `failed` is always 0 —
  * meaning "this backend cannot answer", NOT "the GL path never fails a frame" —
- * and `ok` counts the frames whose fence has been observed signalled, which is a
- * true count of frames the GPU finished. */
+ * and `ok` is the number of frames up to the last fence seen signalled (each
+ * frame's fence is looked at when the next frame places its own), a true count
+ * of frames the GPU finished. */
 void renderer_gpu_frame_counts(Renderer *r, u64 *out_ok, u64 *out_failed,
                                u32 *out_fail_run) {
     if (out_ok)     *out_ok = r ? r->gl_frames_done : 0;
@@ -1399,34 +1408,33 @@ void renderer_end_frame(Renderer *r) {
     renderer_flush_glyphs(r);
 
     /* Armed dump, taken after the last draw and before main.c swaps — the
-     * pixels that are about to be shown.
-     *
-     * The env is read ONCE, not per frame. getenv walks the environment array
-     * linearly and this is the end of every presented frame, a cost a
-     * diagnostic that is off in every real session should not add. Same
-     * convention as gl_glyph_nearest(): resolve on first use, keep a small
-     * static state machine after that.
+     * pixels that are about to be shown. The variable is consumed, so each
+     * time it is set exactly one frame is written: a driver arms it again for
+     * every frame it wants, as on the Metal backend. A build without the dev
+     * hooks reads nothing here (liu_dev_env is a constant NULL), so the
+     * getenv on every frame costs only a build that drives itself.
      *
      * Frame 0 is an empty terminal — the shell has not printed its prompt yet,
      * so a dump taken there shows nothing worth measuring. Wait a beat
-     * (LIU_DUMP_FRAME_AFTER, default ~2s at 60 Hz) before firing. */
-    static i32  dump_state = -1;     /* -1 unresolved, 0 disarmed, 1 armed */
-    static i32  dump_countdown = 0;
-    static char dump_path[4096];
-    if (dump_state < 0) {
-        const char *p = liu_dev_env("LIU_DUMP_FRAME");
-        if (p && *p) {
-            snprintf(dump_path, sizeof dump_path, "%s", p);
+     * (LIU_DUMP_FRAME_AFTER, default ~2s at 60 Hz) before the first. */
+    const char *dump_path = liu_dev_env("LIU_DUMP_FRAME");
+    if (dump_path && *dump_path) {
+        static i32 dump_countdown = -1;
+        if (dump_countdown < 0) {
             const char *after = liu_dev_env("LIU_DUMP_FRAME_AFTER");
             dump_countdown = after ? atoi(after) : 120;
-            dump_state = 1;
-        } else {
-            dump_state = 0;
+            if (dump_countdown < 0) dump_countdown = 0;
         }
-    }
-    if (dump_state == 1 && dump_countdown-- <= 0) {
-        dump_state = 0;              /* one shot */
-        gl_debug_dump_backbuffer(r, dump_path);
+        if (dump_countdown > 0) {
+            dump_countdown--;
+        } else {
+            /* Copied before the unsetenv: a value that arrived through setenv
+             * lives in storage unsetenv frees. */
+            char dump_copy[4096];
+            snprintf(dump_copy, sizeof dump_copy, "%s", dump_path);
+            unsetenv("LIU_DUMP_FRAME");
+            gl_debug_dump_backbuffer(r, dump_copy);
+        }
     }
 
     gl_gpu_timer_end(r);

@@ -179,15 +179,6 @@ static bool wm_params_match(id<MTLDevice> dev, id<MTLCommandQueue> queue,
     return ok;
 }
 
-bool whisper_metal_available(void) {
-    @autoreleasepool {
-        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-        bool ok = (dev != nil);
-        [dev release];
-        return ok;
-    }
-}
-
 /* ---- weight packing ---------------------------------------------------- */
 
 /* Two passes over the tensor list: one to measure, one to copy. Keeping the
@@ -715,12 +706,6 @@ bool whisper_metal_encode(WhisperMetal *m, const f32 *mel) {
         m->encoded = true;
         return true;
     }
-}
-
-bool whisper_metal_encoder_out(WhisperMetal *m, f32 *dst) {
-    if (!m || !dst || !m->encoded) return false;
-    memcpy(dst, m->xn.contents, (usize)m->n_ctx_a * (usize)m->n_state * sizeof(f32));
-    return true;
 }
 
 /* ---- decode ------------------------------------------------------------- */

@@ -63,6 +63,7 @@ void terminal_grid_swap_alt(Terminal *t) {
     Cell *b  = t->grid_base;  t->grid_base  = t->alt_base;  t->alt_base  = b;
     i32   sd = t->grid_slide; t->grid_slide = t->alt_slide; t->alt_slide = sd;
     i32   sk = t->grid_slack; t->grid_slack = t->alt_slack; t->alt_slack = sk;
+    t->parked_slack_ticks = 0;   /* parked from now */
     /* Each screen's underline styles go with its grid: the primary's wait,
      * parked, while a full-screen program draws its own. */
     terminal_underline_swap_parked(t);
@@ -133,6 +134,43 @@ static bool grid_ensure_slack(Terminal *t) {
     t->grid_slack = (i32)want;
     t->grid_slide = 0;
     return true;
+}
+
+/* One screen's allocation cut to its rows: the rows go back to the base
+ * first, so the shrink keeps them; a failed shrink keeps the slack as it was.
+ * `cells` is a window into `*base` while there is slack (both screens are
+ * rows x cols: a resize remakes the parked one at the new size). */
+static void grid_slack_give_back(Cell **cells, Cell **base, i32 *slide, i32 *slack, i32 rows, i32 cols) {
+    if (*slack <= 0 || !*cells) return;
+    usize bytes = (usize)rows * (usize)cols * sizeof(Cell);
+    Cell *alloc = *base ? *base : *cells;
+    if (*slide > 0 && *base) memmove(*base, *cells, bytes);
+    Cell *nb = bytes ? realloc(alloc, bytes) : NULL;
+    if (!nb) {
+        if (*base) { *cells = *base; *slide = 0; }   /* unslid, the slack kept */
+        return;
+    }
+    *cells = nb;
+    *base  = NULL;
+    *slide = 0;
+    *slack = 0;
+}
+
+void terminal_grid_slack_tick(Terminal *t, u32 quiet_limit) {
+    if (!t) return;
+    /* The screen parked under (or above) the one shown cannot scroll until it
+     * is swapped back, when the next scroll grows its slack again. */
+    if (t->alt_slack > 0 && t->alt_cells && ++t->parked_slack_ticks >= quiet_limit)
+        grid_slack_give_back(&t->alt_cells, &t->alt_base, &t->alt_slide, &t->alt_slack, t->rows, t->cols);
+    if (t->scroll_gen != t->slack_seen_gen) {
+        t->slack_seen_gen = t->scroll_gen;
+        t->slack_quiet_ticks = 0;
+        return;
+    }
+    if (t->grid_slack <= 0 || ++t->slack_quiet_ticks < quiet_limit) return;
+    /* A pane that stopped scrolling — an idle shell, a tab in the background
+     * — keeps no more than its screen. */
+    grid_slack_give_back(&t->cells, &t->grid_base, &t->grid_slide, &t->grid_slack, t->rows, t->cols);
 }
 
 static Cell default_cell(void) {
@@ -1092,11 +1130,24 @@ i32 termline_materialize(const TermLineCompressed *line,
      * overshoots `n` because run lengths sum to line->len by construction.
      */
     const u64 *leads = termline_lead_bits(line);
+    /* A line with no wide cell has no bit to apply, so its cells are just the
+     * codepoints under their run's attributes. Asked once per line. */
+    bool bits = leads != NULL;
+    for (i32 w = 0; !bits && line->wide_bits && w < (n + 63) / 64; w++)
+        bits = line->wide_bits[w] != 0;
     i32 col = 0;
     for (u16 r = 0; r < line->run_count && col < n; r++) {
         const AttrRun *run = &line->runs[r];
         i32 end = col + (i32)run->length;
         if (end > n) end = n;
+        if (!bits) {
+            for (i32 i = col; i < end; i++) {
+                out[i].codepoint = line->codepoints[i];
+                out[i].attr      = run->attr;
+            }
+            col = end;
+            continue;
+        }
         for (i32 i = col; i < end; i++) {
             out[i].codepoint = line->codepoints[i];
             out[i].attr      = run->attr;
@@ -1141,12 +1192,6 @@ i32 termline_content_length(const TermLineCompressed *line) {
     }
     /* Uncovered tail cells are blank in termline_materialize as well. */
     return content;
-}
-
-const u32 *termline_codepoints(const TermLineCompressed *line, i32 *out_len) {
-    if (!line) { if (out_len) *out_len = 0; return NULL; }
-    if (out_len) *out_len = line->len;
-    return line->codepoints;
 }
 
 void termline_compressed_destroy(TermLineCompressed *line) {
@@ -1248,6 +1293,7 @@ void buffer_scroll_up(Terminal *t, i32 n) {
      * restores 1, while a half-screen region would gain nothing. A full-screen
      * program with a status line scrolls through here rather than through the
      * whole-screen case. */
+    t->scroll_gen++;
     i32 move_count = region_height - n;
     i32 above = top;                    /* rows before the region */
     i32 below = t->rows - 1 - bot;      /* rows after it          */

@@ -87,4 +87,16 @@ void bridge_iso8601(char *out, usize cap, i64 ms);
  * puts around it; malloc'd, caller frees. NULL on OOM or NULL text. */
 char *bridge_escape_closing_tag(const char *text, const char *tag);
 
+/* A tool call's id in the form the model API behind a target takes it back:
+ * letters, digits, '_' and '-', at most BRIDGE_WIRE_ID_MAX of them, with
+ * `prefix` (may be NULL) in front unless the id already starts with it. The
+ * API refuses the whole conversation over one id outside that form, and a
+ * source's ids are not (".", ":", "|", "#", any length). An id already in
+ * form is kept as it is; any other keeps a readable head with every other
+ * byte made '_' and ends in a hash of the whole id, so two ids stay two. The
+ * same id always gives the same result: that is what pairs a call with its
+ * result. `cap` should be more than BRIDGE_WIRE_ID_MAX. */
+#define BRIDGE_WIRE_ID_MAX 64
+void bridge_wire_tool_id(char *out, usize cap, const char *prefix, const char *id);
+
 #endif /* HISTORY_BRIDGE_WRITERS_H */

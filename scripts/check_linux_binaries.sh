@@ -22,6 +22,13 @@
 #    would ship without per-codepoint font fallback, hinting, ligatures, the
 #    taskbar badge and the screen-reader bridge, the panel's refresh rate or
 #    smooth scrolling.
+# 4. The browser pane's engine is loaded at run time and never linked: no
+#    binary names WebKitGTK, GTK, GDK, GLib, libsoup or cairo, so a machine
+#    without them still starts Liu (the packages only recommend WebKitGTK).
+# 5. Liu carries that engine's loader: the name it opens is in the binary. A
+#    build made where WebKitGTK's headers were missing gets the stub quietly
+#    and hands every page to the system's browser. LIU_BROWSER_OPTIONAL=1
+#    accepts such a build, for a package made for one machine.
 set -euo pipefail
 
 FLOOR="${LIU_GLIBC_FLOOR:-2.35}"
@@ -42,6 +49,10 @@ LIU_NEEDS=(
     "libssh2.so.1:SSH and SFTP"
     "libcrypto.so.3:the vault and update verification (OpenSSL 3)"
 )
+
+# libraries the page engine brings, loaded at run time only (rule 4)
+NEVER_LINKED='^lib(webkit2gtk|javascriptcoregtk|gtk-3|gdk-3|soup|glib-2\.0|gobject-2\.0|gio-2\.0|cairo)'
+BROWSER_LIB="libwebkit2gtk-4.1.so.0"
 
 # a <= b for dotted versions.
 ver_le() { [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1)" == "$1" ]]; }
@@ -80,9 +91,16 @@ for bin in "$@"; do
         fails=$((fails + 1))
     fi
 
+    # 4. the page engine never linked
+    needed="$(readelf -d "${bin}" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p')"
+    linked="$(grep -E "${NEVER_LINKED}" <<<"${needed}" || true)"
+    if [[ -n "${linked}" ]]; then
+        echo "FAIL ${name}: links what the browser pane loads at run time: $(tr '\n' ' ' <<<"${linked}")" >&2
+        fails=$((fails + 1))
+    fi
+
     # 3. the optional features, in the app
     if [[ "${name}" == "Liu" ]]; then
-        needed="$(readelf -d "${bin}" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p')"
         missing=0
         for entry in "${LIU_NEEDS[@]}"; do
             so="${entry%%:*}"
@@ -93,6 +111,16 @@ for bin in "$@"; do
         done
         fails=$((fails + missing))
         if [[ ${missing} -eq 0 ]]; then echo "ok   Liu: links $(tr '\n' ' ' <<<"${needed}")"; fi
+        # 5. the page engine's loader
+        if grep -qaF "${BROWSER_LIB}" "${bin}"; then
+            echo "ok   Liu: loads ${BROWSER_LIB} for the browser pane when the system has it"
+        elif [[ "${LIU_BROWSER_OPTIONAL:-0}" == "1" ]]; then
+            echo "note Liu: built without the browser pane's engine (LIU_BROWSER_OPTIONAL=1): pages open in the system's browser"
+        else
+            echo "FAIL Liu: carries no loader for ${BROWSER_LIB} — built without WebKitGTK's headers, every page would" \
+                 "open in the system's browser (LIU_BROWSER_OPTIONAL=1 accepts that)" >&2
+            fails=$((fails + 1))
+        fi
     fi
 done
 

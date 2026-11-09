@@ -602,8 +602,6 @@ void voice_tick(void) {
 
 VoiceState voice_state(void) { return g.state; }
 
-f32 voice_level(void) { return g.state == VOICE_RECORDING ? g.level : 0.0f; }
-
 i32 voice_wave_take(f32 *out, i32 max) {
     if (g.state != VOICE_RECORDING) { g.wq_n = 0; return 0; }
     if (!out || max <= 0) return 0;
@@ -612,11 +610,6 @@ i32 voice_wave_take(f32 *out, i32 max) {
     g.wq_n -= n;
     if (g.wq_n > 0) memmove(g.wq, g.wq + n, (usize)g.wq_n * sizeof g.wq[0]);
     return n;
-}
-
-f64 voice_elapsed(void) {
-    if (g.state != VOICE_RECORDING && g.state != VOICE_TRANSCRIBING) return 0.0;
-    return (f64)g.pcm_len / (f64)PLATFORM_CAPTURE_RATE;
 }
 
 f32 voice_progress(void) {
@@ -641,15 +634,6 @@ const char *voice_backend(void) {
     if (!g.started) return "";
     pthread_mutex_lock(&g.mu);
     snprintf(buf, sizeof buf, "%s", g.backend);
-    pthread_mutex_unlock(&g.mu);
-    return buf;
-}
-
-const char *voice_language(void) {
-    static char buf[8];
-    if (!g.started) return "";
-    pthread_mutex_lock(&g.mu);
-    snprintf(buf, sizeof buf, "%s", g.language);
     pthread_mutex_unlock(&g.mu);
     return buf;
 }

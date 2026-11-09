@@ -50,7 +50,6 @@ i32 llm_tokenizer_max_piece(const LlmTokenizer *t);
 
 i32 llm_tokenizer_bos(const LlmTokenizer *t);
 i32 llm_tokenizer_eos(const LlmTokenizer *t);
-i32 llm_tokenizer_vocab_size(const LlmTokenizer *t);
 
 /* Direct vocab lookup of a verbatim token string — used to resolve
  * special / control tokens (e.g. "<|hy_User|>") that must be emitted as

@@ -1888,6 +1888,7 @@ static const KeysRow g_keys_rows[] = {
     { ACT_NEXT_PANE,        NULL, NULL },
     { ACT_PREV_PANE,        NULL, NULL },
     { ACT_TOGGLE_PANE_ZOOM, NULL, NULL },
+    { ACT_RESTART_SHELL,    NULL, NULL },
     { ACT_BROADCAST_TOGGLE, NULL, NULL },
     { ACT_SAVE_FILE,        NULL, NULL },
 
@@ -1914,7 +1915,7 @@ static const KeysRow g_keys_rows[] = {
     { ACT_NONE, "Word left / right",              "Alt+Left / Right" },
     { ACT_NONE, "Delete to line start / end",     UI_MOD_PRIMARY "+Backspace / Delete" },
     { ACT_NONE, "Delete word left / right",       "Alt+Backspace / Delete" },
-    { ACT_NONE, "Undo line edit",                 UI_MOD_PRIMARY "+Z" },
+    { ACT_NONE, "Undo line edit",                 UI_MOD_PANE "+Z" },
     { ACT_NONE, "Scroll to top / bottom",         UI_MOD_PRIMARY "+Up / Down" },
 
     { ACT_NONE, "Window & system  ·  not rebindable", NULL },
@@ -1922,14 +1923,10 @@ static const KeysRow g_keys_rows[] = {
      * pressed: "Cmd" is wrong wherever MOD_SUPER is the Super key. */
     { ACT_NONE, "Snap window half / maximize",  "Ctrl+" UI_MOD_PRIMARY "+Arrows" },
     { ACT_NONE, "Snap window quadrant",         "Ctrl+" UI_MOD_PRIMARY "+Shift+Arrows" },
-#ifdef PLATFORM_MACOS
     /* Cmd+Alt+Arrows is the keyboard's way between panes (ACT_FOCUS_PANE_*). */
     { ACT_NONE, "Resize split divider",         "Ctrl+Alt+" UI_MOD_PRIMARY "+Arrows" },
-#else
-    { ACT_NONE, "Resize split divider",         UI_MOD_PRIMARY "+Alt+Arrows" },
-#endif
     { ACT_NONE, "Command history",              "Alt+Up" },
-    { ACT_NONE, "Close item under cursor",      UI_MOD_PRIMARY "+R" },
+    { ACT_NONE, "Close item under cursor",      UI_MOD_PANE "+R" },
 #ifdef PLATFORM_LINUX
     /* X11 has no native fullscreen menu; the F11 binding added for Linux is
      * the one that works here. */
@@ -4219,6 +4216,18 @@ void settings_render(SettingsPanel *sp, struct AppState *app, Renderer *r,
         }
         y += row_h;
         draw_label(r, "Auto folds them into their count once they do not all fit.",
+                   value_x, y, dim_fg);
+        y += row_h;
+
+        /* A Mermaid block an agent prints, drawn as its diagram over the rows
+         * it took (ui/agent_diagram.h). */
+        draw_label_limited(r, "Diagrams:", content_x, y, label_fg, (i32)(fmaxf(0, value_off - 8 * dpi) / cw));
+        settings_draw_switch(r, value_x, y - 2.0f * dpi,
+                             sp->config->agent_diagrams, control_active,
+                             control_bg, control_border,
+                             value_fg, label_fg, cw, ch, dpi);
+        y += row_h;
+        draw_label(r, "Draws a Mermaid block an agent prints as the diagram.",
                    value_x, y, dim_fg);
         y += row_h;
 
@@ -7639,6 +7648,16 @@ static bool settings_handle_click_impl(SettingsPanel *sp, f32 x, f32 y, f32 sw, 
                 return true;
             }
             return false;   /* empty space beside the control is inert */
+        }
+        ry += row_h;
+        /* Caption row (no-op) */
+        ry += row_h;
+
+        /* Diagrams */
+        if (y >= ry && y < ry + row_h &&
+            x >= value_x && x < value_x + settings_switch_w(cw, dpi)) {
+            sp->config->agent_diagrams = !sp->config->agent_diagrams;
+            return true;
         }
         ry += row_h;
         /* Caption row (no-op) */

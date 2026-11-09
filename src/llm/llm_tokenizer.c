@@ -619,7 +619,6 @@ i32 llm_tokenizer_max_piece(const LlmTokenizer *t) {
 
 i32 llm_tokenizer_bos(const LlmTokenizer *t) { return t ? t->bos : -1; }
 i32 llm_tokenizer_eos(const LlmTokenizer *t) { return t ? t->eos : -1; }
-i32 llm_tokenizer_vocab_size(const LlmTokenizer *t) { return t ? t->vocab_size : 0; }
 
 i32 llm_tokenizer_token_id(const LlmTokenizer *t, const char *literal) {
     if (!t || !literal) return -1;

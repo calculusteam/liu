@@ -84,10 +84,6 @@ static f64 md_now(void) {
     return (f64)ts.tv_sec + (f64)ts.tv_nsec * 1e-9;
 }
 
-const char *model_download_default_url(void)    { return LIU_MODEL_URL; }
-const char *model_download_default_sha256(void) { return LIU_MODEL_SHA256; }
-u64         model_download_default_size(void)   { return (u64)LIU_MODEL_SIZE; }
-
 const char *model_download_default_dest(char *out, usize cap) {
     return liu_model_default_path(out, cap);
 }

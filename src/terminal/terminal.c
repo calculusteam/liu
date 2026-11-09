@@ -369,7 +369,7 @@ bool terminal_sync_capture(Terminal *t) {
     }
 #define SNAP_COPY(field, size) do { \
     v->field = NULL; \
-    if (t->field && (size)) { \
+    if (t->field && (size) != 0) { \
         v->field = arena_alloc(&s->arena, (size)); \
         if (!v->field) return false; \
         memcpy(v->field, t->field, (size)); \
@@ -416,6 +416,9 @@ Terminal *terminal_create(i32 cols, i32 rows) {
     Terminal *t = calloc(1, sizeof(Terminal));
     if (!t) return NULL;
 
+    /* Terminals are made on workers too (a sleeping tab's wake). */
+    static _Atomic u32 next_uid;
+    t->uid = atomic_fetch_add_explicit(&next_uid, 1, memory_order_relaxed) + 1;
     t->cols = cols;
     t->rows = rows;
     t->cells = calloc(cell_count, sizeof(Cell));
@@ -591,6 +594,7 @@ void terminal_destroy(Terminal *t) {
 
 /* External scrollback helpers from buffer.c */
 extern void sb_push(Terminal *t, Cell *row_cells, i32 len, bool wrapped);
+extern void sb_push_cold(Terminal *t, TermLineCompressed *cold);
 extern void sb_pop_newest(Terminal *t, i32 n);
 extern TermLine *sb_get(Terminal *t, i32 index);
 extern void buffer_scroll_up(Terminal *t, i32 n);
@@ -607,6 +611,9 @@ bool liu_resize_keep_scrollback_disabled = false;
  * scrollback rows preserved. */
 _Atomic u64 liu_resize_keep_hits = 0;
 _Atomic u64 liu_resize_keep_rows = 0;
+/* Counts history rows past that prefix that a reflow carried over in their
+ * compressed form (resize_row_passes). */
+_Atomic u64 liu_resize_pass_rows = 0;
 
 /* Does the stored row start with the lead of a wide character? */
 static bool resize_row_starts_wide(TermLine *ln) {
@@ -693,6 +700,80 @@ static bool resize_row_is_kept_as_is(TermLine *ln, TermLine *next, i32 cols, boo
     return true;
 }
 
+/* Is this the block the compressor would build from the same cells? The runs
+ * are as long as they can be, carry no wide bit and no pad, and add up to the
+ * line; the lead words are there exactly when some cell is a lead; and the
+ * block holds no spare run slots. An empty line is the bare header. Only such
+ * a block counts the bytes the reflow's own compression would count, so only
+ * such a block may be kept in place of that compression. */
+static bool resize_cold_is_canonical(const TermLineCompressed *c) {
+    if (!c) return false;
+    if (c->len <= 0) return c->run_count == 0 && c->run_cap == 0 && !c->has_leads;
+    if (!c->codepoints || !c->runs || !c->wide_bits ||
+        c->run_count == 0 || c->run_cap != c->run_count) return false;
+    i32 sum = 0;
+    for (u16 r = 0; r < c->run_count; r++) {
+        const AttrRun *run = &c->runs[r];
+        if (run->length == 0 || run->_pad || run->attr._pad ||
+            (run->attr.flags & (ATTR_WIDE | ATTR_WDUMMY))) return false;
+        if (r > 0) {
+            const CellAttr *p = &c->runs[r - 1].attr;
+            if (p->fg == run->attr.fg && p->bg == run->attr.bg && p->flags == run->attr.flags)
+                return false;
+        }
+        sum += run->length;
+    }
+    if (sum != c->len) return false;
+    if (c->has_leads) {
+        i32 words = (c->len + 63) / 64;
+        u64 any = 0;
+        for (i32 w = 0; w < words; w++) any |= c->wide_bits[words + w];
+        if (!any) return false;
+    }
+    return true;
+}
+
+/* Can the last cell of this line show something — a character, a background,
+ * a decoration drawn on a blank, or half of a wide character? A hard-ended row
+ * pushed to the history drops the cells that cannot (sb_push), so a stored row
+ * whose last cell cannot is one the reflow would store shorter. Asked of a
+ * canonical block (the last run covers the last cell). */
+static bool resize_cold_last_cell_shows(const TermLineCompressed *c) {
+    if (!c || c->len <= 0) return true;
+    i32 last = c->len - 1;
+    const CellAttr *a = &c->runs[c->run_count - 1].attr;
+    i32 words = (c->len + 63) / 64;
+    bool half = ((c->wide_bits[last >> 6] >> (last & 63)) & 1u) ||
+                (c->has_leads && ((c->wide_bits[words + (last >> 6)] >> (last & 63)) & 1u));
+    return (c->codepoints[last] & ~(u32)' ') || a->bg != BG_DEFAULT ||
+           (a->flags & TERM_ATTR_VISIBLE_ON_BLANK) || half;
+}
+
+/* Both answers above for one block, worked out the first time a resize asks
+ * and kept in the block (reflow_verdict). A drag asks of the same blocks at
+ * every step, and the run walk is most of what a step over a history that
+ * needs no rewrap costs. Neither answer reads the wrapped flag, the one field
+ * of a stored block that changes (sb_newest_break_wrap). */
+enum { COLD_ASKED = 1, COLD_CANONICAL = 2, COLD_LAST_SHOWS = 4 };
+static u8 resize_cold_verdict(TermLineCompressed *c) {
+    if (!c->reflow_verdict) {
+        u8 v = COLD_ASKED;
+        if (resize_cold_is_canonical(c)) {
+            v |= COLD_CANONICAL;
+            if (resize_cold_last_cell_shows(c)) v |= COLD_LAST_SHOWS;
+        }
+        c->reflow_verdict = v;
+    }
+    return c->reflow_verdict;
+}
+
+/* The block of a row that ends a logical line is the one sb_push would store
+ * from its cells: canonical, and its last cell can show something. */
+static bool resize_cold_line_end_kept(TermLineCompressed *c) {
+    return (resize_cold_verdict(c) & (COLD_CANONICAL | COLD_LAST_SHOWS)) ==
+           (COLD_CANONICAL | COLD_LAST_SHOWS);
+}
+
 /* How many leading scrollback lines a resize may leave exactly
  * where they are. Returns 0 when none may (which is also the answer for
  * an empty scrollback) and never touches the terminal.
@@ -715,7 +796,10 @@ static bool resize_row_is_kept_as_is(TermLine *ln, TermLine *next, i32 cols, boo
  * shape, ends the prefix rather than being handled — the caller falls back to
  * the reflow, which is always correct. So does a line whose CELLS the reflow
  * would lay out differently even at this width (resize_row_is_kept_as_is):
- * the metadata alone cannot see those.
+ * the metadata alone cannot see those. And so does a row whose block is not
+ * the one the reflow would compress again (resize_cold_is_canonical), or a
+ * line-ending row whose last cell the reflow would drop
+ * (resize_cold_last_cell_shows).
  *
  * The last logical line is excluded when it continues onto the SCREEN (its
  * final row is wrapped), because then it is not a scrollback line at all: the
@@ -757,7 +841,9 @@ static i32 resize_keepable_prefix(Terminal *t, i32 cols) {
             SB_META(i, len, wrapped);
             if (!wrapped) break;
             if (len != cols) return keep;   /* not the shape the rewrap assumes */
-            if (!resize_row_is_kept_as_is(sb_get(t, i), sb_get(t, i + 1), cols, false)) return keep;
+            TermLine *row = sb_get(t, i);
+            if (!resize_row_is_kept_as_is(row, sb_get(t, i + 1), cols, false)) return keep;
+            if (row->cold && !(resize_cold_verdict(row->cold) & COLD_CANONICAL)) return keep;
             i++;
         }
         i32 last_len; bool last_wrapped;
@@ -766,12 +852,42 @@ static i32 resize_keepable_prefix(Terminal *t, i32 cols) {
         if (last_len < 0 || last_len > cols) return keep;
         i32 k = i - a + 1;
         if (k > 1 && last_len == 0) return keep;  /* the rewrap would collapse it */
-        if (!resize_row_is_kept_as_is(sb_get(t, i), NULL, cols, true)) return keep;
+        TermLine *end_row = sb_get(t, i);
+        if (!resize_row_is_kept_as_is(end_row, NULL, cols, true)) return keep;
+        if (end_row->cold && !resize_cold_line_end_kept(end_row->cold)) return keep;
         a = i + 1;
         keep = a;
     }
     #undef SB_META
     return keep;
+}
+
+/* Would the reflow at width `cols` give back this history row exactly as it is
+ * stored, compressed form included? Asked of a row that is a logical line of
+ * its own: it is not wrapped and neither is the row before it.
+ *
+ * The reflow lays such a row out cell for cell as it is when the row fits the
+ * width, resize_row_is_kept_as_is holds, and every wide lead is followed by its
+ * dummy (a lead without one gets a dummy inserted after it). sb_push then
+ * stores the same cells and the same block when the last cell can show
+ * something and the block is canonical. A row that passes keeps its compressed
+ * line, and the history's byte accounting comes out the same. */
+static bool resize_row_passes(TermLine *ln, i32 cols) {
+    if (!ln || !ln->cold) return false;
+    const TermLineCompressed *c = ln->cold;
+    i32 len = c->len;
+    if (c->wrapped || len <= 0 || len > cols) return false;
+    if (!resize_cold_line_end_kept(ln->cold)) return false;
+    if (!resize_row_is_kept_as_is(ln, NULL, cols, true)) return false;
+    if (c->has_leads) {
+        const u64 *leads = c->wide_bits + (len + 63) / 64;
+        for (i32 i = 0; i < len; i++) {
+            if (!((leads[i >> 6] >> (i & 63)) & 1u)) continue;
+            if (i + 1 >= len || !((c->wide_bits[(i + 1) >> 6] >> ((i + 1) & 63)) & 1u))
+                return false;
+        }
+    }
+    return true;
 }
 
 /* Underline entries across the reflow — defined with the sparse map below. */
@@ -781,8 +897,13 @@ static void underline_stamp(Terminal *t, Cell *grid, i32 cols, i32 rows, Underli
 static void underline_harvest(Terminal *t, Cell *grid, const UnderlineKinds *tb);
 
 /* One reflowed row: where its cells sit in the packed output buffer, how many
- * of them are stored, and whether the row continues on the next one. */
-typedef struct { i32 off; i32 len; bool wrapped; } ReflowOutRow;
+ * of them are stored, and whether the row continues on the next one. A KEPT
+ * row has no cells there: it is the history row `src` (resize_row_passes),
+ * whose compressed line `cold` takes over once the ring is rebuilt. */
+typedef struct {
+    i32 off; i32 len; bool wrapped;
+    bool kept; i32 src; TermLineCompressed *cold;
+} ReflowOutRow;
 
 /* Make room for `need` output rows.
  *
@@ -963,7 +1084,10 @@ void terminal_resize(Terminal *t, i32 new_cols, i32 new_rows) {
      * resize_row_is_kept_as_is), so they are skipped
      * here and left untouched in the ring by Phase 5 instead of being
      * decompressed, re-packed and re-compressed. On a deep history that round
-     * trip is most of the cost of a vertical drag step.
+     * trip is most of the cost of a drag step. Past the prefix, a history line
+     * of one row that the reflow would give back as it is (resize_row_passes)
+     * keeps its compressed block the same way, line by line, so a line that
+     * does rewrap does not send everything after it through the round trip.
      *
      * `sb_first` is the ONLY thing the two cases differ by. Every rule below —
      * trimming, wide-character packing, the cursor mapping, the screen/
@@ -996,6 +1120,7 @@ void terminal_resize(Terminal *t, i32 new_cols, i32 new_rows) {
             const TermLineCompressed *cold;
             i32 len, content;
             bool wrapped;
+            bool keep;      /* a history row the reflow gives back as it is */
         } PhysRow;
 
         PhysRow *phys = calloc((usize)total_phys, sizeof(PhysRow));
@@ -1077,9 +1202,19 @@ void terminal_resize(Terminal *t, i32 new_cols, i32 new_rows) {
          * lines. Phase 4 sizes its packed output buffer from this instead of
          * out_cap * new_cols. */
         i64 content_total64 = 0;
+        /* A history line of one row that the reflow would give back as it is
+         * keeps its compressed form: Phase 4 writes no cells for it and Phase
+         * 5 puts the same block back in the ring. Same switch as the prefix. */
+        const bool keep_rows = !liu_resize_keep_scrollback_disabled;
         for (i32 li = 0; li < log_count; li++) {
             i32 start = log_start[li];
             i32 end = (li + 1 < log_count) ? log_start[li + 1] : total_phys;
+            if (keep_rows && end - start == 1 && start < sb_live && phys[start].cold &&
+                resize_row_passes(sb_get(t, sb_first + start), new_cols)) {
+                phys[start].keep = true;
+                if (new_total_phys < INT32_MAX) new_total_phys++;
+                continue;
+            }
 
             /* Count total non-trailing-space cells in this logical line */
             i64 total_cells64 = 0;
@@ -1214,6 +1349,21 @@ void terminal_resize(Terminal *t, i32 new_cols, i32 new_rows) {
             i32 start = log_start[li];
             i32 end = (li + 1 < log_count) ? log_start[li + 1] : total_phys;
 
+            /* A kept history row (Phase 2): one output row, no cells. It is
+             * never the cursor's line, which starts on the screen. */
+            if (end - start == 1 && phys[start].keep) {
+                if (!reflow_grow_rows(&out_rows, &out_cap, &out_cell_count,
+                                      new_cols, out_row_count + 1)) {
+                    reflow_oom = true;
+                    break;
+                }
+                out_rows[out_row_count] = (OutRow){
+                    .len = phys[start].len, .kept = true, .src = sb_first + start
+                };
+                out_row_count++;
+                continue;
+            }
+
             /* Flatten the logical line's cells */
             i64 total_cells64 = 0;
             for (i32 pi = start; pi < end; pi++) {
@@ -1267,8 +1417,9 @@ void terminal_resize(Terminal *t, i32 new_cols, i32 new_rows) {
             }
 
             if (!flat || flat_cap < total_cells) { reflow_oom = true; break; }
-            for (i32 i = 0; i < total_cells; i++) flat[i] = blank;
 
+            /* The rows are copied in one after another from the start, so
+             * only what follows the last one copied is left to blank. */
             i32 fi = 0;
             for (i32 pi = start; pi < end; pi++) {
                 i32 copy_len = (pi == end - 1) ? phys[pi].content : phys[pi].len;
@@ -1282,6 +1433,7 @@ void terminal_resize(Terminal *t, i32 new_cols, i32 new_rows) {
                 }
 
             }
+            for (i32 i = fi; i < total_cells; i++) flat[i] = blank;
 
             /* Re-wrap into rows of new_cols.
              *
@@ -1329,6 +1481,28 @@ void terminal_resize(Terminal *t, i32 new_cols, i32 new_rows) {
 
                 i32 col = 0;
                 while (col < new_cols && src < total_cells) {
+                    /* A stretch of plain narrow cells — no wide bit, and a
+                     * character the width table cannot widen — goes over in
+                     * one copy: each step below would copy such a cell as it
+                     * is. It stops short of the cursor's cell, which those
+                     * steps map. */
+                    {
+                        i32 lim = MIN(new_cols - col, total_cells - src);
+                        if (cursor_line && !cursor_done && cursor_cell_offset >= src &&
+                            cursor_cell_offset - src < lim)
+                            lim = cursor_cell_offset - src;
+                        i32 k = 0;
+                        while (k < lim &&
+                               !(flat[src + k].attr.flags & (ATTR_WIDE | ATTR_WDUMMY)) &&
+                               flat[src + k].codepoint < 0x1100)
+                            k++;
+                        if (k > 0) {
+                            memcpy(&row[col], &flat[src], (usize)k * sizeof(Cell));
+                            col += k;
+                            src += k;
+                            continue;
+                        }
+                    }
                     bool is_wide = (flat[src].attr.flags & ATTR_WIDE) != 0;
                     /* A dummy with no lead in front of it is the spacer a wrap
                      * leaves where a wide character did not fit (or an orphan
@@ -1488,6 +1662,23 @@ void terminal_resize(Terminal *t, i32 new_cols, i32 new_rows) {
          *          Keep cursor visible on screen.
          */
 
+        /* Take the kept rows' compressed lines out of their slots before the
+         * ring is cleared below, so the clear does not free them. Their bytes
+         * leave the history's count here; sb_push_cold counts them again when
+         * they go back in. */
+        for (i32 i = 0; i < out_row_count; i++) {
+            if (!out_rows[i].kept) continue;
+            TermLine *ln = sb_get(t, out_rows[i].src);
+            if (!ln || !ln->cold) continue;
+            usize bytes = termline_compressed_bytes(ln->cold);
+            out_rows[i].cold = ln->cold;
+            ln->cold = NULL;
+            ln->len = 0;
+            ln->wrapped = false;
+            t->sb_byte_usage = t->sb_byte_usage > bytes ? t->sb_byte_usage - bytes : 0;
+            atomic_fetch_add_explicit(&liu_resize_pass_rows, 1, memory_order_relaxed);
+        }
+
         /* Clear the scrollback this reflow REBUILT — everything from `sb_first`
          * on. The prefix before it was proven unable to rewrap and stays
          * exactly as it is, ring slots and compression included. With no
@@ -1589,6 +1780,13 @@ void terminal_resize(Terminal *t, i32 new_cols, i32 new_rows) {
         if (push_count < 0) push_count = 0;
         if (push_count > out_row_count) push_count = out_row_count;
         for (i32 i = 0; i < push_count; i++) {
+            if (out_rows[i].kept) {
+                /* The ring takes the block over (and frees it if the budget
+                 * will not hold it). */
+                if (out_rows[i].cold) sb_push_cold(t, out_rows[i].cold);
+                out_rows[i].cold = NULL;
+                continue;
+            }
             sb_push(t, out_flat + (usize)out_rows[i].off,
                     out_rows[i].len, out_rows[i].wrapped);
         }
@@ -1600,13 +1798,23 @@ void terminal_resize(Terminal *t, i32 new_cols, i32 new_rows) {
             i32 src_idx = screen_start_total - sb_first + y;
             if (src_idx >= 0 && src_idx < out_row_count) {
                 i32 copy_c = MIN(out_rows[src_idx].len, new_cols);
-                if (copy_c > 0) {
+                if (out_rows[src_idx].kept) {
+                    if (copy_c > 0 && out_rows[src_idx].cold)
+                        termline_materialize(out_rows[src_idx].cold,
+                                             &resize_cells[y * new_cols], copy_c);
+                } else if (copy_c > 0) {
                     memcpy(&resize_cells[y * new_cols],
                            out_flat + (usize)out_rows[src_idx].off,
                            (usize)copy_c * sizeof(Cell));
                 }
                 resize_line_wrapped[y] = out_rows[src_idx].wrapped;
             }
+        }
+
+        /* A kept row that went to the screen (or nowhere) still owns its
+         * block; the ring took over every one that was pushed. */
+        for (i32 i = 0; i < out_row_count; i++) {
+            if (out_rows[i].cold) termline_compressed_destroy(out_rows[i].cold);
         }
 
         /* Only the current logical line was expanded; all input rows were borrowed. */
@@ -2094,9 +2302,6 @@ void terminal_select_start(Terminal *t, i32 col, i32 row) {
 void terminal_select_update(Terminal *t, i32 col, i32 row) {
     selection_update(t, col, row);
 }
-char *terminal_select_text(Terminal *t) {
-    return selection_get_text(t);
-}
 void terminal_select_clear(Terminal *t) {
     selection_clear(t);
 }
@@ -2302,6 +2507,15 @@ i32 terminal_key_input(Terminal *t, u32 key, u32 mods, u8 *out, i32 out_size) {
      * expect. Alt IS a modifier TUIs bind, so it stays protocol-first; Cmd/Super
      * is not, which is why it is mapped unconditionally at the top. */
     bool legacy_kbd = (t->Liu_kbd_flags == 0 && t->modify_other_keys == 0);
+#ifdef PLATFORM_MACOS
+    bool word_maps = legacy_kbd;
+#else
+    /* On Linux the maps are a line editor's at a prompt. A full-screen program
+     * (the alternate screen: an editor, a pager) and a chord with Shift (a
+     * selection, which ESC b would lose) get xterm's codes instead, as from
+     * every other terminal there: CSI 1;5D, CSI 3;5~, ^H for Ctrl+Backspace. */
+    bool word_maps = legacy_kbd && !(t->mode & MODE_ALT_SCREEN) && !(mods & MOD_SHIFT);
+#endif
 
     #define EMIT(s) do { \
         i32 sl = (i32)strlen(s); \
@@ -2344,10 +2558,16 @@ i32 terminal_key_input(Terminal *t, u32 key, u32 mods, u8 *out, i32 out_size) {
             break;
         case KEY_BACKSPACE:
             /* Cmd+Backspace already returned ^U at the top of the function. */
-            if (legacy_kbd && (mods & (MOD_ALT | MOD_CTRL))) {
+            if (word_maps && (mods & (MOD_ALT | MOD_CTRL))) {
                 /* Option+Backspace (macOS) / Ctrl+Backspace (Linux) →
                  * ESC DEL (backward-kill-word in readline/zle) */
                 EMIT("\x1b\x7f");
+#ifndef PLATFORM_MACOS
+            } else if (legacy_kbd && (mods & (MOD_ALT | MOD_CTRL))) {
+                /* xterm's: Alt is Meta (ESC first), Ctrl makes it BS. */
+                if (mods & MOD_ALT) EMIT("\x1b");
+                EMIT((mods & MOD_CTRL) ? "\x08" : "\x7f");
+#endif
             } else {
                 EMIT("\x7f");
             }
@@ -2367,7 +2587,7 @@ i32 terminal_key_input(Terminal *t, u32 key, u32 mods, u8 *out, i32 out_size) {
         case KEY_DOWN:      EMIT_ARROW("B"); break;
         case KEY_RIGHT:
             /* Cmd+Right already returned ^E at the top of the function. */
-            if (legacy_kbd && (mods & (MOD_ALT | MOD_CTRL))) {
+            if (word_maps && (mods & (MOD_ALT | MOD_CTRL))) {
                 EMIT("\x1b" "f");      /* Option/Ctrl+Right → ESC f (forward-word) */
             } else {
                 EMIT_ARROW("C");
@@ -2375,7 +2595,7 @@ i32 terminal_key_input(Terminal *t, u32 key, u32 mods, u8 *out, i32 out_size) {
             break;
         case KEY_LEFT:
             /* Cmd+Left already returned ^A at the top of the function. */
-            if (legacy_kbd && (mods & (MOD_ALT | MOD_CTRL))) {
+            if (word_maps && (mods & (MOD_ALT | MOD_CTRL))) {
                 EMIT("\x1b" "b");      /* Option/Ctrl+Left → ESC b (backward-word) */
             } else {
                 EMIT_ARROW("D");
@@ -2392,7 +2612,7 @@ i32 terminal_key_input(Terminal *t, u32 key, u32 mods, u8 *out, i32 out_size) {
         case KEY_INSERT:    EMIT_FUNC("2"); break;
         case KEY_DELETE:
             /* Cmd+ForwardDelete already returned ^K at the top of the function. */
-            if (legacy_kbd && (mods & (MOD_ALT | MOD_CTRL))) {
+            if (word_maps && (mods & (MOD_ALT | MOD_CTRL))) {
                 /* Option/Ctrl+ForwardDelete → ESC d (kill-word forward) */
                 EMIT("\x1b" "d");
             } else if (has_mod) {
@@ -2438,6 +2658,26 @@ i32 terminal_key_input(Terminal *t, u32 key, u32 mods, u8 *out, i32 out_size) {
      * reported longer than the buffer (clamp_emit, as on every other path
      * in this file). */
     return clamp_emit(n, out_size);
+}
+
+/* A Ctrl+letter's control byte on the legacy path. On X11 Alt is Meta there
+ * too: Ctrl+Alt+F is ESC then ^F, the Meta prefix line editors read as their
+ * Meta-Control keys. macOS's Option is not added: it is the text
+ * system's there. */
+static i32 ctrl_byte_emit(u8 c0, u32 mods, u8 *out, i32 out_size) {
+#ifndef PLATFORM_MACOS
+    if ((mods & MOD_ALT) && !(mods & MOD_SUPER)) {
+        if (out_size < 2) return 0;
+        out[0] = 0x1b;
+        out[1] = c0;
+        return 2;
+    }
+#else
+    (void)mods;
+#endif
+    if (out_size < 1) return 0;
+    out[0] = c0;
+    return 1;
 }
 
 i32 terminal_char_input(Terminal *t, u32 codepoint, u32 mods, u8 *out, i32 out_size) {
@@ -2506,11 +2746,7 @@ i32 terminal_char_input(Terminal *t, u32 codepoint, u32 mods, u8 *out, i32 out_s
         if (t->modify_other_keys == 1 && t->Liu_kbd_flags == 0) {
             return encode_modify_other_keys(codepoint, mods, out, out_size);
         }
-        if (out_size >= 1) {
-            out[0] = (u8)(codepoint - 'a' + 1);
-            return 1;
-        }
-        return 0;
+        return ctrl_byte_emit((u8)(codepoint - 'a' + 1), mods, out, out_size);
     }
     if ((mods & MOD_CTRL) && codepoint >= 'A' && codepoint <= 'Z') {
         if (t->Liu_kbd_flags & 0x01) {
@@ -2521,11 +2757,7 @@ i32 terminal_char_input(Terminal *t, u32 codepoint, u32 mods, u8 *out, i32 out_s
         if (t->modify_other_keys >= 1 && t->Liu_kbd_flags == 0) {
             return encode_modify_other_keys(codepoint + 32, mods, out, out_size);
         }
-        if (out_size >= 1) {
-            out[0] = (u8)(codepoint - 'A' + 1);
-            return 1;
-        }
-        return 0;
+        return ctrl_byte_emit((u8)(codepoint - 'A' + 1), mods, out, out_size);
     }
 
     /* modifyOtherKeys level 2: encode ALL modified keys when any modifier

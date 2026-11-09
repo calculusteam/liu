@@ -38,8 +38,10 @@ ImgPreflight img_preflight_path(const char *path, const ImgLimits *lim,
     if (out_h) *out_h = 0;
     if (!path || !*path) return IMG_PREFLIGHT_UNREADABLE;
     int iw = 0, ih = 0, ich = 0;
-    return img_preflight_finish(stbi_info(path, &iw, &ih, &ich), iw, ih,
-                                lim, out_w, out_h);
+    /* Its own statement: the order a call's arguments are evaluated in is
+     * the compiler's, and iw / ih must be read after stb wrote them. */
+    int ok = stbi_info(path, &iw, &ih, &ich);
+    return img_preflight_finish(ok, iw, ih, lim, out_w, out_h);
 }
 
 ImgPreflight img_preflight_memory(const u8 *data, usize len, const ImgLimits *lim,
@@ -48,9 +50,8 @@ ImgPreflight img_preflight_memory(const u8 *data, usize len, const ImgLimits *li
     if (out_h) *out_h = 0;
     if (!data || len == 0 || len > (usize)INT32_MAX) return IMG_PREFLIGHT_UNREADABLE;
     int iw = 0, ih = 0, ich = 0;
-    return img_preflight_finish(
-        stbi_info_from_memory(data, (int)len, &iw, &ih, &ich), iw, ih,
-        lim, out_w, out_h);
+    int ok = stbi_info_from_memory(data, (int)len, &iw, &ih, &ich);
+    return img_preflight_finish(ok, iw, ih, lim, out_w, out_h);
 }
 
 /* The bounded animated-GIF decoder uses two passes over the input. The first

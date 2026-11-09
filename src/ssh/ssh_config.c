@@ -809,6 +809,7 @@ static SSHResolvedConfig *ssh_config_resolve_blocks(const char *hostname,
 
     /* If no identity files specified, add defaults */
     if (cfg->identity_file_count == 0) {
+        cfg->identity_defaults = true;
         const char *default_keys[] = {
             "~/.ssh/id_ed25519",
             "~/.ssh/id_rsa",

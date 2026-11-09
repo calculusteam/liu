@@ -557,31 +557,6 @@ i32 sftp_upload_fd(void *sftp_ptr, int fd, const char *label, const char *remote
     return ok ? 0 : -1;
 }
 
-i32 sftp_mkdir(void *sftp_ptr, const char *path) {
-    LIBSSH2_SFTP *sftp = (LIBSSH2_SFTP *)sftp_ptr;
-    if (!sftp) return -1;
-    int rc;
-    SFTP_CALL(rc, libssh2_sftp_mkdir(sftp, path,
-        LIBSSH2_SFTP_S_IRWXU | LIBSSH2_SFTP_S_IRGRP | LIBSSH2_SFTP_S_IXGRP));
-    return rc;
-}
-
-i32 sftp_remove(void *sftp_ptr, const char *path) {
-    LIBSSH2_SFTP *sftp = (LIBSSH2_SFTP *)sftp_ptr;
-    if (!sftp) return -1;
-    int rc;
-    SFTP_CALL(rc, libssh2_sftp_unlink(sftp, path));
-    return rc;
-}
-
-i32 sftp_rename(void *sftp_ptr, const char *old_path, const char *new_path) {
-    LIBSSH2_SFTP *sftp = (LIBSSH2_SFTP *)sftp_ptr;
-    if (!sftp) return -1;
-    int rc;
-    SFTP_CALL(rc, libssh2_sftp_rename(sftp, old_path, new_path));
-    return rc;
-}
-
 /* =========================================================================
  * Transfer progress (global state for UI)
  * ========================================================================= */
@@ -1499,49 +1474,3 @@ SFTPSyncResult sftp_sync_upload(void *sftp_ptr, const char *local_dir, const cha
  * Symlink operations
  * ========================================================================= */
 
-bool sftp_create_symlink(void *sftp_ptr, const char *target, const char *link_path) {
-    LIBSSH2_SFTP *sftp = (LIBSSH2_SFTP *)sftp_ptr;
-    if (!sftp) return false;
-
-    /* libssh2_sftp_symlink_ex with LIBSSH2_SFTP_SYMLINK creates a symlink.
-     * Parameters: sftp, path (target), path_len, target (link_path), target_len, link_type
-     * Note: libssh2 naming is confusing — the first path arg is the target of the link,
-     * and the second is where the symlink itself is created. */
-    int rc;
-    SFTP_CALL(rc, libssh2_sftp_symlink_ex(sftp,
-        target, (u32)strlen(target),
-        (char *)link_path, (u32)strlen(link_path),
-        LIBSSH2_SFTP_SYMLINK));
-    return rc == 0;
-}
-
-bool sftp_read_symlink(void *sftp_ptr, const char *link_path, char *target, i32 target_size) {
-    LIBSSH2_SFTP *sftp = (LIBSSH2_SFTP *)sftp_ptr;
-    if (!sftp || !target || target_size <= 0) return false;
-
-    int rc;
-    SFTP_CALL(rc, libssh2_sftp_symlink_ex(sftp,
-        link_path, (u32)strlen(link_path),
-        target, (u32)target_size,
-        LIBSSH2_SFTP_READLINK));
-
-    if (rc < 0) return false;
-
-    /* Ensure null termination */
-    if (rc < target_size)
-        target[rc] = '\0';
-    else
-        target[target_size - 1] = '\0';
-
-    return true;
-}
-
-bool sftp_remove_symlink(void *sftp_ptr, const char *link_path) {
-    LIBSSH2_SFTP *sftp = (LIBSSH2_SFTP *)sftp_ptr;
-    if (!sftp) return false;
-
-    /* unlink works on symlinks — removes the link itself, not the target */
-    int rc;
-    SFTP_CALL(rc, libssh2_sftp_unlink(sftp, link_path));
-    return rc == 0;
-}

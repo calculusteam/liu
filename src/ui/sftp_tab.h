@@ -147,8 +147,6 @@ void sftp_tab_destroy(SftpTab *st);
  * policy, the remote pane's wiring on the up / down edges, the views. True
  * when something the window shows changed. */
 bool sftp_tab_tick(AppState *app, i32 tab_index, f64 now);
-/* True while something in the tab moves on the clock (a connecting spinner). */
-bool sftp_tab_animating(const AppState *app);
 
 void sftp_tab_render(AppState *app, SftpTab *st, f32 x, f32 y, f32 w, f32 h);
 /* The menu and the drag's ghost, drawn above every panel of the window. */

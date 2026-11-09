@@ -218,7 +218,9 @@ bool bridge_write_commandcode_session(const BridgeHistory *h, const char *sessio
                     if (args) {
                         jsonw_obj_begin(&w, NULL);
                         jsonw_str(&w, "type", "tool-call");
-                        jsonw_str(&w, "toolCallId", b->tool_call_id);
+                        char tid[BRIDGE_WIRE_ID_MAX + 1];
+                        bridge_wire_tool_id(tid, sizeof tid, NULL, b->tool_call_id);
+                        jsonw_str(&w, "toolCallId", tid);
                         jsonw_str(&w, "toolName", name);
                         jsonw_raw_or_str(&w, "input", args);
                         jsonw_obj_end(&w);
@@ -254,7 +256,9 @@ bool bridge_write_commandcode_session(const BridgeHistory *h, const char *sessio
                 cc_result_name(h, j, name, sizeof name);
                 jsonw_obj_begin(&w, NULL);
                 jsonw_str(&w, "type", "tool-result");
-                jsonw_str(&w, "toolCallId", b->tool_call_id);
+                char tid[BRIDGE_WIRE_ID_MAX + 1];
+                bridge_wire_tool_id(tid, sizeof tid, NULL, b->tool_call_id);
+                jsonw_str(&w, "toolCallId", tid);
                 jsonw_str(&w, "toolName", name);
                 jsonw_str(&w, "output", b->tool_output ? b->tool_output : "");
                 jsonw_obj_end(&w);

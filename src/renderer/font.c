@@ -2618,6 +2618,9 @@ typedef struct {
 static PendingFallback g_pending_fallbacks[MAX_PENDING_FALLBACKS];
 static i32 g_pending_fallback_count = 0;
 
+static bool load_fallback(const char *path, f32 pixel_h); /* fwd decl */
+
+#ifdef PLATFORM_MACOS   /* only macOS queues its fallbacks; Linux loads its chain at start */
 static void queue_lazy_fallback(const char *path, f32 pixel_h) {
     if (!path || !*path) return;
     if (fallback_path_loaded(path)) return;
@@ -2629,8 +2632,6 @@ static void queue_lazy_fallback(const char *path, f32 pixel_h) {
     p->pixel_h = pixel_h;
     p->attempted = false;
 }
-
-static bool load_fallback(const char *path, f32 pixel_h); /* fwd decl */
 
 /* Keep only validated character coverage for an unopened candidate. A CJK
  * miss in a Latin face must not retain its full snapshot and CoreText objects.
@@ -2694,6 +2695,7 @@ static i32 load_lazy_fallback_for_cp(u32 cp) {
     }
     return -1;
 }
+#endif
 
 static bool load_fallback(const char *path, f32 pixel_h) {
     if (g_fallback_count >= MAX_FALLBACK_FONTS) return false;
@@ -4143,11 +4145,6 @@ u32 font_drain_raster_completions(FontAtlas *atlas) {
     return installed;
 }
 
-u32 font_raster_completion_version(const FontAtlas *atlas) {
-    const FontAtlasPriv *p = fa_priv(atlas);
-    return p ? p->raster.completed_version : 0;
-}
-
 bool font_atlas_reclaim_pending(const FontAtlas *atlas) {
     const FontAtlasPriv *p = atlas ? (const FontAtlasPriv *)atlas->priv : NULL;
     return p && p->reclaim_wanted;
@@ -4261,10 +4258,6 @@ u32 font_atlas_placement_generation(const FontAtlas *atlas) {
 u32 font_atlas_content_version(const FontAtlas *atlas) {
     const FontAtlasPriv *p = atlas ? (const FontAtlasPriv *)atlas->priv : NULL;
     return p ? p->content_version : 0;
-}
-u32 font_atlas_extent_version(const FontAtlas *atlas) {
-    const FontAtlasPriv *p = atlas ? (const FontAtlasPriv *)atlas->priv : NULL;
-    return p ? p->extent_version : 0;
 }
 void font_atlas_set_gpu_ready(FontAtlas *atlas, u32 content_version) {
     if (!atlas) return;
@@ -5697,6 +5690,7 @@ static LigatureEntry *lig_cache_lookup(FontAtlasPriv *p, const u32 *cps_in, i32 
     return NULL;
 }
 
+#ifdef PLATFORM_MACOS   /* a run's decisions are the Core Text path's (font_check_ligature_run) */
 static LigatureEntry *lig_cache_lookup_ctx(FontAtlasPriv *p, const u32 *cps_in, i32 cnt,
                                            u32 l, u32 r) {
     if(!p->lig)return NULL;
@@ -5711,6 +5705,7 @@ static LigatureEntry *lig_cache_lookup_ctx(FontAtlasPriv *p, const u32 *cps_in, 
     }
     return NULL;
 }
+#endif
 
 static LigatureEntry *lig_cache_insert_at(FontAtlasPriv *p, const LigatureEntry *key,
                                            i32 width, f32 lu0, f32 lv0, f32 lu1, f32 lv1,
@@ -5724,12 +5719,14 @@ static LigatureEntry *lig_cache_insert(FontAtlasPriv *p, const u32 *cps_in, i32 
     return lig_cache_insert_at(p, &key, width, lu0, lv0, lu1, lv1, negative);
 }
 
+#ifdef PLATFORM_MACOS
 /* A run's "no ligature here" (font_check_ligature_run). */
 static void lig_cache_insert_ctx(FontAtlasPriv *p, const u32 *cps_in, i32 cnt, u32 l, u32 r) {
     LigatureEntry key = { .count = (u8)cnt, .ctx = true, .ctx_l = l, .ctx_r = r };
     for (i32 j = 0; j < cnt && j < LIGATURE_MAX_LEN; j++) key.codepoints[j] = cps_in[j];
     (void)lig_cache_insert_at(p, &key, 0, 0, 0, 0, 0, true);
 }
+#endif
 
 /* The key (codepoints, count and, for a run's decision, its context) decides
  * the slot; everything about it is written over whatever held the slot. */
@@ -5870,7 +5867,8 @@ static i32 font_hb_ligature_locked(FontAtlas *atlas, const u32 *cps, i32 count, 
     valid=true;
 done:
     FT_Set_Transform(face,NULL,NULL);
-    if(buffer)hb_buffer_destroy(buffer);if(font)hb_font_destroy(font);
+    if(buffer)hb_buffer_destroy(buffer);
+    if(font)hb_font_destroy(font);
     pthread_mutex_unlock(&g_ft_mu);
     if(!valid){free(bitmap);return 0;}
     if(!changed){lig_cache_insert(p,cps,count,0,0,0,0,0,true);return 0;}
@@ -7479,23 +7477,6 @@ void font_set_user_fallback_config(const char **paths, i32 count) {
         }
     }
     if(previous_count!=g_user_fallback_count || memcmp(previous,g_user_fallback_paths,sizeof(previous)))font_prewarm_clear_locked();
-    pthread_mutex_unlock(&g_face_mu);
-}
-
-void font_atlas_load_user_fallbacks(const char **paths, i32 count) {
-    /* Appends to the process-shared fallback chain — exclude the workers.
-     * g_pixel_h is face state written by face_load_locked, so its guard is
-     * INSIDE the lock: read outside it, the value could be one a worker is
-     * rewriting. */
-    pthread_mutex_lock(&g_face_mu);
-    font_prewarm_clear_locked();
-    if (g_pixel_h <= 0) { pthread_mutex_unlock(&g_face_mu); return; }
-    for (i32 i = 0; i < count; i++) {
-        if (!paths[i] || !paths[i][0]) continue;
-        if (load_fallback(paths[i], g_pixel_h)) {
-            fprintf(stderr, "font: loaded user fallback '%s'\n", paths[i]);
-        }
-    }
     pthread_mutex_unlock(&g_face_mu);
 }
 

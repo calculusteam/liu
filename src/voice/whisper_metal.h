@@ -15,9 +15,6 @@
 
 typedef struct WhisperMetal WhisperMetal;
 
-/* True if a usable Metal device and the Whisper metallib are both present. */
-bool whisper_metal_available(void);
-
 /* Build a Metal backend over a resolved weight table. `w` (and the model
  * file behind it) must outlive the returned handle only until this call
  * returns: the weights are copied into device buffers here. Returns NULL on
@@ -30,10 +27,5 @@ bool whisper_metal_encode(WhisperMetal *m, const f32 *mel);
 bool whisper_metal_decode(WhisperMetal *m, const i32 *tokens, i32 n, i32 n_past,
                           f32 *logits);
 void whisper_metal_decode_reset(WhisperMetal *m);
-
-/* Copy the encoder output ([n_audio_ctx * n_state]) back to the host, so
- * this backend can be compared against the CPU one on a tensor rather than
- * only on final text. Returns false if no encode has run. */
-bool whisper_metal_encoder_out(WhisperMetal *m, f32 *dst);
 
 #endif /* VOICE_WHISPER_METAL_H */

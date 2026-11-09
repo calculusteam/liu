@@ -409,6 +409,16 @@ typedef struct {
     LiuDrawableMailbox         *acquire;
     LiuSurfacePresenter        *surfacePresenter;
     bool                        frameTargetPlanned;
+    /* Hand-off fades (renderer_fade_note): this frame's notes, the last
+     * presented frame's, and that frame's image — the pixels a fade starts
+     * from, valid while the image is still in the pool and leased by no
+     * frame since (lease_serial). */
+    RendererFade                fadeNow[RENDERER_FADE_CAP];
+    u32                         fadeNowCount;
+    RendererFade                fadeLast[RENDERER_FADE_CAP];
+    u32                         fadeLastCount;
+    LiuSurfaceImage            *fadeSource;      /* not retained: checked against the pool */
+    u64                         fadeSourceSerial;
     f64                         lastFrameTime;
     LiuGpuEpoch                *epoch;      /* GPU completion counters — see above */
     id<MTLCommandBuffer>        currentCommandBuffer;
@@ -500,6 +510,7 @@ static bool metal_atlas_prepare(RendererMetal *m, Renderer *r, id<MTLCommandBuff
 static void metal_atlas_destroy(RendererMetal *m);
 static void metal_atlas_drop_pending(RendererMetal *m);
 static void metal_commit_tracked(RendererMetal *m, id<MTLCommandBuffer> cb);
+static void metal_fades_finish(Renderer *r, RendererMetal *m);
 static void metal_retained_destroy(RetainedBatch *batch);
 static void metal_retained_trim(Renderer *r, f64 now);
 
@@ -1330,7 +1341,10 @@ void renderer_begin_frame(Renderer *r, i32 w, i32 h) {
                 m->layer.framebufferOnly && r->clear_color[3]==1 && !r->bg_texture &&
                 !liu_dev_env("LIU_DUMP_FRAME") && w>0 && h>16 &&
                 (usize)w*(usize)(h-16)*4>LIU_SURFACE_COMPACT_MIN_BYTES;
+            atomic_store_explicit(&m->surfacePresenter->waiting,true,memory_order_release);
             m->currentDrawable=[(m->frameTargetPlanned ? [m->surfacePresenter nextRecordingWidth:(NSUInteger)w height:(NSUInteger)h] : [m->surfacePresenter nextWidth:(NSUInteger)w height:(NSUInteger)h]) retain];
+            if (m->currentDrawable)
+                atomic_store_explicit(&m->surfacePresenter->waiting,false,memory_order_release);
             if (!m->currentDrawable && m->surfacePresenter->allocation_failed) {
                 [m->surfacePresenter stop];[m->surfacePresenter release];m->surfacePresenter=nil;
                 fprintf(stderr,"renderer_metal: IOSurface allocation failed; using CAMetalLayer\n");
@@ -1362,6 +1376,7 @@ void renderer_begin_frame(Renderer *r, i32 w, i32 h) {
             return;
         }
         m->lastFrameTime=platform_time_sec();
+        m->fadeNowCount=0;
 
         /* The atlas preparation goes on this command buffer BEFORE the render
          * encoder opens: blits and the clears of replacement textures are
@@ -1612,12 +1627,21 @@ void renderer_end_frame(Renderer *r) {
         if([(id)m->currentCommandBuffer isKindOfClass:[LiuMetalRecordedBuffer class]])
             atomic_store(&((LiuMetalRecordedBuffer *)m->currentCommandBuffer)->packet->state->failed,true);
         r->frame_deferred=true;
+        /* The surface goes back unused: its release is what the retry waits for. */
+        atomic_store_explicit(&m->surfacePresenter->waiting,true,memory_order_release);
     }
 
     if (m->currentEncoder) {
         [m->currentEncoder endEncoding];
         [m->currentEncoder release];
         m->currentEncoder = nil;
+    }
+    bool fades_presented = false;
+    if (m->surfacePresenter && m->currentDrawable && m->currentCommandBuffer && !r->frame_deferred &&
+        !m->frameTargetPlanned && [(id)m->currentDrawable isKindOfClass:[LiuSurfaceDrawable class]] &&
+        !liu_dev_env("LIU_DUMP_FRAME")) {
+        metal_fades_finish(r, m);
+        fades_presented = true;
     }
 
     /* Attach the fence-release completed handler to the command buffer about
@@ -1664,6 +1688,8 @@ void renderer_end_frame(Renderer *r) {
          * that does not go through metal_commit_tracked() and still cannot fool
          * a GPU mark into thinking a live reader is done. */
         metal_debug_dump_drawable(m, dump_copy);
+        m->fadeSource = nil;      /* drawn without hand-offs: nothing to fade from */
+        m->fadeLastCount = 0;
         if (m->currentDrawable) [m->currentDrawable present];
         [m->currentDrawable release]; m->currentDrawable = nil;
         [m->currentCommandBuffer release]; m->currentCommandBuffer = nil;
@@ -1730,6 +1756,14 @@ dump_not_yet:
                 if (cb.status==MTLCommandBufferStatusCompleted) [drawable present];
             }];
             metal_commit_tracked(m,m->currentCommandBuffer);
+            /* What the next frame's hand-offs are judged against. */
+            if ([(id)drawable isKindOfClass:[LiuSurfaceDrawable class]]) {
+                LiuSurfaceDrawable *shown=(LiuSurfaceDrawable *)drawable;
+                m->fadeSource=shown->image;
+                m->fadeSourceSerial=shown->serial;
+                m->fadeLastCount=fades_presented ? m->fadeNowCount : 0;
+                if (m->fadeLastCount) memcpy(m->fadeLast,m->fadeNow,m->fadeLastCount*sizeof m->fadeLast[0]);
+            }
         } else if (m->layer.presentsWithTransaction) {
             id<CAMetalDrawable> drawable=m->currentDrawable;
             [m->currentCommandBuffer addScheduledHandler:^(id<MTLCommandBuffer> cb) {
@@ -1861,6 +1895,97 @@ bool renderer_set_terminal_rects(Renderer *r, const RendererTerminalRect *rects,
     memcpy(drawable->terminal_rects+drawable->terminal_rect_count,rects,count*sizeof(*rects));
     drawable->terminal_rect_count+=count;
     return true;
+}
+
+static bool metal_fade_wanted(void) {
+    static i32 on=-1;
+    if (on<0) { const char *e=getenv("LIU_HANDOFF_FADE");on=(e && e[0]=='0')?0:1; }
+    return on==1;
+}
+
+bool renderer_fade_available(Renderer *r) {
+    RendererMetal *m=r ? r->backend : NULL;
+    return m && m->surfacePresenter && m->currentDrawable && !m->frameTargetPlanned &&
+           [(id)m->currentDrawable isKindOfClass:[LiuSurfaceDrawable class]] &&
+           r->clear_color[3]>=1.0f && !r->bg_texture && metal_fade_wanted() &&
+           !liu_dev_env("LIU_DUMP_FRAME");
+}
+
+void renderer_fade_note(Renderer *r, f32 x, f32 y, f32 w, f32 h, u64 owner, u64 picture, f64 until) {
+    if (!renderer_fade_available(r)) return;
+    RendererMetal *m=r->backend;
+    if (m->fadeNowCount>=RENDERER_FADE_CAP || !isfinite(x) || !isfinite(y) || !isfinite(w) || !isfinite(h))
+        return;
+    /* Whole pixels, outward, inside the frame: the copy is of pixels. */
+    f32 x0=fmaxf(0.0f,floorf(x)), y0=fmaxf(0.0f,floorf(y));
+    f32 x1=fminf(r->screen_width,ceilf(x+w)), y1=fminf(r->screen_height,ceilf(y+h));
+    if (x1-x0<1.0f || y1-y0<1.0f) return;
+    m->fadeNow[m->fadeNowCount++]=(RendererFade){ (i32)x0,(i32)y0,(i32)(x1-x0),(i32)(y1-y0),owner,picture,until };
+}
+
+void renderer_fade_counts(Renderer *r, u64 *started, u64 *kept) {
+    RendererMetal *m=r ? r->backend : NULL;
+    LiuSurfacePresenter *p=m ? m->surfacePresenter : nil;
+    if (started) *started=p ? p->fades_started : 0;
+    if (kept) *kept=p ? p->fades_kept : 0;
+}
+
+/* End of a frame that is about to be committed for presentation: what each
+ * noted rect does (LIU_FADE_*), judged against the last presented frame, and
+ * for those that start a fade the copy of that frame's pixels — encoded on
+ * this frame's buffer, after its render pass, from a texture no frame has
+ * written since. */
+static void metal_fades_finish(Renderer *r, RendererMetal *m) {
+    LiuSurfaceDrawable *d=(LiuSurfaceDrawable *)m->currentDrawable;
+    LiuSurfacePresenter *p=m->surfacePresenter;
+    d->fade_count=m->fadeNowCount;
+    if (!d->fade_count) return;
+    memcpy(d->fades,m->fadeNow,d->fade_count*sizeof d->fades[0]);
+    LiuSurfaceImage *src=m->fadeSource;
+    bool src_ok=false;
+    if (src && src!=d->image && src->lease_serial==m->fadeSourceSerial &&
+        src->texture.width==d->image->texture.width && src->texture.height==d->image->texture.height)
+        for (u32 i=0;i<3;i++) if (p->images[i]==src) { src_ok=true;break; }
+    u32 need_w=0,need_h=0;
+    for (u32 k=0;k<d->fade_count;k++) {
+        const RendererFade *f=&d->fades[k];
+        u8 mode=LIU_FADE_END;
+        if (f->until>0.0) {
+            for (u32 j=0;j<m->fadeLastCount;j++) {
+                const RendererFade *g=&m->fadeLast[j];
+                if (!liu_fade_same_place(f,g)) continue;
+                if (g->until>0.0 && g->picture==f->picture) mode=LIU_FADE_KEEP;
+                else if (src_ok) mode=LIU_FADE_START;
+                break;
+            }
+        }
+        d->fade_mode[k]=mode;
+        if (mode==LIU_FADE_START) {
+            d->fade_slice_x[k]=need_w;
+            need_w+=(u32)f->w;
+            if ((u32)f->h>need_h) need_h=(u32)f->h;
+        }
+    }
+    if (!need_w) return;
+    LiuSurfaceImage *dst=[p fadeImageWidth:need_w height:need_h];
+    id<MTLBlitCommandEncoder> blit=dst ? [m->currentCommandBuffer blitCommandEncoder] : nil;
+    if (!blit) {
+        if (dst) atomic_store_explicit(&dst->leased,false,memory_order_release);
+        for (u32 k=0;k<d->fade_count;k++) if (d->fade_mode[k]==LIU_FADE_START) d->fade_mode[k]=LIU_FADE_END;
+        return;
+    }
+    for (u32 k=0;k<d->fade_count;k++) {
+        if (d->fade_mode[k]!=LIU_FADE_START) continue;
+        const RendererFade *f=&d->fades[k];
+        [blit copyFromTexture:src->texture sourceSlice:0 sourceLevel:0
+                 sourceOrigin:MTLOriginMake((NSUInteger)f->x,(NSUInteger)f->y,0)
+                   sourceSize:MTLSizeMake((NSUInteger)f->w,(NSUInteger)f->h,1)
+                    toTexture:dst->texture destinationSlice:0 destinationLevel:0
+            destinationOrigin:MTLOriginMake(d->fade_slice_x[k],0,0)];
+    }
+    [blit endEncoding];
+    d->fade_image=[dst retain];   /* leased by fadeImageWidth, given back when the frame is done */
+    (void)r;
 }
 
 static usize metal_trim_frame_buffers(Renderer *r) {

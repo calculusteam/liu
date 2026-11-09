@@ -82,7 +82,11 @@ static f64 session_mono_now(void) {
     return (f64)ts.tv_sec + (f64)ts.tv_nsec / 1e9;
 }
 
-#ifdef PLATFORM_MACOS
+/* Which agent runs in a pane's foreground, from what the kernel says of its
+ * processes. The rungs are the same on both systems; what differs is where a
+ * process's name, argument vector, executable and group are read
+ * (libproc and sysctl on macOS, /proc on Linux). */
+#if defined(PLATFORM_MACOS) || defined(PLATFORM_LINUX)
 
 static bool session_proc_name_is_agent(const char *name) {
     return agent_names_id(name, false)[0] != '\0';
@@ -192,14 +196,16 @@ static bool session_proc_title_agent(const char *arg, char *out, usize out_cap) 
 }
 
 /* A node/bun/python wrapper hides the real CLI behind the interpreter's
- * process name ("node"). Read the process arguments (KERN_PROCARGS2) and
- * return the basename of the first non-flag argv entry that names a known
- * agent — that's the script path, e.g. ".../commandcode" → "commandcode".
+ * process name ("node"). Read the process arguments (KERN_PROCARGS2 on macOS,
+ * /proc/<pid>/cmdline on Linux) and return the basename of the first non-flag
+ * argv entry that names a known agent — that's the script path, e.g.
+ * ".../commandcode" → "commandcode".
  * This is what lets script-based CLIs (codex, commandcode, grok …)
  * be recognized the same way native binaries (claude, opencode) already are. */
 /* All callers are on the main thread (session_fg_process). A single process-wide
  * buffer therefore removes allocator churn without a lock or per-pane
- * duplication. KERN_ARGMAX is invariant for the process lifetime. */
+ * duplication. KERN_ARGMAX is invariant for the process lifetime; on Linux a
+ * vector longer than the buffer is read up to its last whole argument. */
 static char  *g_procargs_scratch;
 static usize  g_procargs_scratch_cap;
 static bool   g_procargs_cleanup_registered;
@@ -215,6 +221,7 @@ static void session_procargs_cleanup(void) {
 static char *session_procargs_buffer(usize *cap_out) {
     if (!g_procargs_scratch) {
         int argmax = 0;
+#ifdef PLATFORM_MACOS
         size_t am_sz = sizeof argmax;
         int mib_am[2] = { CTL_KERN, KERN_ARGMAX };
 #ifdef LIU_AGENT_ARGV_PROBE
@@ -222,6 +229,9 @@ static char *session_procargs_buffer(usize *cap_out) {
 #endif
         if (sysctl(mib_am, 2, &argmax, &am_sz, NULL, 0) != 0 || argmax <= 0)
             argmax = 256 * 1024;
+#else
+        argmax = 256 * 1024;
+#endif
         char *buf = (char *)malloc((size_t)argmax);
 #ifdef LIU_AGENT_ARGV_PROBE
         g_argv_malloc_bytes += (u64)argmax;
@@ -247,6 +257,7 @@ static bool session_proc_argv_agent(pid_t pid, char *out, usize out_cap) {
     char *buf = session_procargs_buffer(&scratch_cap);
     if (!buf) goto done_false;
 
+#ifdef PLATFORM_MACOS
     size_t bsz = scratch_cap;
     int mib[3] = { CTL_KERN, KERN_PROCARGS2, (int)pid };
 #ifdef LIU_AGENT_ARGV_PROBE
@@ -264,6 +275,29 @@ static bool session_proc_argv_agent(pid_t pid, char *out, usize out_cap) {
     /* Layout: argc | exec_path\0 | \0-padding | argv[0]\0 argv[1]\0 … */
     while (p < end && *p != '\0') p++;   /* skip exec_path        */
     while (p < end && *p == '\0') p++;   /* skip padding to argv0 */
+#else
+    /* Layout: argv[0]\0 argv[1]\0 … and nothing before it. A process that
+     * retitled itself reads as its title followed by NULs. */
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/cmdline", (int)pid);
+#ifdef LIU_AGENT_ARGV_PROBE
+    g_argv_procargs_count++;
+#endif
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) goto done_false;
+    usize bsz = 0;
+    while (bsz < scratch_cap) {
+        ssize_t n = read(fd, buf + bsz, scratch_cap - bsz);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        bsz += (usize)n;
+    }
+    close(fd);
+    int argc = 0;
+    for (usize i = 0; i < bsz; i++) if (buf[i] == '\0') argc++;
+    char *p   = buf;
+    char *end = buf + bsz;
+#endif
 
     bool found = false;
     bool py0 = false;       /* argv[0] is a Python interpreter */
@@ -306,6 +340,10 @@ static bool session_proc_argv_agent(pid_t pid, char *out, usize out_cap) {
                 found = true;
                 break;
             }
+            /* The rest of the vector names a script only behind an
+             * interpreter; any other program's arguments are what the user
+             * gave it (`vim codex` edits a file called codex). */
+            if (!session_proc_name_is_wrapper(bn0)) break;
             py0 = strncasecmp(bn0, "python", 6) == 0;
             continue;                    /* argv[0] = interpreter */
         }
@@ -364,8 +402,16 @@ bool session_argv_probe_for_bench(i32 pid, char *out, usize out_cap) {
  * The >=5-char guard keeps short, ambiguous ids (amp, cmd, gpt) from matching
  * an incidental directory name. */
 static bool session_proc_path_agent(pid_t pid, char *out, usize out_cap) {
+#ifdef PLATFORM_MACOS
     char path[PROC_PIDPATHINFO_MAXSIZE];
     if (proc_pidpath(pid, path, sizeof path) <= 0) return false;
+#else
+    char link[64], path[4096];
+    snprintf(link, sizeof link, "/proc/%d/exe", (int)pid);
+    ssize_t n = readlink(link, path, sizeof path - 1);
+    if (n <= 0) return false;
+    path[n] = '\0';
+#endif
     char *save = NULL;
     for (char *tok = strtok_r(path, "/", &save); tok;
          tok = strtok_r(NULL, "/", &save)) {
@@ -412,85 +458,114 @@ static bool session_proc_name_versioned_agent(const char *name,
  * how long to trust the answer: "some process named zsh" is the steady state of
  * an idle pane and is worth caching for much longer than an agent name is. */
 /* ---------------------------------------------------------------------------
- * One process snapshot per scheduler interval
+ * The members of one process group
  *
- * The group sweep behind session_find_interesting_pgrp_process() is
- * proc_listpids(PROC_ALL_PIDS) followed by a proc_pidinfo per pid — one full
- * sweep of every process on the machine. It is the fallback, but it is the
- * fallback for the ordinary case: an idle shell leader is not an agent, not a
- * versioned agent, not a wrapper and has no agent in its argv, so the group
- * sweep runs. Run PER PANE, a sweep that costs far more than the leader fast
- * path next to it is multiplied by the number of panes in a single frame.
- *
- * The pid->(pgid,name) table is the same for every pane asked in the same
- * instant, so it is taken ONCE and shared. The snapshot's own TTL is well under
- * the per-session TTL that gates these calls, so the worst extra staleness is a
- * fraction of an answer that was already 0.6 s old. */
-#define SESSION_PROC_SNAP_TTL 0.25
+ * An idle shell leader is not an agent, not a versioned agent, not a wrapper
+ * and has no agent in its argv, so the group is looked at whenever its answer
+ * is asked again. The macOS kernel lists a group's members itself
+ * (PROC_PGRP_ONLY): a proc_pidinfo for each member, not one for every
+ * process on the machine and a filter on its pgid. Both walk the kernel's
+ * process list in the same order, so the first member that answers is the
+ * same one. Linux has no such list: every /proc/<pid>/stat is read for its
+ * group. A group is rarely more than a pipeline; past the stack buffer the
+ * list is taken again on the heap. */
+#define SESSION_PGRP_STACK 64
 
-typedef struct {
-    pid_t pid;
-    pid_t pgid;
-    char  name[MAXCOMLEN + 1];
-} SessionProcRow;
+#ifdef PLATFORM_LINUX
+/* A process's accounting name and group, from /proc/<pid>/stat:
+ * `pid (comm) S ppid pgrp …`. comm can hold ") ", so the fixed fields start
+ * after the LAST ')'. False for a process that is gone or a zombie. */
+static bool session_proc_stat(pid_t pid, char *name, usize name_cap, pid_t *pgrp) {
+    char path[64], line[512];
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)pid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    ssize_t n;
+    do { n = read(fd, line, sizeof line - 1); } while (n < 0 && errno == EINTR);
+    close(fd);
+    if (n <= 0) return false;
+    line[n] = '\0';
+    char *lp = strchr(line, '(');
+    char *rp = strrchr(line, ')');
+    if (!lp || !rp || rp < lp || !rp[1]) return false;
+    char st = 0;
+    int ppid = 0, pg = 0;
+    if (sscanf(rp + 1, " %c %d %d", &st, &ppid, &pg) != 3) return false;
+    if (st == 'Z' || st == 'X' || st == 'x') return false;
+    if (name && name_cap) {
+        usize len = (usize)(rp - lp - 1);
+        if (len >= name_cap) len = name_cap - 1;
+        memcpy(name, lp + 1, len);
+        name[len] = '\0';
+    }
+    if (pgrp) *pgrp = (pid_t)pg;
+    return true;
+}
+#endif
 
-static SessionProcRow *g_proc_snap      = NULL;
-static i32             g_proc_snap_n    = 0;
-static i32             g_proc_snap_cap  = 0;
-static f64             g_proc_snap_at   = 0.0;
-/* Diagnostics: how many sweeps actually happened, and how much they cost.
+/* Diagnostics: how many group lookups ran, and how much they cost.
  * Main-thread only, like every caller of session_fg_process(). */
-static u64             g_proc_snap_sweeps = 0;
-static f64             g_proc_snap_secs   = 0.0;
+static u64 g_proc_scan_count = 0;
+static f64 g_proc_scan_secs  = 0.0;
 
 void session_proc_scan_stats(u64 *out_sweeps, f64 *out_seconds);
 void session_proc_scan_stats(u64 *out_sweeps, f64 *out_seconds) {
-    if (out_sweeps)  *out_sweeps  = g_proc_snap_sweeps;
-    if (out_seconds) *out_seconds = g_proc_snap_secs;
+    if (out_sweeps)  *out_sweeps  = g_proc_scan_count;
+    if (out_seconds) *out_seconds = g_proc_scan_secs;
 }
 
-/* Refresh the snapshot if it is older than its TTL. Returns false only when
- * there is nothing usable to read. */
-static bool session_proc_snapshot(void) {
-    f64 now = session_mono_now();
-    if (g_proc_snap && g_proc_snap_n > 0 &&
-        now - g_proc_snap_at < SESSION_PROC_SNAP_TTL) return true;
-
-    i32 bytes = proc_listpids(PROC_ALL_PIDS, 0, NULL, 0);
-    if (bytes <= 0) return g_proc_snap_n > 0;    /* keep the last good one */
-    pid_t *pids = (pid_t *)malloc((usize)bytes);
-    if (!pids) return g_proc_snap_n > 0;
-
-    i32 got = proc_listpids(PROC_ALL_PIDS, 0, pids, bytes);
-    i32 count = got > 0 ? got / (i32)sizeof(pid_t) : 0;
-    if (count > g_proc_snap_cap) {
-        i32 cap = count + count / 4 + 64;
-        SessionProcRow *rows = (SessionProcRow *)realloc(g_proc_snap,
-                                   (usize)cap * sizeof *rows);
-        if (!rows) { free(pids); return g_proc_snap_n > 0; }
-        g_proc_snap = rows;
-        g_proc_snap_cap = cap;
+/* The pids of process group `pgid`, in the kernel's list order. Returns the
+ * count; *out is `stack` or a heap block the caller frees. */
+#ifdef PLATFORM_LINUX
+static i32 session_pgrp_members(pid_t pgid, pid_t *stack, i32 stack_n, pid_t **out) {
+    *out = stack;
+    DIR *d = opendir("/proc");
+    if (!d) return 0;
+    pid_t *list = stack;
+    i32 cap = stack_n, n = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] < '1' || e->d_name[0] > '9') continue;
+        char *endp = NULL;
+        long pid = strtol(e->d_name, &endp, 10);
+        if (!endp || *endp || pid <= 0) continue;
+        pid_t pg = 0;
+        if (!session_proc_stat((pid_t)pid, NULL, 0, &pg) || pg != pgid) continue;
+        if (n == cap) {
+            pid_t *grown = (pid_t *)malloc((usize)cap * 2 * sizeof *grown);
+            if (!grown) break;
+            memcpy(grown, list, (usize)n * sizeof *list);
+            if (list != stack) free(list);
+            list = grown;
+            cap *= 2;
+        }
+        list[n++] = (pid_t)pid;
     }
-
-    i32 n = 0;
-    for (i32 i = 0; i < count && n < g_proc_snap_cap; i++) {
-        if (pids[i] <= 0) continue;
-        struct proc_bsdinfo bi;
-        if (proc_pidinfo(pids[i], PROC_PIDTBSDINFO, 0, &bi, sizeof bi)
-            != (i32)sizeof bi) continue;
-        if (!bi.pbi_name[0]) continue;
-        g_proc_snap[n].pid  = pids[i];
-        g_proc_snap[n].pgid = (pid_t)bi.pbi_pgid;
-        snprintf(g_proc_snap[n].name, sizeof g_proc_snap[n].name, "%s", bi.pbi_name);
-        n++;
-    }
-    free(pids);
-    g_proc_snap_n  = n;
-    g_proc_snap_at = now;
-    g_proc_snap_sweeps++;
-    g_proc_snap_secs += session_mono_now() - now;
-    return n > 0;
+    closedir(d);
+    *out = list;
+    return n;
 }
+#else
+static i32 session_pgrp_members(pid_t pgid, pid_t *stack, i32 stack_n, pid_t **out) {
+    *out = stack;
+    i32 got = proc_listpids(PROC_PGRP_ONLY, (uint32_t)pgid, stack,
+                            stack_n * (i32)sizeof(pid_t));
+    if (got <= 0) return 0;
+    i32 n = got / (i32)sizeof(pid_t);
+    if (n < stack_n) return n;
+    /* The buffer filled: the group may be larger. Ask for its size and take
+     * it whole, with room for members that appear in between. */
+    i32 bytes = proc_listpids(PROC_PGRP_ONLY, (uint32_t)pgid, NULL, 0);
+    if (bytes <= 0) return n;
+    bytes += 16 * (i32)sizeof(pid_t);
+    pid_t *heap = (pid_t *)malloc((usize)bytes);
+    if (!heap) return n;
+    got = proc_listpids(PROC_PGRP_ONLY, (uint32_t)pgid, heap, bytes);
+    if (got <= 0) { free(heap); return n; }
+    *out = heap;
+    return got / (i32)sizeof(pid_t);
+}
+#endif
 
 static bool session_find_interesting_pgrp_process(pid_t pgid,
                                                   const char *leader,
@@ -501,48 +576,63 @@ static bool session_find_interesting_pgrp_process(pid_t pgid,
     out[0] = '\0';
     if (pgid <= 0) return false;
 
-    if (!session_proc_snapshot()) return false;
-    i32 count = g_proc_snap_n;
+    f64 t0 = session_mono_now();
+    pid_t stack[SESSION_PGRP_STACK];
+    pid_t *members = NULL;
+    i32 count = session_pgrp_members(pgid, stack, SESSION_PGRP_STACK, &members);
     char fallback[256] = {0};
+    bool hit = false;
 
-    for (i32 i = 0; i < count; i++) {
-        const SessionProcRow *row = &g_proc_snap[i];
-        if (row->pgid != pgid) continue;
-        /* The snapshot row under the names of proc_pidinfo's fields
-         * (`bi.pbi_name`), which the body below reads. */
-        struct { const char *pbi_name; } bi = { row->name };
-        pid_t pids_i = row->pid;
+    for (i32 i = 0; i < count && !hit; i++) {
+        pid_t pids_i = members[i];
+        if (pids_i <= 0) continue;
+        char name[64];
+#ifdef PLATFORM_MACOS
+        struct proc_bsdinfo bi;
+        if (proc_pidinfo(pids_i, PROC_PIDTBSDINFO, 0, &bi, sizeof bi)
+            != (i32)sizeof bi) continue;
+        /* A member that changed group since the list was taken. */
+        if ((pid_t)bi.pbi_pgid != pgid || !bi.pbi_name[0]) continue;
+        snprintf(name, sizeof name, "%s", bi.pbi_name);
+#else
+        pid_t member_pgid = 0;
+        if (!session_proc_stat(pids_i, name, sizeof name, &member_pgid)) continue;
+        if (member_pgid != pgid || !name[0]) continue;
+#endif
 
-        if (session_proc_name_is_agent(bi.pbi_name)) {
-            snprintf(out, out_cap, "%s", bi.pbi_name);
-            if (out_found_agent) *out_found_agent = true;
-            return true;
-        }
-        /* Versioned native binary (e.g. grok's "grok-0.2.22-macos-aarch64").
-         * Recover the leading agent id before falling through to wrapper/argv. */
-        if (session_proc_name_versioned_agent(bi.pbi_name, out, out_cap)) {
-            if (out_found_agent) *out_found_agent = true;
-            return true;
-        }
-        if (session_proc_name_is_wrapper(bi.pbi_name)) {
+        if (session_proc_name_is_agent(name)) {
+            snprintf(out, out_cap, "%s", name);
+            hit = true;
+        } else if (session_proc_name_versioned_agent(name, out, out_cap)) {
+            /* Versioned native binary (e.g. grok's "grok-0.2.22-macos-aarch64"):
+             * the leading agent id, before wrapper/argv. */
+            hit = true;
+        } else if (session_proc_name_is_wrapper(name)) {
             /* node/bun/python interpreter → inspect its argv for the script. */
-            if (session_proc_argv_agent(pids_i, out, out_cap)) {
-                if (out_found_agent) *out_found_agent = true;
-                return true;
-            }
+            hit = session_proc_argv_agent(pids_i, out, out_cap);
         } else {
             /* Opaque name (e.g. a Bun-compiled CLI re-exec'd as its bare
              * version string, like Claude Code's "2.1.150") → recover the
-             * agent from the executable path before treating it as fallback. */
-            if (session_proc_path_agent(pids_i, out, out_cap)) {
-                if (out_found_agent) *out_found_agent = true;
-                return true;
-            }
-            if (!fallback[0])
-                snprintf(fallback, sizeof fallback, "%s", bi.pbi_name);
+             * agent from the executable path before treating it as fallback.
+             * A retitled process's accounting name is its title, which only
+             * argv carries whole ("Kimi Code"). */
+            hit = session_proc_path_agent(pids_i, out, out_cap);
+#ifdef PLATFORM_LINUX
+            if (!hit) hit = session_proc_argv_agent(pids_i, out, out_cap);
+#endif
+            if (!hit && !fallback[0])
+                snprintf(fallback, sizeof fallback, "%s", name);
         }
     }
+    if (members != stack) free(members);
+    g_proc_scan_count++;
+    g_proc_scan_secs += session_mono_now() - t0;
 
+    if (hit) {
+        if (out_found_agent) *out_found_agent = true;
+        return true;
+    }
+    out[0] = '\0';
     if (fallback[0]) {
         snprintf(out, out_cap, "%s", fallback);
         return true;
@@ -553,9 +643,29 @@ static bool session_find_interesting_pgrp_process(pid_t pgid,
     }
     return false;
 }
-#else  /* !PLATFORM_MACOS */
 
-/* The snapshot only exists on the macOS process-probing path. */
+#ifdef LIU_AGENT_ARGV_PROBE
+bool session_pgrp_probe_for_bench(i32 pgid, const char *leader,
+                                  char *out, usize out_cap, bool *found_agent) {
+    return session_find_interesting_pgrp_process((pid_t)pgid, leader, out, out_cap,
+                                                 found_agent);
+}
+#endif
+
+#ifdef PLATFORM_LINUX
+/* An interactive shell's accounting name. A pane whose own shell leads the
+ * foreground group is at its prompt: with job control every command it runs
+ * gets a group of its own, so there is nobody else in this one to look for. */
+static bool session_proc_name_is_shell(const char *name) {
+    static const char *const shells[] = { "zsh", "bash", "fish", "sh", "dash", "ksh", "tcsh" };
+    for (usize i = 0; i < sizeof shells / sizeof shells[0]; i++)
+        if (strcmp(name, shells[i]) == 0) return true;
+    return false;
+}
+#endif
+#else  /* neither macOS nor Linux */
+
+/* Group lookups exist only where processes are probed. */
 void session_proc_scan_stats(u64 *out_sweeps, f64 *out_seconds);
 void session_proc_scan_stats(u64 *out_sweeps, f64 *out_seconds) {
     if (out_sweeps)  *out_sweeps  = 0;
@@ -1022,6 +1132,10 @@ struct Session {
     LinkState       link;
     char            link_reason[256];   /* why the link last went down, kept across the reconnect */
     char            auth_refused[256];  /* the server's refusal of the last credential offered (connect worker) */
+    const char     *auth_asked;         /* session_auth_asked(): a literal, under status_lock */
+    bool            auth_dismissed;     /* the person dismissed Liu's password dialog (connect worker) */
+    char            asked_password[256]; /* typed into Liu's password dialog and taken: the connect
+                                          * worker's alone (a reconnect offers it again); scrubbed on destroy */
 
     /* Workers keep cached SFTP handles alive via the suspend count. Each
      * libssh2 call owns io_lock; SFTP operation state additionally remains
@@ -1083,6 +1197,7 @@ struct Session {
     bool            auth_peer_is_target;    /* false while a jump host is being authenticated to */
     char            kbi_name[256];
     char            kbi_instruction[512];
+    bool            kbi_liu;                /* the question is Liu's own (a password it asks for), not the server's */
     i32             kbi_num_prompts;
     char          (*kbi_prompts)[256];     /* heap [KBI_MAX_PROMPTS][256] */
     bool            kbi_echo[KBI_MAX_PROMPTS];
@@ -1437,6 +1552,7 @@ static LIBSSH2_USERAUTH_KBDINT_RESPONSE_FUNC(ssh_kbdint_callback) {
     kbi_text_copy(s->kbi_name, sizeof s->kbi_name, name, name_len);
     kbi_text_copy(s->kbi_instruction, sizeof s->kbi_instruction, instruction, instruction_len);
     snprintf(s->kbi_peer, sizeof s->kbi_peer, "%s", s->auth_peer);
+    s->kbi_liu = false;
 
     i32 count = (num_prompts > KBI_MAX_PROMPTS) ? KBI_MAX_PROMPTS : num_prompts;
     s->kbi_num_prompts = count;
@@ -1504,10 +1620,123 @@ static LIBSSH2_USERAUTH_KBDINT_RESPONSE_FUNC(ssh_kbdint_callback) {
     pthread_mutex_unlock(&s->kbi_lock);
 }
 
+static void ssh_auth_asked_set(Session *s, const char *how) {
+    pthread_mutex_lock(&s->status_lock);
+    s->auth_asked = how;
+    pthread_mutex_unlock(&s->status_lock);
+}
+
+const char *session_auth_asked(Session *s) {
+    if (!s || s->type != SESSION_SSH) return "";
+    pthread_mutex_lock(&s->status_lock);
+    const char *how = s->auth_asked ? s->auth_asked : "";
+    pthread_mutex_unlock(&s->status_lock);
+    return how;
+}
+
+/* One password asked of the person through the prompt dialog the server's
+ * questions use, marked as Liu's own so the dialog names it so. `note` is the
+ * line above the field. False when it was dismissed or left empty, or the
+ * connect is being stopped. Blocks the connect worker until answered. */
+static bool ssh_ask_password_dialog(Session *s, const char *note, char *out, usize cap) {
+    out[0] = '\0';
+    pthread_mutex_lock(&s->kbi_lock);
+    if (!s->kbi_prompts) s->kbi_prompts = calloc(KBI_MAX_PROMPTS, sizeof(*s->kbi_prompts));
+    if (!s->kbi_responses) s->kbi_responses = calloc(KBI_MAX_PROMPTS, sizeof(*s->kbi_responses));
+    if (!s->kbi_prompts || !s->kbi_responses) {
+        pthread_mutex_unlock(&s->kbi_lock);
+        return false;
+    }
+    s->kbi_name[0] = '\0';
+    snprintf(s->kbi_instruction, sizeof s->kbi_instruction, "%s", note ? note : "");
+    snprintf(s->kbi_peer, sizeof s->kbi_peer, "%s", s->auth_peer);
+    s->kbi_liu = true;
+    snprintf(s->kbi_prompts[0], sizeof s->kbi_prompts[0], "Password:");
+    s->kbi_echo[0] = false;
+    s->kbi_responses[0][0] = '\0';
+    s->kbi_num_prompts = 1;
+    s->kbi_ready = false;
+
+    pthread_mutex_lock(&s->status_lock);
+    s->status = SESSION_KBI_PENDING;
+    pthread_mutex_unlock(&s->status_lock);
+    session_notify_main();
+    while (!s->kbi_ready)
+        pthread_cond_wait(&s->kbi_cond, &s->kbi_lock);
+    pthread_mutex_lock(&s->status_lock);
+    s->status = SESSION_AUTHENTICATING;
+    pthread_mutex_unlock(&s->status_lock);
+
+    snprintf(out, cap, "%s", s->kbi_responses[0]);
+    secure_zero(s->kbi_responses[0], sizeof s->kbi_responses[0]);
+    s->kbi_liu = false;
+    pthread_mutex_unlock(&s->kbi_lock);
+    if (atomic_load_explicit(&s->connect_cancel, memory_order_acquire)) {
+        secure_zero(out, cap);
+        return false;
+    }
+    return out[0] != '\0';
+}
+
+/* The password method with what the person types, up to three times as ssh
+ * allows. `refused`: a password was already turned down, and the dialog says
+ * so. What got in is kept for this session's reconnects. */
+static int ssh_auth_ask_password(Session *s, const SSHConfig *config, bool refused) {
+    int rc = -1;
+    for (int tries = 0; tries < 3; tries++) {
+        char pw[256];
+        const char *note = (refused || tries) ? "That password was not accepted." : "";
+        if (!ssh_ask_password_dialog(s, note, pw, sizeof pw)) {
+            s->auth_dismissed = true;
+            return -1;
+        }
+        rc = libssh2_userauth_password(s->ssh_session, config->username, pw);
+        if (rc == 0) {
+            snprintf(s->asked_password, sizeof s->asked_password, "%s", pw);
+            ssh_auth_asked_set(s, "password");
+        }
+        secure_zero(pw, sizeof pw);
+        if (rc != LIBSSH2_ERROR_AUTHENTICATION_FAILED) break;
+    }
+    return rc;
+}
+
+/* Nothing Liu offered got in and it was given no password
+ * (SSHConfig.ask_password): ask the person what the server takes
+ * (ssh/auth_second_factor.h ssh_auth_ask_for). A password asked for on an
+ * earlier connect of this session is offered first. `offered`: the server's
+ * list of methods. */
+static int ssh_auth_ask(Session *s, const SSHConfig *config, const char *offered, int auth_rc) {
+    switch (ssh_auth_ask_for(offered)) {
+    case SSH_ASK_SERVER_PROMPT: {
+        ssh_wait_unbounded(s->ssh_session);    /* a person is answering */
+        int rc = libssh2_userauth_keyboard_interactive(s->ssh_session, config->username,
+                                                       &ssh_kbdint_callback);
+        if (rc == 0) ssh_auth_asked_set(s, "password");
+        return rc;
+    }
+    case SSH_ASK_PASSWORD:
+        if (s->asked_password[0]) {
+            if (libssh2_userauth_password(s->ssh_session, config->username, s->asked_password) == 0) {
+                ssh_auth_asked_set(s, "password");
+                return 0;
+            }
+            secure_zero(s->asked_password, sizeof s->asked_password);
+            return ssh_auth_ask_password(s, config, true);
+        }
+        return ssh_auth_ask_password(s, config, false);
+    case SSH_ASK_NOTHING:
+        break;
+    }
+    return auth_rc;
+}
+
 /* The key was taken but the server wants a second step (ssh/auth_second_factor.h):
  * ask what it still accepts and give it that — its own prompt through the
- * keyboard-interactive dialog, or the stored password. Returns libssh2's
- * answer, or the failure it was called with when nothing is left to try. */
+ * keyboard-interactive dialog, or the stored password. When the key was not
+ * one named for the host and no password was given, the person is asked
+ * (ssh_auth_ask). Returns libssh2's answer, or the failure it was called with
+ * when nothing is left to try. */
 static int ssh_auth_second_step(Session *s, const SSHConfig *config, int auth_rc) {
     s->auth_refused[0] = '\0';
     if (auth_rc == 0 || libssh2_userauth_authenticated(s->ssh_session)) return 0;
@@ -1528,6 +1757,8 @@ static int ssh_auth_second_step(Session *s, const SSHConfig *config, int auth_rc
     case SSH_SECOND_FACTOR_NONE:
         break;
     }
+    if (config->ask_password && !config->password[0] && !libssh2_userauth_authenticated(s->ssh_session))
+        return ssh_auth_ask(s, config, rest, auth_rc);
     return auth_rc;
 }
 
@@ -1682,7 +1913,20 @@ static void ssh_offer_algorithms(LIBSSH2_SESSION *ssh, const char *host, i32 por
     known_hosts_stored_kinds(ssh, host, port, stored);
     if (ssh_algs_hostkey_list(stored, legacy, list, sizeof list))
         (void)libssh2_session_method_pref(ssh, LIBSSH2_METHOD_HOSTKEY, list);
-    if (ssh_algs_list(SSH_ALGS_KEX, SSH_ALGS_KEX_LEGACY, legacy, list, sizeof list))
+    /* The markers first, where the running library does not add them
+     * itself: the library is the system's on Linux, not the one built
+     * against. */
+    unsigned long have = 0;
+    const char *vs = libssh2_version(0);
+    if (vs) {
+        unsigned long maj = 0, min = 0, pat = 0;
+        if (sscanf(vs, "%lu.%lu.%lu", &maj, &min, &pat) >= 2) have = (maj << 16) | (min << 8) | pat;
+    }
+    list[0] = '\0';
+    char kex[sizeof list];
+    if (ssh_algs_list(SSH_ALGS_KEX, SSH_ALGS_KEX_LEGACY, legacy, kex, sizeof kex) &&
+        ssh_algs_append(list, sizeof list, ssh_algs_kex_markers(have)) &&
+        ssh_algs_append(list, sizeof list, kex))
         (void)libssh2_session_method_pref(ssh, LIBSSH2_METHOD_KEX, list);
     if (ssh_algs_list(SSH_ALGS_CIPHER, SSH_ALGS_CIPHER_LEGACY, legacy, list, sizeof list)) {
         (void)libssh2_session_method_pref(ssh, LIBSSH2_METHOD_CRYPT_CS, list);
@@ -3111,6 +3355,7 @@ static int ssh_do_connect(Session *s) {
 
     int auth_rc = -1;
     s->auth_refused[0] = '\0';
+    s->auth_dismissed = false;
 
     /* GSSAPI: when gssapi_auth flag is set OR auth_method is AUTH_GSSAPI,
      * try methods in order: agent -> keyboard-interactive (GSSAPI fallback)
@@ -3177,24 +3422,36 @@ static int ssh_do_connect(Session *s) {
     } else {
         /* Standard auth paths */
         switch (config->auth_method) {
-        case AUTH_PASSWORD:
-            /* Attempt password auth if a password is set; then always fall
-             * back to keyboard-interactive on failure. The fallback is
-             * unconditional so that a Recent-row reconnect with an empty
-             * password field still gets a KBI prompt callback fired, which
-             * the UI layer maps to the kbi_dialog overlay. */
-            if (config->password[0]) {
+        case AUTH_PASSWORD: {
+            /* The password given (the form, a vault secret) or, on a
+             * reconnect, the one the person was asked for; then the server's
+             * own prompt (keyboard-interactive), tried even with no password
+             * so a host that asks its own question gets the dialog; then,
+             * where the server takes passwords but asks nothing itself (no
+             * keyboard-interactive on its list), Liu's password dialog. */
+            const char *pw = config->password[0] ? config->password : s->asked_password;
+            bool refused = false;
+            if (pw[0]) {
                 auth_rc = libssh2_userauth_password(s->ssh_session,
-                                                    config->username,
-                                                    config->password);
+                                                    config->username, pw);
+                refused = auth_rc != 0;
+                if (auth_rc == 0 && pw == s->asked_password) ssh_auth_asked_set(s, "password");
             } else {
                 auth_rc = -1;  /* force KBI path */
             }
             if (auth_rc != 0) {
                 auth_rc = libssh2_userauth_keyboard_interactive(
                     s->ssh_session, config->username, &ssh_kbdint_callback);
+                if (auth_rc == 0 && !config->password[0]) ssh_auth_asked_set(s, "password");
+            }
+            if (auth_rc != 0 && !libssh2_userauth_authenticated(s->ssh_session) &&
+                ssh_auth_ask_for(auth_list) == SSH_ASK_PASSWORD) {
+                if (refused && pw == s->asked_password)
+                    secure_zero(s->asked_password, sizeof s->asked_password);
+                auth_rc = ssh_auth_ask_password(s, config, refused);
             }
             break;
+        }
         case AUTH_PUBLICKEY: {
             char pub_path[520];
             snprintf(pub_path, sizeof(pub_path), "%s.pub", config->key_path);
@@ -3343,7 +3600,10 @@ static int ssh_do_connect(Session *s) {
     if (auth_rc != 0) {
         char *errmsg = NULL;
         libssh2_session_last_error(s->ssh_session, &errmsg, NULL, 0);
-        set_error(s, errmsg && errmsg[0] ? errmsg :
+        /* A password dialog the person dismissed is why, whatever libssh2
+         * said of the attempt before it. */
+        set_error(s, s->auth_dismissed ? "No password was given" :
+                     errmsg && errmsg[0] ? errmsg :
                      s->auth_refused[0] ? s->auth_refused : "Authentication failed");
         return -1;
     }
@@ -4109,6 +4369,7 @@ static void session_destroy_final(Session *s) {
         free(s->kbi_responses);
         s->kbi_responses = NULL;
     }
+    secure_zero(s->asked_password, sizeof s->asked_password);
     free(s->kbi_prompts);
     s->kbi_prompts = NULL;
     free(s->initial_cwd);
@@ -5597,6 +5858,15 @@ i32 session_fg_pid(Session *s) {
     return fg > 0 ? (i32)fg : -1;
 }
 
+i32 session_fg_pid_cached(Session *s) {
+    if (!s || s->type != SESSION_LOCAL || s->status != SESSION_CONNECTED) return -1;
+    if (s->pty_master < 0) return -1;
+    if (!local_reader_requests(s)) return session_fg_pid(s);
+    i32 pg = pty_reader_fg_pgid(s->reader);
+    if (pg == 0) return session_fg_pid(s);      /* never sampled yet: ask, this once */
+    return pg > 0 ? pg : -1;
+}
+
 /* ---- background jobs behind the prompt ----------------------------------
  *
  * session_fg_pid() vs session_shell_pgid() answers "does a job own the
@@ -5725,6 +5995,15 @@ void session_invalidate_fg_cache(Session *s) {
 }
 
 const char *session_fg_process_cached(Session *s) {
+#ifdef PLATFORM_LINUX
+    /* At a shell prompt Linux's lookup is two small /proc reads (the shell's
+     * own group is not swept), and session_fg_process keeps its answer for the
+     * TTL: as cheap as the cache, and never stale. The cache is refreshed only
+     * by the agent probes, which on a slow or busy machine come less often
+     * than its 0.6 s lifetime: a shell read as nothing switched the suggestion
+     * off in the middle of a word. */
+    return session_fg_process(s);
+#else
     if (!s || s->type != SESSION_LOCAL || s->status != SESSION_CONNECTED ||
         s->fg_cache_at <= 0 || !s->fg_cache[0]) return "";
     pid_t fg = local_fg_pgrp(s);
@@ -5734,6 +6013,7 @@ const char *session_fg_process_cached(Session *s) {
     f64 now = (f64)ts.tv_sec + (f64)ts.tv_nsec / 1e9;
     f64 ttl = s->fg_cache_ttl > 0 ? s->fg_cache_ttl : SESSION_FG_TTL_BASE;
     return now - s->fg_cache_at < ttl ? s->fg_cache : "";
+#endif
 }
 
 const char *session_fg_process(Session *s) {
@@ -5814,21 +6094,41 @@ const char *session_fg_process(Session *s) {
     }
 #elif defined(PLATFORM_LINUX)
     if (fg > 0) {
-        char path[64];
-        snprintf(path, sizeof(path), "/proc/%d/comm", fg);
-        FILE *f = fopen(path, "r");
-        if (f) {
-            if (fgets(s->fg_cache, sizeof s->fg_cache, f)) {
-                char *nl = strchr(s->fg_cache, '\n');
-                if (nl) *nl = '\0';
+        /* The same rungs as macOS, read from /proc. The leader's name is its
+         * comm: a script's own name until it execs its interpreter, then the
+         * interpreter's ("node", "python3") or the title it set itself. */
+        char leader[64] = {0};
+        pid_t leader_pgid = 0;
+        if (session_proc_stat(fg, leader, sizeof leader, &leader_pgid) && leader[0]) {
+            char picked[64] = {0};
+            if (session_proc_name_is_agent(leader)) {
+                snprintf(s->fg_cache, sizeof s->fg_cache, "%s", leader);
+                found_agent = true;
+            } else if (session_proc_name_versioned_agent(leader, picked, sizeof picked)) {
+                snprintf(s->fg_cache, sizeof s->fg_cache, "%s", picked);
+                found_agent = true;
+            } else if (!session_proc_name_is_wrapper(leader) &&
+                       session_proc_path_agent(fg, picked, sizeof picked)) {
+                snprintf(s->fg_cache, sizeof s->fg_cache, "%s", picked);
+                found_agent = true;
+            } else if (session_proc_argv_agent(fg, picked, sizeof picked)) {
+                snprintf(s->fg_cache, sizeof s->fg_cache, "%s", picked);
+                found_agent = true;
             }
-            fclose(f);
+        }
+        if (s->fg_cache[0] == '\0') {
+            if (fg == s->child_pid && session_proc_name_is_shell(leader))
+                snprintf(s->fg_cache, sizeof s->fg_cache, "%s", leader);
+            else
+                (void)session_find_interesting_pgrp_process(fg, leader,
+                                                            s->fg_cache, sizeof s->fg_cache,
+                                                            &found_agent);
         }
     }
 #endif
-#ifdef PLATFORM_MACOS
-    /* Backoff is a macOS concern: only that path can fall into the full-system
-     * pid sweep. Linux reads one /proc/<pid>/comm — nothing worth deferring.
+#if defined(PLATFORM_MACOS) || defined(PLATFORM_LINUX)
+    /* Backoff: a lookup that finds no agent can fall into the group sweep
+     * (every pid on macOS, every /proc/<pid>/stat on Linux).
      *
      * An agent answer is worth re-checking often: it can exit within its own
      * process group (the pgid alone would not show it). A no-agent answer for a
@@ -6505,6 +6805,14 @@ bool session_kbi_echo(Session *s, i32 index) {
     return s->kbi_echo[index];
 }
 
+bool session_kbi_is_liu(Session *s) {
+    if (!s || s->type != SESSION_SSH) return false;
+    pthread_mutex_lock(&s->kbi_lock);
+    bool liu = s->kbi_liu;
+    pthread_mutex_unlock(&s->kbi_lock);
+    return liu;
+}
+
 void session_kbi_submit(Session *s, const char **responses, i32 count) {
     if (!s || s->type != SESSION_SSH || count < 0 ||
         (count > 0 && !responses)) return;
@@ -6529,6 +6837,13 @@ void session_kbi_submit(Session *s, const char **responses, i32 count) {
         }
     }
     s->kbi_ready = true;
+    /* Answered: the question is no longer pending, said under the lock the
+     * loop reads it through. Left to the connect worker, the loop could see it
+     * still pending before the worker woke and open the dialog again, empty,
+     * over a session that then logged in. */
+    pthread_mutex_lock(&s->status_lock);
+    if (s->status == SESSION_KBI_PENDING) s->status = SESSION_AUTHENTICATING;
+    pthread_mutex_unlock(&s->status_lock);
     pthread_cond_signal(&s->kbi_cond);
     pthread_mutex_unlock(&s->kbi_lock);
 }

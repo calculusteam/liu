@@ -20,6 +20,7 @@
 #include "agentctl/agentctl_delegated.h"
 #include "agentctl/agentctl_proto.h"
 #include "agentctl/agentctl_ring.h"
+#include "core/spawn_fds.h"
 #include "agentctl/agentctl_stream.h"
 #include "agentctl/agentctl_team.h"
 #include "agentctl/agentctl_watch.h"
@@ -1811,19 +1812,13 @@ static bool known_has(const char *path) {
 }
 
 static bool watch_ignored(const char *path) {
-    static const char *const names[] = {
-        ".git", "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".next",
-        ".turbo", ".parcel-cache", ".gradle", "DerivedData", ".venv", ".idea", ".DS_Store", "4913",
-        "Library", ".cache", ".Trash",
-    };
     const char *p = path;
     while (*p) {
         while (*p == '/') p++;
         if (!*p) break;
         const char *e = strchr(p, '/');
         usize len = e ? (usize)(e - p) : strlen(p);
-        for (usize i = 0; i < sizeof names / sizeof names[0]; i++)
-            if (strlen(names[i]) == len && !strncmp(p, names[i], len)) return true;
+        if (agentctl_watch_skip_name(p, len)) return true;
         if (!e) {
             /* the file itself: an editor's swap, backup or lock file */
             if ((len > 1 && p[len - 1] == '~') || !strncmp(p, ".#", 2)) return true;
@@ -2493,7 +2488,10 @@ static pid_t spawn_runner(u32 id) {
     envp[e++] = sock_e;
     if (g_helpers[0]) envp[e++] = helpers_e;
     envp[e] = NULL;
-    char *argv[] = { (char *)"liu-agent", (char *)"run", NULL };
+    /* The role by argument, not by argv[0]: a binfmt interpreter (an x86-64
+     * binary on another architecture) hands the program its full path as
+     * argv[0], and a runner started as `liu-agent` then took no role. */
+    char *argv[] = { (char *)"liu-notify", (char *)"agent", (char *)"run", NULL };
 
     posix_spawn_file_actions_t fa;
     posix_spawnattr_t attr;
@@ -2506,9 +2504,7 @@ static pid_t spawn_runner(u32 id) {
     sigemptyset(&none);
     sigfillset(&all);
     short flags = POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK;
-#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
-    flags |= POSIX_SPAWN_CLOEXEC_DEFAULT;
-#endif
+    spawn_fds_only_stdio(&fa, &flags);
     posix_spawnattr_setflags(&attr, flags);
     posix_spawnattr_setpgroup(&attr, 0);
     posix_spawnattr_setsigdefault(&attr, &all);
@@ -3813,7 +3809,9 @@ bool agentctl_start(void (*wake)(void)) {
     if (g_running) return true;
     g_wake_main = wake;
     for (i32 i = 0; i < AGENTCTL_MAX_CONNS; i++) { memset(&g_conns[i], 0, sizeof g_conns[i]); g_conns[i].fd = -1; }
-    for (i32 i = 0; i < AGENTCTL_MAX_JOBS; i++) g_jobs[i].runner = -1;
+    /* A free job slot (id 0) is never asked for its runner, and every path
+     * that takes one sets `runner = -1` itself: the table is left untouched
+     * here, so its ~36 KB slots stay untouched pages until a job uses one. */
 
     char dir[256];
     if (!notify_run_dir(dir, sizeof dir)) return false;
@@ -4190,12 +4188,6 @@ i32 agentctl_pane_trust(u64 pane) {
     i32 t = trust_of(pane);
     pthread_mutex_unlock(&g_mu);
     return t;
-}
-
-void agentctl_pane_untrust(u64 pane) {
-    pthread_mutex_lock(&g_mu);
-    for (i32 i = 0; i < AGT_TRUST_MAX; i++) if (g_trust[i].pane == pane) memset(&g_trust[i], 0, sizeof g_trust[i]);
-    pthread_mutex_unlock(&g_mu);
 }
 
 bool agentctl_tool_answer(u32 job, const char *decision) {

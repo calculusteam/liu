@@ -967,7 +967,6 @@ void fb_render_viewer(FileBrowser *fb, Renderer *r, f32 x, f32 y, f32 w, f32 h,
                       f32 hover_x, f32 hover_y);
 
 /* Input */
-bool fb_handle_click(FileBrowser *fb, f32 rel_x, f32 rel_y, f32 w, f32 h, f32 dpi);
 void fb_handle_scroll(FileBrowser *fb, f32 dy, bool precise);
 /* The height, in framebuffer pixels, of one line of the view that scrolls by
  * line (the code editor's cell, the Markdown live editor's body line) as the
@@ -1051,12 +1050,10 @@ void fb_viewer_toggle(FileBrowser *fb);
 bool fb_path_is_svg(const char *path);
 
 /* Document outline (markdown headings, populated each render). Count is 0 when
- * not viewing markdown or the doc has no headings. `fb_md_outline_get` copies
- * the heading label into `out` (nul-terminated) and returns its level (1..6),
- * or 0 if `idx` is out of range. `fb_md_scroll_to_heading` scrolls the viewer
- * so heading `idx` sits at the top (clamped to the content bounds). */
+ * not viewing markdown or the doc has no headings. `fb_md_scroll_to_heading`
+ * scrolls the viewer so heading `idx` sits at the top (clamped to the content
+ * bounds). */
 u32  fb_md_outline_count(const FileBrowser *fb);
-u8   fb_md_outline_get(const FileBrowser *fb, u32 idx, char *out, usize out_cap);
 void fb_md_scroll_to_heading(FileBrowser *fb, u32 idx);
 
 /* If a code-block Copy button is under (vx,vy), return its code text (pointer
@@ -1072,7 +1069,6 @@ bool fb_md_hit_copy(const FileBrowser *fb, f32 vx, f32 vy,
 
 /* Helpers */
 const char *fb_format_size(u64 bytes);
-const char *fb_file_icon(const char *name, bool is_dir);
 FileViewMode fb_detect_mode(const char *filename);
 
 /* The file-type icon, as ONE thing drawn in two places — the explorer row and
@@ -1104,10 +1100,9 @@ f32  fb_file_icon_ink_left(FbFileIcon icon, f32 size);
 void fb_file_icon_draw(Renderer *r, FbFileIcon icon, f32 x, f32 y,
                        f32 size, Color tint);
 
-/* Editor status-bar labels. Both return static/interned strings — copy before
- * the next call if you need to hold on to them. */
+/* Editor status-bar label: a static/interned string — copy it before the
+ * next call if you need to hold on to it. */
 const char *fb_language_label(const char *path);          /* "C", "Python", … */
-const char *fb_eol_label(const char *content, usize len); /* "LF" / "CRLF" */
 void fb_entry_path(const FileBrowser *fb, const FileEntry *entry, char *out, usize out_size);
 
 /* Editor operations */
@@ -1264,8 +1259,6 @@ void fb_editor_goto_doc_end(FileBrowser *fb);
  * than the 512 KiB a thread gets by default on macOS. */
 #define FB_PASTE_WORKER_STACK ((usize)4 << 20)
 
-bool fb_download_file(FileBrowser *fb, i32 index, const char *local_dir);
-bool fb_upload_file(FileBrowser *fb, const char *local_path);
 bool fb_delete_file(FileBrowser *fb, i32 index);
 bool fb_mkdir(FileBrowser *fb, const char *name);
 bool fb_create_file(FileBrowser *fb, const char *name);
@@ -1284,7 +1277,7 @@ bool fb_copy_local(const char *src, const char *dst);
 /* File clipboard entry — one source file/dir registered via Cmd+C/X.
  * Source may live in a different FileBrowser instance than the paste target
  * (e.g. cut from SFTP tab A, paste into SFTP tab B, or into a local tab).
- * `session` is opaque; fb_paste reopens the SFTP scope as needed. */
+ * `session` is opaque; a paste reopens the SFTP scope as needed. */
 typedef struct FileClipboardItem {
     FileBrowserSource  source;
     char               path[FB_MAX_PATH * 2];  /* absolute source path */
@@ -1313,13 +1306,7 @@ typedef struct FileClipboard {
     FileClipboardItem *items;
 } FileClipboard;
 
-/* Paste every item in `clip` into `dst_fb->cwd`.
- * Handles all 4 source×dest combos (local/sftp × local/sftp) and recurses
- * into directories on cross-source transfers. After a successful cut-paste
- * every source item is removed. Returns true when all items succeed. */
-bool fb_paste(FileBrowser *dst_fb, const FileClipboard *clip);
-
-/* Paste a single item — used internally by fb_paste and by the drag-drop
+/* Paste a single item — used by the paste and by the drag-drop
  * handler (which builds an item on the fly from an entry). True only when the
  * whole item landed; fb_paste_item_report says which kind of "no" it was. */
 bool fb_paste_item(FileBrowser *dst_fb, const FileClipboardItem *item, bool is_cut);

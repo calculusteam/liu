@@ -197,8 +197,6 @@ WhisperCpu *whisper_cpu_create(const WhisperWeights *w, i32 n_threads,
     return c;
 }
 
-const f32 *whisper_cpu_encoder_out(const WhisperCpu *c) { return c ? c->enc : NULL; }
-
 void whisper_cpu_decode_reset(WhisperCpu *c) { if (c) c->kv_len = 0; }
 
 /* ========================================================================

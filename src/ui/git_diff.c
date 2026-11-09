@@ -942,10 +942,6 @@ static void gd_release(GitDiffView *v) {
  * View state
  * ========================================================================= */
 
-bool git_diff_is_open(const AppState *app) {
-    return app && app->git_diff.open;
-}
-
 void git_diff_close(AppState *app) {
     if (!app) return;
     app->git_diff.open = false;

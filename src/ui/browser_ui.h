@@ -31,6 +31,11 @@ void browser_ui_render(struct AppState *app, f32 ox, f32 oy, f32 w, f32 h);
 void browser_apply_visibility_and_frame(struct AppState *app,
                                         struct PlatformWindow *window);
 
+/* The floating notices drawn over the active tab's page, handed to it as holes
+ * to be seen through (browser_native_set_holes); none when it is not shown.
+ * Called after the notices are placed for the frame. */
+void app_browser_notice_holes(struct AppState *app);
+
 /* Per-frame poll of native state. Returns true if UI should redraw. */
 bool app_browser_tick(struct AppState *app);
 

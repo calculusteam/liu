@@ -382,6 +382,8 @@ typedef struct {
     bool    agent_subagent_tabs;           /* the subagents an agent in a pane starts itself (Claude Code's
                                             * Agent tool, Codex's spawned agents…) are shown as job tabs
                                             * beside its tab, read from the agent's own store (default ON) */
+    bool    agent_diagrams;                /* a Mermaid block an agent prints is drawn as its diagram over
+                                            * the rows its source took (ui/agent_diagram.h, default ON) */
     u8      agent_jobs_fold;               /* AgcFoldPolicy: when a tab's job tabs start folded into their
                                             * count chip — 0 auto (past what fits), 1 always, 2 never */
     bool    cursor_blink;

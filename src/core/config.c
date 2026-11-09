@@ -1097,6 +1097,7 @@ AppConfig config_default(void) {
     c.agent_orchestration_notice_seen = false;
     c.agent_orchestration_guard = true;
     c.agent_subagent_tabs = true;
+    c.agent_diagrams = true;
     c.agent_jobs_fold = 0;
     c.agent_orchestration_ask_tools = true;
     c.agent_orchestration_keep = true;
@@ -2032,6 +2033,7 @@ bool config_load(AppConfig *cfg, const char *filepath) {
             else if (strcmp(key, "agent_orchestration_ask_tools") == 0) cfg->agent_orchestration_ask_tools = strcmp(val, "true") == 0;
             else if (strcmp(key, "agent_orchestration_keep") == 0) cfg->agent_orchestration_keep = strcmp(val, "true") == 0;
             else if (strcmp(key, "agent_subagent_tabs") == 0) cfg->agent_subagent_tabs = strcmp(val, "true") == 0;
+            else if (strcmp(key, "agent_diagrams") == 0) cfg->agent_diagrams = strcmp(val, "true") == 0;
             else if (strcmp(key, "agent_jobs_fold") == 0) cfg->agent_jobs_fold = config_jobs_fold_parse(val);
             else if (strcmp(key, "agent_orchestration_max") == 0) {
                 i32 v = config_i32_or(val, cfg->agent_orchestration_max);
@@ -2340,6 +2342,7 @@ bool config_save(const AppConfig *cfg, const char *filepath) {
     fprintf(f, "  \"agent_orchestration_ask_tools\": %s,\n", cfg->agent_orchestration_ask_tools ? "true" : "false");
     fprintf(f, "  \"agent_orchestration_keep\": %s,\n", cfg->agent_orchestration_keep ? "true" : "false");
     fprintf(f, "  \"agent_subagent_tabs\": %s,\n", cfg->agent_subagent_tabs ? "true" : "false");
+    fprintf(f, "  \"agent_diagrams\": %s,\n", cfg->agent_diagrams ? "true" : "false");
     fprintf(f, "  \"agent_jobs_fold\": \"%s\",\n", config_jobs_fold_name(cfg->agent_jobs_fold));
     fprintf(f, "  \"bold_is_bright\": %s,\n", cfg->bold_is_bright ? "true" : "false");
     fprintf(f, "  \"show_scrollbar\": %s,\n", cfg->show_scrollbar ? "true" : "false");

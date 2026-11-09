@@ -55,13 +55,8 @@ bool hist_xdg_state_path (char *out, usize cap, const char *rel); /* .local/stat
 /* Per-OS desktop-app data roots, "<base>/<rel>":
  *   hist_appdata_path        — ROAMING base: mac ~/Library/Application Support,
  *                              win %APPDATA%, linux $XDG_CONFIG_HOME|~/.config.
- *                              (VS Code-family user data lives here.)
- *   hist_local_appdata_path  — LOCAL base (Rust dirs::data_local_dir()):
- *                              mac ~/Library/Application Support,
- *                              win %LOCALAPPDATA%,
- *                              linux $XDG_DATA_HOME|~/.local/share. */
+ *                              (VS Code-family user data lives here.) */
 bool hist_appdata_path      (char *out, usize cap, const char *rel);
-bool hist_local_appdata_path(char *out, usize cap, const char *rel);
 
 /* cJSON conveniences — return NULL / false when key absent or type mismatched. */
 const char *hist_cjson_str (cJSON *obj, const char *key);
@@ -126,8 +121,8 @@ bool hist_slugify_lower(char *out, usize cap, const char *path);
  * small (a truncated slug would name a different project). */
 bool hist_slugify_claude(char *out, usize cap, const char *path);
 
-
 /* ---------------------------------------------------------------------------
+
  * Bounded line reader
  *
  * getline() grows its buffer to whatever the file hands it BEFORE the caller

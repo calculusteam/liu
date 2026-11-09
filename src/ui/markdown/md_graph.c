@@ -842,9 +842,6 @@ bool md_graph_node_is_tag(const MdGraph *g, i32 i) {
     return (g && i >= 0 && i < g->node_count) ? g->nodes[i].is_tag : false;
 }
 
-i32 md_graph_node_group(const MdGraph *g, i32 i) {
-    return (g && i >= 0 && i < g->node_count) ? g->nodes[i].group : -1;
-}
 i32 md_graph_group_count(const MdGraph *g) { return g ? g->group_count : 0; }
 const char *md_graph_group_name(const MdGraph *g, i32 gi) {
     return (g && g->group_names && gi >= 0 && gi < g->group_count) ? g->group_names[gi] : "";

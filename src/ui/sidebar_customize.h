@@ -303,7 +303,6 @@ void app_sbc_anchor_capture(struct AppState *app);
 
 void sbc_open(struct AppState *app);
 void sbc_close(struct AppState *app);
-void sbc_toggle(struct AppState *app);
 /* Each returns whether the event was consumed. Coordinates are framebuffer px. */
 bool sbc_key(struct AppState *app, i32 key, u32 mods);
 bool sbc_mouse_down(struct AppState *app, f32 x, f32 y);

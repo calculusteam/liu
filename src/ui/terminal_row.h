@@ -21,6 +21,7 @@ static void term_render_cache_spare_free(TermRenderCache *c) {
 }
 static void term_render_cache_free(TermRenderCache *c) {
     term_prepare_cancel(c);
+    agent_diagram_pane_release(&c->adg);
     free(c->palette_lut);c->palette_lut=NULL;c->palette_source=NULL;c->palette_lut_valid=false;
     renderer_retained_release(&c->gpu_glyphs);
     renderer_retained_release(&c->gpu_backgrounds);

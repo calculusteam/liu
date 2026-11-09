@@ -72,11 +72,6 @@ void sbc_close(AppState *app) {
     sbc_clear_press(app);
 }
 
-void sbc_toggle(AppState *app) {
-    if (!app) return;
-    if (app->sbc_open) sbc_close(app); else sbc_open(app);
-}
-
 /* ---- the settings themselves ------------------------------------------- */
 
 static void sbc_set_docked(AppState *app, bool on) {

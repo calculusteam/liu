@@ -63,6 +63,8 @@ typedef struct {
     /* Authentication */
     char identity_files[SSH_CONFIG_MAX_IDENTITY_FILES][512];
     i32  identity_file_count;
+    bool identity_defaults;       /* the host names no IdentityFile: identity_files are ssh's
+                                   * default ones that exist (~/.ssh/id_ed25519, id_rsa, id_ecdsa) */
     bool identity_only;           /* IdentitiesOnly yes */
 
     /* Proxy */

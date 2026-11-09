@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pwd.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <spawn.h>
@@ -257,6 +258,7 @@ static bool probe_dir(const char *dir, usize dlen, const char *binary,
  * Shared by find_in_path() (agent autodetect) and agent_ensure_process_path()
  * (which folds these into the process PATH so spawned agents inherit them).
  * Entries beginning with '~' are $HOME-expanded at use. */
+#ifdef __APPLE__
 static const char *const g_path_extras[] = {
     "/opt/homebrew/bin",
     "/opt/homebrew/sbin",
@@ -280,6 +282,47 @@ static const char *const g_path_extras[] = {
     "~/.qwen/bin",
     "~/.antigravity/bin",
 };
+#else
+/* Linux: a desktop session's PATH comes from the login profile, and the
+ * per-user tool managers write themselves into the interactive rc files
+ * instead. These are where commands land outside the distribution's own
+ * folders: the per-user and system-wide prefixes of the package managers that
+ * install beside it, the shims and default versions of the version managers,
+ * and the folders the agents' own installers use. */
+static const char *const g_path_extras[] = {
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "~/.local/bin",
+    "~/bin",
+    "/home/linuxbrew/.linuxbrew/bin",
+    "/home/linuxbrew/.linuxbrew/sbin",
+    "~/.linuxbrew/bin",
+    "~/.nix-profile/bin",
+    "/nix/var/nix/profiles/default/bin",
+    "/run/current-system/sw/bin",
+    "/snap/bin",
+    "~/.local/share/pnpm",
+    "~/.local/share/fnm/aliases/default/bin",
+    "~/.asdf/shims",
+    "~/.local/share/mise/shims",
+    "~/.volta/bin",
+    "~/.bun/bin",
+    "~/.deno/bin",
+    "~/.cargo/bin",
+    "~/go/bin",
+    "/usr/local/go/bin",
+    "~/.npm-global/bin",
+    "~/.npm/bin",
+    "~/.yarn/bin",
+    "~/.grok/bin",
+    "~/.opencode/bin",
+    "~/.kiro/bin",
+    "~/.crush/bin",
+    "~/.kimi/bin",
+    "~/.qwen/bin",
+    "~/.antigravity/bin",
+};
+#endif
 static const usize g_path_extras_count =
     sizeof(g_path_extras) / sizeof(g_path_extras[0]);
 
@@ -349,9 +392,14 @@ static usize expand_tilde(const char *dir, char *out, usize cap) {
  * (captures nvm/asdf/fnm/volta dynamic dirs that a static list can't), and fold in
  * the curated static install dirs as a fallback, then setenv() the result so every
  * subsequent child — and every PATH-based lookup in-process — sees the full PATH.
- * No-op on non-macOS, where GUI launches keep a usable PATH. */
+ *
+ * Linux has the same gap in another place: a desktop session's PATH is the
+ * login profile's, and the version managers an agent is installed with write
+ * themselves into the interactive rc files, so an agent a pane finds was not
+ * on the PATH of the app the menu started. The same repair, with that
+ * system's folders, and only the ones that exist: this PATH is every pane's
+ * too. */
 void agent_ensure_process_path(void) {
-#ifdef __APPLE__
     /* Must start terminated: when neither the login shell nor $PATH yields a
      * base (step 1 writes nothing), the very first path_has_segment() below
      * still reads this buffer — over uninitialised stack if it isn't NUL'd. */
@@ -361,7 +409,15 @@ void agent_ensure_process_path(void) {
     /* 1) Base: the login shell's PATH when it answers, else the current one. */
     char shell_path[6144] = {0};
     const char *shell = getenv("SHELL");
+#ifdef __APPLE__
     if (!shell || !*shell) shell = "/bin/zsh";
+#else
+    /* A session started without SHELL: the account's own login shell. */
+    if (!shell || !*shell) {
+        const struct passwd *pw = getpwuid(getuid());
+        shell = pw && pw->pw_shell && pw->pw_shell[0] == '/' ? pw->pw_shell : "/bin/sh";
+    }
+#endif
     {
         (void)agent_login_shell_path(shell, shell_path, sizeof shell_path,
                                      AGENT_LOGIN_PATH_DEADLINE_MS);
@@ -380,13 +436,16 @@ void agent_ensure_process_path(void) {
         usize dlen = expand_tilde(g_path_extras[i], dir, sizeof dir);
         if (!dlen) continue;
         if (path_has_segment(merged, dir, dlen)) continue;
+#ifndef __APPLE__
+        struct stat st;
+        if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+#endif
         int n = snprintf(merged + off, sizeof(merged) - off,
                          off ? ":%s" : "%s", dir);
         if (n > 0 && (usize)n < sizeof(merged) - off) off += (usize)n;
     }
 
     if (off > 0) setenv("PATH", merged, 1);
-#endif
 }
 
 const char *agent_id_for_basename(const char *name) {

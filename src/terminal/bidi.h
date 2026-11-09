@@ -86,10 +86,6 @@ void bidi_reorder_line_ex(const Cell *cells, i32 cols, Cell *visual,
  * clamps to [0, cols). */
 i32 bidi_visual_to_logical_col(const Cell *cells, i32 cols, i32 vis_col);
 
-/* Determine the base (paragraph) direction for a line.
- * Scans for the first strong character (L, R, or AL). */
-BidiDir bidi_base_direction(const Cell *cells, i32 cols);
-
 /* Simple Arabic presentation form shaping.
  * Modifies codepoints in-place within the visual cell array.
  * Must be called AFTER bidi_reorder_line(). */

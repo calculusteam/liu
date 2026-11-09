@@ -38,7 +38,4 @@ bool           serial_is_alive(SerialSession *ss);
 /* Pollable fd for the read path. */
 i32            serial_fd(SerialSession *ss);
 
-/* List available serial ports. Returns count, fills names array. */
-i32 serial_list_ports(char (*names)[128], i32 max);
-
 #endif

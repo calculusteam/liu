@@ -104,3 +104,37 @@ char *bridge_escape_closing_tag(const char *text, const char *tag) {
     out[o] = '\0';
     return out;
 }
+
+static bool wire_id_byte(u8 c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+           c == '_' || c == '-';
+}
+
+void bridge_wire_tool_id(char *out, usize cap, const char *prefix, const char *id) {
+    if (!out || cap == 0) return;
+    if (!id || !id[0]) id = "liu";
+    if (!prefix) prefix = "";
+    usize pn = strlen(prefix);
+    const char *parts[2] = { pn && strncmp(id, prefix, pn) == 0 ? "" : prefix, id };
+
+    char w[BRIDGE_WIRE_ID_MAX + 1];
+    usize n = 0;
+    bool kept = true;
+    for (int k = 0; k < 2; k++) {
+        for (const u8 *p = (const u8 *)parts[k]; *p; p++) {
+            if (n == BRIDGE_WIRE_ID_MAX) { kept = false; break; }
+            if (!wire_id_byte(*p)) kept = false;
+            w[n++] = wire_id_byte(*p) ? (char)*p : '_';
+        }
+    }
+    if (!kept) {
+        u64 hv = 1469598103934665603ull;               /* FNV-1a */
+        for (const u8 *p = (const u8 *)id; *p; p++) { hv ^= *p; hv *= 1099511628211ull; }
+        const usize tail = 17;                         /* "_" + 16 hex digits */
+        if (n > BRIDGE_WIRE_ID_MAX - tail) n = BRIDGE_WIRE_ID_MAX - tail;
+        snprintf(w + n, sizeof w - n, "_%016llx", (unsigned long long)hv);
+        n += tail;
+    }
+    w[n] = '\0';
+    snprintf(out, cap, "%s", w);
+}

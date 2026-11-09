@@ -5,10 +5,10 @@
  * three places, and which one a session fills depends on who started it:
  *
  *   1. Xft.dpi in the root window's RESOURCE_MANAGER - what xrdb loads, what
- *      GNOME's and Plasma's session scripts write. When it is there it wins:
+ *      the larger desktops' session scripts write. When it is there it wins:
  *      it is the setting a person edits by hand.
- *   2. XSETTINGS (x11_xsettings.h) - the settings daemons of Xfce, Cinnamon,
- *      MATE, LXQt and xsettingsd keep the scale ONLY there. Xft/DPI is dots per
+ *   2. XSETTINGS (x11_xsettings.h) - the desktops whose settings daemon owns
+ *      XSETTINGS keep the scale ONLY there. Xft/DPI is dots per
  *      inch x 1024 and already carries the window scale; where it is missing,
  *      Gdk/WindowScalingFactor is the integer scale (times Gdk/UnscaledDPI over
  *      96 when that is given too, which is how the daemon builds Xft/DPI).

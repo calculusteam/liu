@@ -418,9 +418,21 @@ done:
 }
 
 static bool fb_image_decode_start(FileBrowser *fb, const char *path) {
-    if (!fb || !path || !path[0] || fb->image_job) return false;
+    if (!fb || !path || !path[0]) return false;
+    /* With every orphan slot held by a decode that has not returned, the
+     * cancel below would wait for this one on the caller's thread: a decode
+     * cannot be interrupted, and a file that never answers never returns. */
+    if (fb->image_job && !atomic_load_explicit(&fb->image_job->done, memory_order_acquire) &&
+        atomic_load_explicit(&g_fb_image_orphans, memory_order_acquire) >= FB_IMAGE_MAX_ORPHANS) {
+        fb_notice(fb, true, "Still reading the previous images; try again in a moment");
+        return false;
+    }
     /* The image takes the viewer, and the text in it is freed below. */
     if (!fb_discard_ok(fb, UNSAVED_OPEN)) return false;
+    /* A picture still decoding is the one being left: it is cancelled (its
+     * worker frees it) and this one starts. Closing the viewer does not end
+     * a decode, so without this the next picture was not opened at all. */
+    fb_image_decode_cancel(fb);
 
     /* Commit to the new viewer before launching, but keep all heavy disk and
      * pixel work off this thread. */
@@ -730,25 +742,6 @@ const char *fb_format_size(u64 bytes) {
     return buf;
 }
 
-const char *fb_file_icon(const char *name, bool is_dir) {
-    if (is_dir) return "[D]";
-    const char *ext = strrchr(name, '.');
-    if (!ext) return "   ";
-    if (strcmp(ext, ".c") == 0 || strcmp(ext, ".h") == 0) return "[C]";
-    if (strcmp(ext, ".py") == 0) return "[P]";
-    if (strcmp(ext, ".js") == 0 || strcmp(ext, ".ts") == 0) return "[J]";
-    if (strcmp(ext, ".rs") == 0) return "[R]";
-    if (strcmp(ext, ".go") == 0) return "[G]";
-    if (strcmp(ext, ".md") == 0) return "[M]";
-    if (strcmp(ext, ".sh") == 0) return "[S]";
-    if (strcmp(ext, ".txt") == 0) return "[T]";
-    if (strcmp(ext, ".json") == 0) return "[J]";
-    if (strcmp(ext, ".yaml") == 0 || strcmp(ext, ".yml") == 0) return "[Y]";
-    if (strcmp(ext, ".toml") == 0) return "[T]";
-    if (strcmp(ext, ".png") == 0 || strcmp(ext, ".jpg") == 0) return "[I]";
-    return "   ";
-}
-
 /* Human-readable language for the editor status bar.
  *
  * Deliberately separate from fb_detect_mode(): that one answers "which viewer
@@ -785,17 +778,6 @@ const char *fb_language_label(const char *path) {
     if (n == 0) return "Text";
     fallback[n] = '\0';
     return fallback;
-}
-
-/* Line-ending style of the loaded buffer, for the status bar. Reports what
- * dominates rather than what appears first — a file that is overwhelmingly
- * LF with one stray CRLF is an LF file with a defect, and labelling it CRLF
- * would send the reader looking in the wrong place. */
-const char *fb_eol_label(const char *content, usize len) {
-    /* The rule is editor_detect_crlf's (a bounded scan of what dominates),
-     * because it is also what decides which break Enter inserts: the bar
-     * cannot name one ending while the editor writes the other. */
-    return editor_detect_crlf(content, len) ? "CRLF" : "LF";
 }
 
 /* What the text's bytes are, for the status bar and the painter. Read again
@@ -8822,22 +8804,6 @@ bool fb_editor_click_caret(FileBrowser *fb, f32 mx, f32 my) {
     return true;
 }
 
-bool fb_handle_click(FileBrowser *fb, f32 rel_x, f32 rel_y, f32 w, f32 h, f32 dpi) {
-    (void)w; (void)rel_x; (void)h;
-    if (rel_y < fb_list_hdr_h(dpi)) return true; /* header click */
-
-    i32 idx = fb_list_entry_at(fb, rel_y, dpi);
-    if (idx >= 0 && idx < fb->entry_count) {
-        fb->selected = idx;
-        fb_sel_clear(fb);
-        fb_sel_set(fb, idx, true);
-        fb->selection_anchor = idx;
-        fb_open_file(fb, idx);
-        return true;
-    }
-    return false;
-}
-
 /* =========================================================================
  * Rendered-markdown text selection
  *
@@ -9114,19 +9080,6 @@ u32 fb_md_outline_count(const FileBrowser *fb) {
     if (!fb || fb->view_mode != FVIEW_MARKDOWN || fb->md_raw_mode) return 0;
     if (!fb->md_outline) return 0;
     return fb->md_outline_count;
-}
-
-u8 fb_md_outline_get(const FileBrowser *fb, u32 idx, char *out, usize out_cap) {
-    if (out && out_cap) out[0] = '\0';
-    if (!fb || !fb->md_outline || idx >= fb->md_outline_count) return 0;
-    const MdOutlineItem *it = &fb->md_outline[idx];
-    if (out && out_cap) {
-        usize n = it->text_len;
-        if (n > out_cap - 1) n = out_cap - 1;
-        if (it->text && n) memcpy(out, it->text, n);
-        out[n] = '\0';
-    }
-    return it->level ? it->level : 1;
 }
 
 void fb_md_scroll_to_heading(FileBrowser *fb, u32 idx) {

@@ -5,6 +5,7 @@
 
 #include "platform/platform.h"
 #include "platform/xdnd_uri.h"
+#include "platform/x11_embed.h"      /* a toolkit embedded in a window */
 #include "platform/event_payload.h"   /* a queued drop OWNS its path */
 #include "platform/clip_request.h"    /* one clipboard request, its own answer */
 #include "platform/clipboard_png.h"
@@ -413,6 +414,13 @@ static void linux_drain_wake_pipe(void) {
 
 struct PlatformWindow {
     Window      xwindow;
+    /* Where X sends this window's keys: a 1x1 input-only child outside the
+     * window's area. X sends a key to the deepest window under the pointer
+     * when that window is inside the focus window, so with the focus on the
+     * window itself a key typed with the pointer over an embedded page (a
+     * window of another connection) went to the page. The pointer is never
+     * inside this one. */
+    Window      key_sink;
     GLXContext  glx_context;
     Atom        wm_delete;
     i32         width, height;
@@ -474,13 +482,30 @@ struct PlatformWindow {
     AtspiWindow a11y;
 };
 
-/* The PlatformWindow an X window id belongs to; NULL for the root, the helper
- * and anything that is not ours. */
+/* The PlatformWindow an X window id belongs to (the window or its keyboard's
+ * window); NULL for the root, the helper and anything that is not ours. */
 static PlatformWindow *linux_window_of(Window xid) {
     if (xid == None) return NULL;
     for (i32 i = 0; i < g_window_count; i++)
-        if (g_windows[i]->xwindow == xid) return g_windows[i];
+        if (g_windows[i]->xwindow == xid || g_windows[i]->key_sink == xid) return g_windows[i];
     return NULL;
+}
+
+/* The window that takes this window's keys: its key sink when it has one. */
+static Window linux_keys_of(const PlatformWindow *w) {
+    return w->key_sink ? w->key_sink : w->xwindow;
+}
+
+/* The focus given to the window itself goes on to its key sink, only while
+ * it is still the window's: a CurrentTime request must not take the focus
+ * back from whatever was given it since. */
+static void linux_focus_to_keys(PlatformWindow *w) {
+    if (!w || !w->key_sink) return;
+    Window focus = None;
+    int revert = 0;
+    XGetInputFocus(g_platform.display, &focus, &revert);
+    if (focus == w->xwindow)
+        XSetInputFocus(g_platform.display, w->key_sink, RevertToParent, CurrentTime);
 }
 
 /* Xlib's default error handler calls exit(1) on ANY protocol error, which
@@ -1201,8 +1226,8 @@ static void linux_set_window_identity(Window win) {
     }
 
     /* The desktop file this window belongs to, for the desktops that name an
-     * application from it (x11_identity.h): GNOME Shell reads
-     * _GTK_APPLICATION_ID, KWin _KDE_NET_WM_DESKTOP_FILE. */
+     * application from it (x11_identity.h); each reads one of
+     * _GTK_APPLICATION_ID and _KDE_NET_WM_DESKTOP_FILE. */
     {
         static const char id[] = X11_DESKTOP_FILE_ID;
         Atom ids[2] = { XInternAtom(dpy, "_GTK_APPLICATION_ID", False),
@@ -1234,8 +1259,7 @@ static void linux_set_window_identity(Window win) {
 /* No window-manager title bar or borders: Liu's tab strip is where the title
  * bar would be, and a WM title bar above it gave the window two stacked
  * headers. _MOTIF_WM_HINTS is not in any current spec, but it is the one
- * decoration switch every X11 window manager still honours (mutter, KWin,
- * Xfwm, openbox, i3); the struct is five 32-bit values in the WM's layout,
+ * decoration switch every X11 window manager still honours; the struct is five 32-bit values in the WM's layout,
  * declared here rather than pulling in Motif headers. Set before the window is
  * mapped: most window managers read it once, at map time. */
 static void x11_set_borderless(Display *dpy, Window win) {
@@ -1447,6 +1471,13 @@ PlatformWindow *platform_window_create(const PlatformWindowConfig *cfg) {
                                 vi->depth, InputOutput, vi->visual,
                                 CWColormap | CWEventMask | CWBackPixel |
                                 CWBorderPixel, &swa);
+    {
+        XSetWindowAttributes ka = {0};
+        ka.event_mask = KeyPressMask | KeyReleaseMask;
+        w->key_sink = XCreateWindow(dpy, w->xwindow, -1, -1, 1, 1, 0, 0, InputOnly,
+                                    CopyFromParent, CWEventMask, &ka);
+        if (w->key_sink) XMapWindow(dpy, w->key_sink);
+    }
     w->width = cfg->width;
     w->height = cfg->height;
     w->mapped = true;      /* assume visible until WM_STATE says otherwise */
@@ -1541,7 +1572,7 @@ PlatformWindow *platform_window_create(const PlatformWindowConfig *cfg) {
                 w->xic = XCreateIC(g_platform.xim,
                                    XNInputStyle, style,
                                    XNClientWindow, w->xwindow,
-                                   XNFocusWindow,  w->xwindow,
+                                   XNFocusWindow,  linux_keys_of(w),
                                    XNPreeditAttributes, pre,
                                    (void *)NULL);
                 XFree(pre);
@@ -1557,7 +1588,7 @@ PlatformWindow *platform_window_create(const PlatformWindowConfig *cfg) {
                     w->xic = XCreateIC(g_platform.xim,
                                        XNInputStyle, style,
                                        XNClientWindow, w->xwindow,
-                                       XNFocusWindow,  w->xwindow,
+                                       XNFocusWindow,  linux_keys_of(w),
                                        XNPreeditAttributes, pre,
                                        (void *)NULL);
                     XFree(pre);
@@ -1572,7 +1603,7 @@ PlatformWindow *platform_window_create(const PlatformWindowConfig *cfg) {
             w->xic = XCreateIC(g_platform.xim,
                                XNInputStyle, XIMPreeditNothing | XIMStatusNothing,
                                XNClientWindow, w->xwindow,
-                               XNFocusWindow,  w->xwindow,
+                               XNFocusWindow,  linux_keys_of(w),
                                (void *)NULL);
         }
     }
@@ -1701,8 +1732,8 @@ void platform_window_set_transparent(PlatformWindow *w, bool transparent) {
 }
 
 /* No blur on the X11 backend: the compositor owns background blur there and
- * exposes it per-window only through compositor-specific protocols (KWin's
- * property, Hyprland's rule), none of which is portable across the desktops
+ * exposes it per-window only through compositor-specific protocols (a window
+ * property, a compositor rule), none of which is portable across the desktops
  * this build targets. Reported as inexact so the UI can say so rather than
  * showing a slider that does nothing. */
 bool platform_window_set_content_opacity(PlatformWindow *w, f32 opacity) {
@@ -1715,15 +1746,14 @@ bool platform_window_set_content_opacity(PlatformWindow *w, f32 opacity) {
 
 /* Blur whatever shows through the window.
  *
- * X11 has no standard for this. KWin's _KDE_NET_WM_BLUR_BEHIND_REGION is the
- * one convention adopted beyond its author (Plasma, and the wlroots
- * compositors that copied it), so it is the one used. The property holds a
+ * X11 has no standard for this. _KDE_NET_WM_BLUR_BEHIND_REGION is the one
+ * convention more than one compositor reads, so it is the one used. The property holds a
  * list of x,y,w,h rectangles to blur; an EMPTY list means the whole window,
  * which is exactly right here: Liu's translucency is per-pixel and covers the
  * entire client area. Deleting the property turns it back off.
  *
- * The radius cannot be chosen: KWin blurs with a single global strength from
- * its own effect settings, so "on" and "off" are honoured but not the four
+ * The radius cannot be chosen: the compositor blurs with a single global
+ * strength from its own effect settings, so "on" and "off" are honoured but not the four
  * presets the UI offers. platform_window_blur_is_exact() reports that.
  *
  * As on macOS, this only shows where the window is actually translucent: at
@@ -1761,7 +1791,7 @@ PlatformWindow *platform_key_window(void) { return g_key_window; }
 
 /* _NET_WM_WINDOW_OPACITY is never set. The translucency is RENDERED (the
  * clear's alpha), so the property would apply it a second time (0.75 would
- * land at 0.56) and also makes KWin refuse to blur behind the window. Since
+ * land at 0.56) and also makes a compositor refuse to blur behind the window. Since
  * nothing sets the property, nothing has to clear it.
  *
  * A window created before a compositor started has a 24-bit visual with no
@@ -2097,6 +2127,7 @@ void platform_window_display_link_sync(PlatformWindow *w, bool visible,
 }
 bool platform_window_display_link_running(PlatformWindow *w) { (void)w; return false; }
 u64  platform_window_vsync_ticks(PlatformWindow *w) { (void)w; return 0; }
+void platform_window_set_link_wake(PlatformWindow *w, bool wake) { (void)w; (void)wake; }
 f64  platform_window_display_link_period_sec(PlatformWindow *w) { (void)w; return 0.0; }
 f64  platform_window_display_link_silence_sec(PlatformWindow *w) { (void)w; return 0.0; }
 
@@ -2896,7 +2927,7 @@ bool linux_a11y_window_has_focus(PlatformWindow *w) {
     Window focus = None;
     int revert = 0;
     XGetInputFocus(g_platform.display, &focus, &revert);
-    return focus == w->xwindow;
+    return focus == w->xwindow || (w->key_sink && focus == w->key_sink);
 }
 
 /* The accessibility bus address a session publishes on the root window,
@@ -3022,8 +3053,8 @@ static bool xdnd_source_has_uri_list(const XClientMessageEvent *cm) {
  * the file-viewer handler in main.c). The X server has no such notion, so the
  * notch is scaled here.
  *
- * Three lines per notch is the usual desktop default. KDE makes it
- * configurable through kcminputrc: that file is read when it exists, whatever
+ * Three lines per notch is the usual desktop default. kcminputrc makes it
+ * configurable: that file is read when it exists, whatever
  * desktop is running, because a value set there applies to every application
  * on the machine.
  * ------------------------------------------------------------------------- */
@@ -3458,10 +3489,23 @@ static void linux_dispatch_xevent_for(XEvent *xep, PlatformWindow *win);
  * focus, its input context, and the PlatformEvent it becomes carries it. Events
  * of the root window and the helper have none. Re-entered by the clipboard
  * pump, hence the save and restore. */
+/* An event for a window that is not one of Liu's (x11_embed.h): an embedded
+ * toolkit's socket hears from its client here first. */
+static bool (*g_child_event)(void *xevent, void *ctx);
+static void *g_child_event_ctx;
+
+void platform_x11_set_child_event_handler(bool (*fn)(void *xevent, void *ctx), void *ctx) {
+    g_child_event = fn;
+    g_child_event_ctx = ctx;
+}
+
 static void linux_dispatch_xevent(XEvent *xep) {
     PlatformWindow *saved = g_dispatch_window;
     PlatformWindow *win = xep->type == GenericEvent ? NULL
                                                     : linux_window_of(xep->xany.window);
+    if (!win && xep->type != GenericEvent && g_child_event &&
+        g_child_event((void *)xep, g_child_event_ctx))
+        return;
     g_dispatch_window = win;
     linux_dispatch_xevent_for(xep, win);
     g_dispatch_window = saved;
@@ -3758,6 +3802,27 @@ static void linux_dispatch_xevent_for(XEvent *xep, PlatformWindow *win) {
                                xe.xbutton.same_screen, &bx, &by))
             break;
         if (win) g_pointer_window = win;
+        /* A press in Liu's own window takes the keyboard back from a page
+         * embedded in it (the X focus stays on a child until someone moves it). */
+        if (win && xe.type == ButtonPress) {
+            Window focus = None;
+            int revert = 0;
+            XGetInputFocus(dpy, &focus, &revert);
+            /* Only from a window inside this one: another client's focus is
+             * the window manager's to move. */
+            bool inside = false;
+            for (Window w = focus, root = 0, parent = 0, *kids = NULL; w != None && w != PointerRoot && w != win->xwindow;
+                 w = parent) {
+                unsigned nk = 0;
+                if (!XQueryTree(dpy, w, &root, &parent, &kids, &nk)) break;
+                if (kids) XFree(kids);
+                kids = NULL;
+                if (parent == win->xwindow) { inside = true; break; }
+                if (parent == root || parent == None) break;
+            }
+            if (inside && focus != win->key_sink)
+                XSetInputFocus(dpy, linux_keys_of(win), RevertToParent, xe.xbutton.time);
+        }
         handle_pointer_button(win, xe.type == ButtonPress,
                               xe.xbutton.button, bx, by,
                               xe.xbutton.state, xe.xbutton.time);
@@ -3993,6 +4058,12 @@ static void linux_dispatch_xevent_for(XEvent *xep, PlatformWindow *win) {
     case FocusOut: {
         if (xe.xfocus.mode == NotifyGrab || xe.xfocus.mode == NotifyUngrab)
             break;
+        /* Focus that lands on the window itself, from outside or back from a
+         * child, goes on to its key sink. */
+        if (xe.type == FocusIn && win && (xe.xfocus.detail == NotifyAncestor ||
+                                          xe.xfocus.detail == NotifyInferior ||
+                                          xe.xfocus.detail == NotifyNonlinear))
+            linux_focus_to_keys(win);
         if (xe.xfocus.detail == NotifyInferior ||
             xe.xfocus.detail == NotifyPointer ||
             xe.xfocus.detail == NotifyPointerRoot)
@@ -4201,9 +4272,48 @@ static void linux_dispatch_xevent_for(XEvent *xep, PlatformWindow *win) {
     }
 }
 
+/* The second event source the wait drives (x11_embed.h): an embedded
+ * toolkit's main context. Main thread only. */
+static PlatformPollSource g_poll_src;
+static bool               g_poll_src_on;
+#define LINUX_POLL_SRC_FDS 64
+
+/* The toolkit can make a GL context of its own current while it runs (a page
+ * drawn with GL): Liu's is current again before anything of Liu's draws. */
+static void poll_src_dispatch(const struct pollfd *fds, i32 n) {
+    GLXContext c = glXGetCurrentContext();
+    GLXDrawable dr = glXGetCurrentDrawable();
+    g_poll_src.dispatch(g_poll_src.ctx, fds, n);
+    if (c && glXGetCurrentContext() != c) glXMakeCurrent(g_platform.display, dr, c);
+}
+
+static void poll_src_pump(void) {
+    GLXContext c = glXGetCurrentContext();
+    GLXDrawable dr = glXGetCurrentDrawable();
+    g_poll_src.pump(g_poll_src.ctx);
+    if (c && glXGetCurrentContext() != c) glXMakeCurrent(g_platform.display, dr, c);
+}
+
+void platform_x11_set_poll_source(const PlatformPollSource *src) {
+    g_poll_src_on = src && src->prepare && src->dispatch;
+    if (g_poll_src_on) g_poll_src = *src;
+    else memset(&g_poll_src, 0, sizeof g_poll_src);
+}
+
+void *platform_x11_display(void) { return g_platform.display; }
+
+unsigned long platform_x11_window(PlatformWindow *w) {
+    return w ? (unsigned long)w->xwindow : 0ul;
+}
+
+unsigned long platform_x11_key_sink(PlatformWindow *w) {
+    return w ? (unsigned long)linux_keys_of(w) : 0ul;
+}
+
 void platform_poll_events(void) {
     Display *dpy = g_platform.display;
     if (!dpy) return;
+    if (g_poll_src_on && g_poll_src.pump) poll_src_pump();
     linux_xtime_service(platform_time_sec());
     linux_png_expire(platform_time_sec());
     linux_clip_secret_tick(platform_time_sec());
@@ -4253,9 +4363,18 @@ void platform_wait_events(f64 timeout_sec) {
      * the zero-cost idle path. */
     short a11y_events = 0;
     int   a11y_fd = atspi_poll_fd(&a11y_events);
+    /* The embedded toolkit's descriptors, asked for here and answered after
+     * the wait whatever it returns (its prepare must be followed by a check). */
+    struct pollfd src_fds[LINUX_POLL_SRC_FDS];
+    i32 src_n = 0, src_timeout = -1;
+    if (g_poll_src_on) {
+        src_n = g_poll_src.prepare(g_poll_src.ctx, src_fds, LINUX_POLL_SRC_FDS, &src_timeout);
+        if (src_n < 0) src_n = 0;
+        if (src_n > LINUX_POLL_SRC_FDS) src_n = LINUX_POLL_SRC_FDS;
+    }
     i32 nfds = 1 + (g_platform.wake_pipe[0] >= 0 ? 1 : 0) +
                (g_platform.inotify_fd >= 0 ? 1 : 0) + (a11y_fd >= 0 ? 1 : 0) +
-               watch_count;
+               src_n + watch_count;
     if (nfds > g_platform.poll_cap) {
         i32 new_cap = g_platform.poll_cap ? g_platform.poll_cap : 16;
         while (new_cap < nfds) {
@@ -4269,12 +4388,14 @@ void platform_wait_events(f64 timeout_sec) {
         if (!checked_mul_usize((usize)new_cap, sizeof(struct pollfd), &bytes)) {
             pthread_mutex_unlock(&g_platform.watch_lock);
             watch_hold_pass_end(false);
+            if (g_poll_src_on) poll_src_dispatch(src_fds, 0);
             return;
         }
         struct pollfd *grown = realloc(g_platform.poll_fds, bytes);
         if (!grown) {
             pthread_mutex_unlock(&g_platform.watch_lock);
             watch_hold_pass_end(false);
+            if (g_poll_src_on) poll_src_dispatch(src_fds, 0);
             return;
         }
         g_platform.poll_fds = grown;
@@ -4290,6 +4411,8 @@ void platform_wait_events(f64 timeout_sec) {
         pfds[idx++] = (struct pollfd){ .fd = g_platform.inotify_fd, .events = POLLIN };
     if (a11y_fd >= 0)
         pfds[idx++] = (struct pollfd){ .fd = a11y_fd, .events = a11y_events };
+    i32 src_base = idx;
+    for (i32 i = 0; i < src_n; i++) pfds[idx++] = src_fds[i];
     for (i32 i = 0; i < watch_count; i++) {
         int wfd = g_platform.watch_fds[i];
         /* Structural answer in Liu's shape: a pane that spent its
@@ -4325,7 +4448,14 @@ void platform_wait_events(f64 timeout_sec) {
         f64 ms = timeout_sec * 1000.0;
         timeout_ms = ms > 2147483647.0 ? 2147483647 : (int)ceil(ms);
     }
+    if (src_n > 0 || g_poll_src_on) {
+        if (src_timeout >= 0 && (timeout_ms < 0 || src_timeout < timeout_ms)) timeout_ms = src_timeout;
+    }
     int ready = poll(pfds, (nfds_t)nfds, timeout_ms);
+    if (g_poll_src_on) {
+        for (i32 i = 0; i < src_n; i++) src_fds[i].revents = ready > 0 ? pfds[src_base + i].revents : 0;
+        poll_src_dispatch(src_fds, src_n);
+    }
     if (ready > 0) {
         /* Count only the watched fds for platform_take_fd_fire_count(). The X11
          * connection fd and the internal wake pipe still wake event processing
@@ -4772,8 +4902,16 @@ void platform_toast_trim(PlatformWindow *w, i32 keep) {
     (void)w; (void)keep;
 }
 
+/* A key an embedded page took that is Liu's (its binding table's): it reaches
+ * the loop as the key window's own. */
 void platform_push_key_down(i32 key, u32 mods, bool repeat) {
-    (void)key; (void)mods; (void)repeat;
+    push_event((PlatformEvent){
+        .type = EVENT_KEY_DOWN,
+        .window = g_key_window,
+        .timestamp = platform_time_sec(),
+        .key = { .key = key, .mods = mods, .repeat = repeat }
+    });
+    linux_wake_waiter();
 }
 
 bool platform_is_liu_chrome_cmd_key(i32 key, u32 mods) {
@@ -4906,6 +5044,8 @@ void platform_set_ime_cursor_pos(f32 x, f32 y, f32 cell_w, f32 cell_h) {
     XPoint spot;
     spot.x = (short)lroundf(x);
     spot.y = (short)lroundf(y + cell_h);
+    /* relative to the input context's focus window, the key sink at (-1,-1) */
+    if (w->key_sink) { spot.x += 1; spot.y += 1; }
 
     /* This runs once per frame from the main loop. XSetICValues is a round
      * trip to the IM server, so only spend it when the cursor actually moved. */
@@ -5009,8 +5149,8 @@ void platform_play_bell(void) {
  *
  * The freedesktop world has no dock, and no standard for this. What it has is
  * com.canonical.Unity.LauncherEntry: a session-bus signal carrying a count and
- * a visibility flag, read by Plasma's task manager and by GNOME with
- * Dash-to-Dock. Nothing listens on a bare WM, and that is fine — the signal
+ * a visibility flag, read by the task managers and docks that support it.
+ * Nothing listens on a bare WM, and that is fine — the signal
  * goes nowhere and costs one message.
  *
  * The first argument is the desktop-file id the count belongs to, so it has to
@@ -5465,8 +5605,8 @@ void platform_poll_file_watches(void) {
  * File dialogs
  *
  * X11 has no native file picker; the desktop-agnostic answer is to run the
- * portable helper the user's desktop already ships (kdialog on KDE, zenity on
- * GNOME and everything derived from it) and read the chosen path off its
+ * portable helper the user's desktop already ships (kdialog on a Qt desktop,
+ * zenity or one of its kind elsewhere) and read the chosen path off its
  * stdout. Blocking the main loop for the duration matches the macOS backend,
  * where NSOpenPanel runs a modal session.
  *
@@ -5573,7 +5713,7 @@ static void linux_ext_globs(const char *extensions, char *out, usize cap) {
  * XDG Desktop Portal file chooser
  *
  * The subprocess pickers below need a helper to be installed, and which helper
- * that is depends on the desktop. A minimal Hyprland, sway or i3 install
+ * that is depends on the desktop. A minimal tiling window manager install
  * commonly has neither zenity nor kdialog, and there no file dialog would open.
  *
  * org.freedesktop.portal.FileChooser is the freedesktop answer: one D-Bus
@@ -5868,8 +6008,8 @@ static const char *linux_file_dialog(const char *title, const char *extensions,
     }
 #endif
 
-    /* Prefer the picker that matches the running desktop: a Qt dialog on KDE
-     * and a GTK one elsewhere, so the file browser looks and behaves like
+    /* Prefer the picker that matches the running desktop: a Qt dialog where
+     * XDG_CURRENT_DESKTOP names a Qt desktop and a GTK one elsewhere, so the file browser looks and behaves like
      * every other dialog the user sees. */
     const char *desktop = getenv("XDG_CURRENT_DESKTOP");
     bool kde_first = desktop && (strstr(desktop, "KDE") || strstr(desktop, "LXQt"));

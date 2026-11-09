@@ -140,8 +140,10 @@ if [[ ! -f "${TREE}/assets/fonts/JetBrainsMonoNerdFontMono-Regular.ttf" ]]; then
     echo "assets/fonts/JetBrainsMonoNerdFontMono-Regular.ttf is missing from the staged tree — Liu cannot start without it." >&2
     exit 1
 fi
-# The DMG backdrop art is macOS packaging material, not runtime data.
+# The DMG backdrop art is macOS packaging material, not runtime data; so is the
+# folder metadata Finder leaves in a tree built from a Mac's copy.
 rm -rf "${TREE}/assets/dmg"
+find "${TREE}/assets" -name .DS_Store -type f -delete
 
 # --- terminfo, icon, VERSION -------------------------------------------------
 # install.sh looks for these by name; each is optional there, so a rename here

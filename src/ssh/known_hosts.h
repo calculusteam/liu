@@ -30,7 +30,6 @@ void known_hosts_stored_kinds(LIBSSH2_SESSION *session, const char *hostname, i3
  * revocation status. Revocation takes precedence over a changed key. */
 HostKeyStatus known_hosts_check_status(i32 check, bool revoked);
 bool known_hosts_add(LIBSSH2_SESSION *session, const char *hostname, i32 port);
-bool known_hosts_remove(LIBSSH2_SESSION *session, const char *hostname, i32 port);
 /* Retire every stored key for hostname:port that contradicts the session's
  * key (accepted key change). True when the store is consistent afterwards. */
 bool known_hosts_forget(LIBSSH2_SESSION *session, const char *hostname, i32 port);
