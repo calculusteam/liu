@@ -18316,6 +18316,11 @@ void app_explorer_open_for_active_tab(AppState *app) {
         renderer_draw_rect(r, x, y, w, h, dim);
     }
 
+bool app_fb_status_card_room(const AppState *app) {
+    return app->sidebar_visible && app->sidebar_width >= 150.0f * app->dpi_scale &&
+           !sftp_transfer_active();
+}
+
 /* Something is in front of the panes (a dialog, a panel, a menu) and the
  * pointer belongs to it: nothing under it hears of the pointer. Several of
  * them take the click and let the motion and the wheel go on to the main
@@ -18325,11 +18330,6 @@ void app_explorer_open_for_active_tab(AppState *app) {
  * answer behind the scrim. The ones that keep their own events are listed as
  * well: the rule is what is in front. The find bar is not here: it covers
  * nothing, and the pane is scrolled while it is open. */
-bool app_fb_status_card_room(const AppState *app) {
-    return app->sidebar_visible && app->sidebar_width >= 150.0f * app->dpi_scale &&
-           !sftp_transfer_active();
-}
-
 bool app_dialog_has_pointer(const AppState *a) {
     return a->palette_active || a->transcript_viewer_active || a->settings.open ||
            a->sites.active || a->ssh_dialog_active || a->create_theme_active ||

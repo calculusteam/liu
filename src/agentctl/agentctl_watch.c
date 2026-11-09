@@ -347,8 +347,12 @@ static void wdmap_set(usize i) {
     if (wdmap_find(g_dirs[i].wd, &at) >= 0) { g_wdslot[at] = (i32)i + 1; return; }
     if ((g_wdused + 1) * 2 > g_wdcap) { wdmap_rebuild(g_ndirs + 1); if (wdmap_find(g_dirs[i].wd, NULL) >= 0) return; }
     if (!g_wdcap) return;
+    /* A table the rebuild could not grow (no memory) may have no room left:
+     * the watch then goes without an index entry and its events unseen. */
     at = wd_home(g_dirs[i].wd);
-    while (g_wdslot[at] > 0) at = (at + 1) & (g_wdcap - 1);
+    usize n = 0;
+    while (g_wdslot[at] > 0 && ++n < g_wdcap) at = (at + 1) & (g_wdcap - 1);
+    if (g_wdslot[at] > 0) return;
     if (g_wdslot[at] == 0) g_wdused++;
     g_wdslot[at] = (i32)i + 1;
 }

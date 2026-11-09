@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <pwd.h>
 #include <fcntl.h>
+#include <pthread.h>
 
 #ifdef PLATFORM_MACOS
     #include <mach-o/dyld.h>
@@ -1356,48 +1357,55 @@ static bool helper_copy(const char *src, const char *dst) {
 }
 #endif
 
-const char *liu_helper_exe_dir(void) {
-    static char cached[1024];
-    static bool done;
-    if (done) return cached;
-    done = true;
+static char g_helper_dir[1024];
+
+/* Resolved once per process, on whichever thread asks first: a local pane
+ * can be made on a worker. */
+static void helper_dir_resolve(void) {
+    char *cached = g_helper_dir;
+    usize cap = sizeof g_helper_dir;
     const char *exe = liu_executable_dir();
-    snprintf(cached, sizeof cached, "%s", exe ? exe : "");
+    snprintf(cached, cap, "%s", exe ? exe : "");
 #ifdef __linux__
     /* An AppImage runs from a folder its runtime mounts for this process and
      * names in APPDIR. */
     const char *appdir = getenv("APPDIR");
     usize an = appdir ? strlen(appdir) : 0;
-    if (!an || !exe || strncmp(exe, appdir, an) != 0 || (exe[an] != '/' && exe[an] != '\0')) return cached;
+    if (!an || !exe || strncmp(exe, appdir, an) != 0 || (exe[an] != '/' && exe[an] != '\0')) return;
     const char *home = getenv("HOME");
     if (!home || home[0] != '/') {
         struct passwd *pw = getpwuid(getuid());
         home = pw ? pw->pw_dir : NULL;
     }
-    if (!home || home[0] != '/') return cached;
+    if (!home || home[0] != '/') return;
     char base[1024], dir[1024];
     if ((usize)snprintf(base, sizeof base, "%s/.liu", home) >= sizeof base ||
-        (usize)snprintf(dir, sizeof dir, "%s/helpers", base) >= sizeof dir) return cached;
+        (usize)snprintf(dir, sizeof dir, "%s/helpers", base) >= sizeof dir) return;
     (void)mkdir(base, 0755);
     (void)mkdir(dir, 0700);
     /* Used only when both are this user's own directories, reached through
      * no link, and nobody else can write the folder the copies are in. */
     struct stat st;
     if (lstat(base, &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != geteuid() ||
-        (st.st_mode & (S_IWGRP | S_IWOTH)) != 0) return cached;
+        (st.st_mode & (S_IWGRP | S_IWOTH)) != 0) return;
     if (lstat(dir, &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != geteuid() ||
-        (st.st_mode & (S_IRWXG | S_IRWXO)) != 0) return cached;
+        (st.st_mode & (S_IRWXG | S_IRWXO)) != 0) return;
     static const char *const names[] = { "liu-notify", "liu-history" };
     for (usize i = 0; i < sizeof names / sizeof names[0]; i++) {
         char src[1100], dst[1100];
         snprintf(src, sizeof src, "%s/%s", exe, names[i]);
         snprintf(dst, sizeof dst, "%s/%s", dir, names[i]);
         if (access(src, X_OK) != 0) continue;
-        if (!helper_copy(src, dst)) return cached;
+        if (!helper_copy(src, dst)) return;
     }
-    snprintf(cached, sizeof cached, "%s", dir);
+    snprintf(cached, cap, "%s", dir);
 #endif
-    return cached;
+}
+
+const char *liu_helper_exe_dir(void) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, helper_dir_resolve);
+    return g_helper_dir;
 }
 
 const char *font_user_dir(void) {

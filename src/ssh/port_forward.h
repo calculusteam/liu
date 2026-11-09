@@ -43,8 +43,8 @@ bool forward_open_idle(LIBSSH2_SESSION *owner);
 /* The pane that owns the forwards is leaving a connection that goes on: a TCP /
  * SOCKS open of it that is in flight is carried to its end (the session is in
  * blocking mode, for a short bound) and its channel closed, because libssh2
- * cannot cancel it and the next open on the connection would be handed it. One
- * the bound cuts short stays in flight: forward_cleanup_pane keeps it. */
+ * cannot cancel it and the next open on the connection would be handed it. An
+ * open the bound cuts short stays in flight: forward_cleanup_pane keeps it. */
 void forward_open_settle(LIBSSH2_SESSION *owner);
 void forward_cleanup(LIBSSH2_SESSION *owner);
 /* The pane that started `owner`'s forwards leaves a connection other panes go

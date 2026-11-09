@@ -1929,9 +1929,6 @@ static i32 linux_gtk_work_areas(X11Rect *out, i32 cap) {
     return count;
 }
 
-/* The monitor holding (or nearest to) a root point, less the panels: the work
- * area clipped to it (x11_monitor.h). The whole screen is the monitor when
- * the server lists none. */
 /* The monitors and work areas change seldom (a monitor plugged in, a panel
  * moved), and a tab dragged across the screen asks for them at every motion:
  * they are read from the server again at most every LINUX_FRAME_TTL s. */
@@ -1945,6 +1942,9 @@ static struct {
     i32     na;
 } g_frame_cache;
 
+/* The monitor holding (or nearest to) a root point, less the panels: the work
+ * area clipped to it (x11_monitor.h). The whole screen is the monitor when
+ * the server lists none. */
 static X11Rect linux_visible_frame(i32 px, i32 py) {
     Display *dpy = g_platform.display;
     f64 now = platform_time_sec();
