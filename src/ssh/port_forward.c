@@ -923,10 +923,8 @@ bool forward_get(LIBSSH2_SESSION *owner, i32 index, ForwardRule *out) {
     return true;
 }
 
-void forward_cleanup(LIBSSH2_SESSION *owner) {
-    if (!owner) return;
-
-    FWD_LOCK();
+/* `owner`'s rules, relays and SOCKS handshakes, ended. Under FWD_LOCK. */
+static void forward_end_rules_locked(LIBSSH2_SESSION *owner) {
     for (i32 i = 0; i < g_fwd.rule_hi; i++) {
         if (g_fwd.rules[i].owner != owner) continue;
         if (g_fwd.rules[i].info.active && g_fwd.rules[i].listen_fd >= 0) {
@@ -947,11 +945,50 @@ void forward_cleanup(LIBSSH2_SESSION *owner) {
         SocksPending *p = &g_fwd.socks[i];
         if (p->active && p->owner == owner) socks_pending_drop(p);
     }
+}
+
+void forward_cleanup(LIBSSH2_SESSION *owner) {
+    if (!owner) return;
+
+    FWD_LOCK();
+    forward_end_rules_locked(owner);
     for (i32 i = 0; i < MAX_FORWARD_OPENING; i++) {
         ForwardOpening *p = &g_fwd.opening[i];
         if (p->active && p->owner == owner) opening_drop(p);
     }
     open_gate_forget(&g_fwd.gate, owner);
+    FWD_UNLOCK();
+}
+
+void forward_cleanup_pane(LIBSSH2_SESSION *owner) {
+    if (!owner) return;
+    FWD_LOCK();
+    forward_end_rules_locked(owner);
+    for (i32 i = 0; i < MAX_FORWARD_OPENING; i++) {
+        ForwardOpening *p = &g_fwd.opening[i];
+        if (p->active && p->owner == owner) opening_abandon(p, true);
+    }
+    FWD_UNLOCK();
+}
+
+void forward_open_carry(LIBSSH2_SESSION *owner) {
+    if (!owner) return;
+    FWD_LOCK();
+    for (i32 i = 0; i < MAX_FORWARD_OPENING; i++) {
+        ForwardOpening *p = &g_fwd.opening[i];
+        if (p->active) continue;
+        memset(p, 0, sizeof *p);
+        p->active    = true;
+        p->fd        = -1;
+        p->owner     = owner;
+        p->rule_slot = -1;
+        snprintf(p->host, sizeof p->host, "127.0.0.1");
+        p->port      = 1;
+        p->seq       = ++g_fwd.open_seq;
+        p->started   = true;
+        p->orphan    = true;
+        break;
+    }
     FWD_UNLOCK();
 }
 

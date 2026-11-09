@@ -127,6 +127,14 @@ void bridge_wire_tool_id(char *out, usize cap, const char *prefix, const char *i
             w[n++] = wire_id_byte(*p) ? (char)*p : '_';
         }
     }
+    /* An id already in form that reads like a hashed one ("…_" and 16 hex
+     * digits) is hashed too: kept, it could equal another id's hashed form. */
+    if (kept && n >= 17 && w[n - 17] == '_') {
+        bool hexed = true;
+        for (usize k = n - 16; k < n && hexed; k++)
+            hexed = (w[k] >= '0' && w[k] <= '9') || (w[k] >= 'a' && w[k] <= 'f');
+        if (hexed) kept = false;
+    }
     if (!kept) {
         u64 hv = 1469598103934665603ull;               /* FNV-1a */
         for (const u8 *p = (const u8 *)id; *p; p++) { hv ^= *p; hv *= 1099511628211ull; }

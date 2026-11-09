@@ -137,6 +137,10 @@ static u32 list_items(const u8 *s, u32 n, void (*put)(void *ctx, u32 i, const u8
 
 /* ---- dates ---- */
 
+/* Days a date or a duration may reach, about 8,000 years: any day the chart
+ * adds up stays far inside i64 when it is floored for a label. */
+#define GANTT_DAYS_MAX 3.0e6
+
 static i64 days_from_civil(i64 y, i64 m, i64 d) {
     y -= m <= 2;
     i64 era = (y >= 0 ? y : y - 399) / 400;
@@ -178,8 +182,10 @@ static bool parse_date(const u8 *s, u32 n, const char *fmt, f64 *out) {
         memcpy(buf, s, n); buf[n] = 0;
         char *end;
         f64 v = strtod(buf, &end);
-        if (end == buf || *end) return false;
-        *out = v / (fmt[0] == 'X' ? 86400.0 : 86400000.0);
+        if (end == buf || *end || !isfinite(v)) return false;
+        v /= fmt[0] == 'X' ? 86400.0 : 86400000.0;
+        if (fabs(v) > GANTT_DAYS_MAX) return false;
+        *out = v;
         return true;
     }
     i64 y = 1970, mo = 1, d = 1, h = 0, mi = 0, se = 0;
@@ -213,7 +219,7 @@ static bool parse_duration(const u8 *s, u32 n, f64 *out) {
     f64 k = !strcmp(u, "ms") ? 1.0 / 86400000.0 : !strcmp(u, "s") ? 1.0 / 86400.0 :
             !strcmp(u, "m") ? 1.0 / 1440.0 : !strcmp(u, "h") ? 1.0 / 24.0 : !strcmp(u, "d") ? 1.0 :
             !strcmp(u, "w") ? 7.0 : !strcmp(u, "M") ? 30.0 : !strcmp(u, "y") ? 365.0 : -1.0;
-    if (k < 0) return false;
+    if (k < 0 || v * k > GANTT_DAYS_MAX) return false;
     *out = v * k;
     return true;
 }
@@ -807,6 +813,10 @@ static void xy_axis(const u8 *s, u32 n, char *title, bool *range, f64 *lo, f64 *
     }
 }
 
+#define XY_ABS_MAX 1e15
+
+static bool xy_number_ok(f64 v) { return isfinite(v) && fabs(v) <= XY_ABS_MAX; }
+
 static bool xychart_parse(DScan *sc, const u8 *head, u32 hlen) {
     for (u32 i = 0; i + 10 <= hlen; i++)
         if (!memcmp(head + i, "horizontal", 10)) xy_horizontal = true;
@@ -834,6 +844,13 @@ static bool xychart_parse(DScan *sc, const u8 *head, u32 hlen) {
             if (!se->n) nxs--;
         }
     }
+    /* Every number the axes are worked out from is finite and of a size whose
+     * sums stay finite; a chart with any other is not drawn. */
+    for (u32 k = 0; k < nxs; k++)
+        for (u32 i = 0; i < xs_[k].n; i++)
+            if (!xy_number_ok(xs_[k].v[i])) return false;
+    if (y_given && (!xy_number_ok(y_lo) || !xy_number_ok(y_hi))) return false;
+    if (x_numeric && (!xy_number_ok(x_lo) || !xy_number_ok(x_hi))) return false;
     return nxs > 0;
 }
 
@@ -855,6 +872,10 @@ static void xychart_emit(void) {
     if (!(hi > lo)) hi = lo + 1.0;
     f64 step = nice_step((hi - lo) / 5.0);
     if (!y_given) { lo = floor(lo / step) * step; hi = ceil(hi / step) * step; }
+    /* The value ticks by count, not by adding up a step: near a large bound a
+     * small step can be below the spacing of doubles there. */
+    f64 span = (hi - lo) / step;
+    u32 nticks = isfinite(span) && span > 0.0 ? (u32)fmin(span + 0.5, 64.0) : 1u;
     /* category labels */
     char labs[DGM_MAX_VALUES][DG_ELABEL_CAP];
     for (u32 i = 0; i < n; i++) {
@@ -870,14 +891,15 @@ static void xychart_emit(void) {
     f32 across = xy_horizontal ? g_cw * 60.0f : g_ch * 14.0f;
     char vl[32];
     f32 val_w = 0;
-    for (f64 v = lo; v <= hi + step * 0.5; v += step) { fmt_num(v, vl, sizeof vl); val_w = fmaxf(val_w, text_w(vl)); }
+    for (u32 k = 0; k <= nticks; k++) { fmt_num(lo + step * (f64)k, vl, sizeof vl); val_w = fmaxf(val_w, text_w(vl)); }
     f32 top = title_h() + (y_title[0] && !xy_horizontal ? g_ch * 1.4f : 0.0f);
     f32 t = dg_stroke_w();
     f32 ox, oy, pw, ph;                            /* the plot box */
     if (!xy_horizontal) { ox = val_w + g_cw * 1.5f; oy = top; pw = along; ph = across; }
     else { ox = lab_w + g_cw * 1.5f; oy = top; pw = across; ph = along; }
     /* value grid and labels */
-    for (f64 v = lo; v <= hi + step * 0.5; v += step) {
+    for (u32 k = 0; k <= nticks; k++) {
+        f64 v = lo + step * (f64)k;
         f32 f = (f32)((v - lo) / (hi - lo));
         fmt_num(v, vl, sizeof vl);
         f32 w = text_w(vl);

@@ -41,17 +41,12 @@ bool diag_notify_bin(char *out, usize cap) {
 #elif defined(__linux__)
     /* Same requirement as the bundle path above: an agent spawns the hook with
      * whatever PATH it inherited, which for a desktop-launched agent rarely
-     * includes a self-built or tarball-installed Liu. */
-    char exe[1024];
-    isize elen = readlink("/proc/self/exe", exe, sizeof exe - 1);
-    if (elen > 0) {
-        exe[elen] = '\0';
-        char *slash = strrchr(exe, '/');
-        if (slash) {
-            *slash = '\0';
-            int n = snprintf(out, cap, "%s/liu-notify", exe);
-            if (n > 0 && (usize)n < cap && access(out, X_OK) == 0) return true;
-        }
+     * includes a self-built or tarball-installed Liu. The folder is one that
+     * stays after Liu exits (liu_helper_exe_dir). */
+    const char *dir = liu_helper_exe_dir();
+    if (dir && dir[0]) {
+        int n = snprintf(out, cap, "%s/liu-notify", dir);
+        if (n > 0 && (usize)n < cap && access(out, X_OK) == 0) return true;
     }
 #endif
     int n = snprintf(out, cap, "liu-notify");

@@ -2260,6 +2260,7 @@ typedef struct AppState {
     i32       close_confirm_pane;      /* -1 = whole tab */
     i32       close_confirm_group;     /* -1 = single tab */
     bool      close_confirm_restart;   /* the pane is restarted, not closed */
+    u64       close_confirm_pane_sid;  /* the pane's session when asked: the pane is found by it again */
     char      close_confirm_agent[32]; /* display name, e.g. "Claude Code" */
 
     /* Host key verification dialog */
@@ -3086,6 +3087,9 @@ bool app_md_copy_flash_active(const AppState *app, f64 now);
 /* A dialog, panel or menu is in front of the panes and has the pointer:
  * nothing under it is hovered or told of it (ui.c, the one list). */
 bool app_dialog_has_pointer(const AppState *a);
+/* Can the explorer's status card be seen: the sidebar is up and wide enough
+ * for it, and an SFTP transfer's card is not in its place. */
+bool app_fb_status_card_room(const AppState *app);
 /* True while the glyph atlas has been relaid out since this window's row
  * caches were built — a grow or a shelf reclaim re-normalises every published
  * UV, and the caches hold those UVs baked into GPU instances. The loop turns

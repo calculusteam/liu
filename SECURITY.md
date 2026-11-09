@@ -11,8 +11,9 @@ Use GitHub's private reporting form: this repository's **Security** tab →
 
 A report is most useful when it says:
 
-- the version and build (`Liu --version`, or Settings › About) and the macOS
-  version;
+- the version and build (`Liu --version`, or Settings › About), and the macOS
+  version, or the Linux distribution and how Liu was installed (.deb, .rpm,
+  AppImage or tarball);
 - what an attacker has to control — the bytes a program prints in a pane, a
   file Liu opens, a server it connects to, a page in the built-in browser;
 - the smallest input or sequence of steps that shows the problem, and what
@@ -43,7 +44,8 @@ write or a network request.
 
 Fixes are made on the latest release; Liu updates itself from the signed feed
 on this repository's releases, so a fixed version reaches installed copies
-through the in-app updater.
+through the in-app updater (on Linux, a tarball install; a .deb, .rpm or
+AppImage is updated from the release page).
 
 ## How untrusted input is tested
 

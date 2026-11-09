@@ -4610,9 +4610,26 @@ static bool app_confirm_close_arm(AppState *app, i32 tab_index, i32 pane, i32 gr
     app->close_confirm_pane = pane;
     app->close_confirm_group = group;
     app->close_confirm_restart = false;
+    app->close_confirm_pane_sid = pane >= 0 && tab_index >= 0 && tab_index < app->tab_count
+        ? session_instance_id(tab_pane_session_at(&app->tabs[tab_index], pane)) : 0;
     snprintf(app->close_confirm_agent, sizeof(app->close_confirm_agent),
              "%s", (disp && disp[0]) ? disp : "An AI agent");
     return true;
+}
+
+/* The pane the close question was about, where it is now: another pane of the
+ * tab closing meanwhile moves it. -1 when it is gone. */
+static i32 liu_confirm_pane_now(const AppState *app) {
+    i32 t = app->close_confirm_tab;
+    if (t < 0 || t >= app->tab_count || app->close_confirm_pane < 0) return -1;
+    const Tab *tab = &app->tabs[t];
+    if (!app->close_confirm_pane_sid) return app->close_confirm_pane;
+    i32 n = app_tab_pane_count(tab);       /* a slot past the count may hold a stale pointer */
+    for (i32 p = 0; p < n; p++) {
+        Session *s = tab_pane_session_at(tab, p);
+        if (s && session_instance_id(s) == app->close_confirm_pane_sid) return p;
+    }
+    return -1;
 }
 
 /* Restart Shell, from a pane's menu, the palette or its chord. It ends what
@@ -8291,7 +8308,7 @@ static void app_fb_status(AppState *app, FbStatusKind kind, const char *fmt, ...
      * explorer's is on screen only while the sidebar is up, so otherwise the
      * result is a notice. */
     if (app->fb_actor.id & FB_ACTOR_RAIL) {
-        if (!(app->sidebar_visible && app->sidebar_width >= 150.0f * app->dpi_scale))
+        if (!app_fb_status_card_room(app))
             app_show_toast_kind(app, kind == FB_STATUS_ERROR ? NOTIFY_ERROR : NOTIFY_SUCCESS,
                                 app->fb_status);
     }
@@ -13203,7 +13220,9 @@ static FileBrowser *app_editor_drag_live(AppState *a) {
  * in progress is not published at every move). */
 static void app_editor_publish_primary(AppState *a) {
     FileBrowser *fb = app_editing_fb(a);
-    if (!fb || !fb_editor_sel_active(fb)) return;
+    /* No selection forgets the last one: the same range selected again, after
+     * another application took PRIMARY, is published again. */
+    if (!fb || !fb_editor_sel_active(fb)) { a->ed_primary_sig = 0; return; }
     u64 sig = editor_primary_sig(fb, fb->view_edit_gen, fb->sel_line, fb->sel_col,
                                  fb->cursor_line, fb->cursor_col);
     if (sig == a->ed_primary_sig) return;
@@ -17361,7 +17380,7 @@ static void liu_script_screen(AppState *a, const char *arg) {
  * pressed (the window is never key, so no other reaches it). */
 static bool liu_script_drop_real(const PlatformEvent *ev) {
     if (s_find_demo_own_event) { s_find_demo_own_event = false; return false; }
-    /* A drive that moves the pointer itself (xdotool on X11, in a container)
+    /* A drive that moves the pointer itself (a pointer tool on X11, in a container)
      * and reads the app back through the script keeps its mouse. */
     static i32 real_mouse = -1;
     if (real_mouse < 0) real_mouse = liu_dev_env("LIU_E2E_REAL_MOUSE") != NULL;
@@ -24728,19 +24747,16 @@ int main(int argc, char **argv) {
                     if (app.close_confirm_restart) {
                         /* The flag stays: the question fades out as it was
                          * asked. The next arm clears it. */
-                        if (app.close_confirm_tab >= 0 && app.close_confirm_tab < app.tab_count)
-                            (void)app_restart_pane(&app, app.close_confirm_tab,
-                                                   app.close_confirm_pane);
+                        i32 rp = liu_confirm_pane_now(&app);
+                        if (rp >= 0) (void)app_restart_pane(&app, app.close_confirm_tab, rp);
                         continue;
                     }
                     if (app.close_confirm_group >= 0) {
                         app_close_tab_group(&app, app.close_confirm_group);
                     } else if (app.close_confirm_pane >= 0) {
                         /* Pane close never empties the tab strip. */
-                        if (app.close_confirm_tab >= 0 &&
-                            app.close_confirm_tab < app.tab_count)
-                            app_close_split_pane(&app, app.close_confirm_tab,
-                                                 app.close_confirm_pane);
+                        i32 cp = liu_confirm_pane_now(&app);
+                        if (cp >= 0) app_close_split_pane(&app, app.close_confirm_tab, cp);
                         continue;
                     } else if (app.close_confirm_tab >= 0 &&
                                app.close_confirm_tab < app.tab_count) {
@@ -24952,11 +24968,16 @@ int main(int argc, char **argv) {
                 case EVENT_MOUSE_UP:
                     consumed = lightbox_mouse_up(&app);
                     break;
-                case EVENT_MOUSE_MOVE:
+                case EVENT_MOUSE_MOVE: {
                     app.hover_x = (f32)event.mouse.x;
                     app.hover_y = (f32)event.mouse.y;
-                    consumed = lightbox_mouse_move(&app, app.hover_x, app.hover_y);
+                    /* Swallowed either way; only a drag's pan changes what is drawn. */
+                    bool panned = app.lightbox.dragging;
+                    (void)lightbox_mouse_move(&app, app.hover_x, app.hover_y);
+                    if (!panned) continue;
+                    consumed = true;
                     break;
+                }
                 case EVENT_SCROLL:
                     consumed = lightbox_scroll(&app, (f32)event.scroll.dy,
                                                event.scroll.precise);
@@ -24992,11 +25013,16 @@ int main(int argc, char **argv) {
                 case EVENT_MOUSE_UP:
                     consumed = diagram_viewer_mouse_up(&app);
                     break;
-                case EVENT_MOUSE_MOVE:
+                case EVENT_MOUSE_MOVE: {
                     app.hover_x = (f32)event.mouse.x;
                     app.hover_y = (f32)event.mouse.y;
-                    consumed = diagram_viewer_mouse_move(&app, app.hover_x, app.hover_y);
+                    /* Swallowed either way; only a drag's pan changes what is drawn. */
+                    bool panned = app.dgv.dragging;
+                    (void)diagram_viewer_mouse_move(&app, app.hover_x, app.hover_y);
+                    if (!panned) continue;
+                    consumed = true;
                     break;
+                }
                 case EVENT_SCROLL:
                     consumed = diagram_viewer_scroll(&app, (f32)event.scroll.dx,
                                                      (f32)event.scroll.dy,

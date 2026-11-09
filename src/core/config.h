@@ -558,6 +558,14 @@ const char *font_user_dir(void);
  * Used to find sibling helper binaries (liu-history, agenthistory, …). */
 const char *liu_executable_dir(void);
 
+/* The folder liu-notify and liu-history are run from by what outlives this
+ * process: the agents' hook shim and the pane PATH's helper links. It is
+ * liu_executable_dir(), except where that folder goes away when Liu exits
+ * and another user could make it again (an AppImage's mount under /tmp):
+ * then a copy of both in a folder only this user can write (~/.liu/helpers),
+ * renewed when they differ. Cached on first call; empty when unresolved. */
+const char *liu_helper_exe_dir(void);
+
 /* Get the custom font directory under the repository font root. */
 const char *font_custom_dir(void);
 

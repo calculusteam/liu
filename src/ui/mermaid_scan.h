@@ -122,6 +122,10 @@ typedef struct {
  * closing delimiter) are not judged: the block is whole when it closes. */
 u32 mmd_find(const MmdScreen *scr, MmdBlock *out, u32 cap, char *src, u32 src_cap);
 
+/* Rows the scans have walked since the process began: a diagnostic count of
+ * the work mmd_find did. Main thread only, like mmd_find's callers. */
+u64 mmd_rows_walked(void);
+
 /* How far the rows moved between two pictures of the same pane: the `shift`
  * for which cur[y] reads as old[y + shift] over the longest run of rows, and
  * that run, cur[*run0..*run1]. A run counts by its non-blank rows and needs

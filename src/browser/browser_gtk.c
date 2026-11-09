@@ -45,8 +45,14 @@
 #undef KeyCode
 
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <math.h>
 #include <pthread.h>
+#include <signal.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -104,6 +110,8 @@ static struct {
     WK_FUNCS(WK_PTR)
 #undef WK_PTR
     __typeof__(&webkit_web_view_get_theme_color) webkit_web_view_get_theme_color;   /* 2.42+, optional */
+    __typeof__(&webkit_web_context_get_default) webkit_web_context_get_default;     /* optional */
+    __typeof__(&webkit_web_context_set_sandbox_enabled) webkit_web_context_set_sandbox_enabled;
 } W;
 
 /* The X shape extension, from the library's own dependencies (GDK links it):
@@ -186,6 +194,46 @@ static void wk_pump(void *ctx) {
     for (i32 i = 0; i < 64 && (W.g_main_context_iteration)(NULL, FALSE); i++) {}
 }
 
+/* Can WebKit's sandbox run here: its two helpers are installed, and the
+ * sandbox tool starts a program at all (user namespaces may be turned off, or
+ * forbidden in a container). Asked once, before the first page; bounded. */
+static bool wk_sandbox_works(void) {
+    static const char *const bwraps[] = { "/usr/bin/bwrap", "/usr/local/bin/bwrap" };
+    static const char *const proxies[] = { "/usr/bin/xdg-dbus-proxy", "/usr/local/bin/xdg-dbus-proxy",
+                                           "/usr/libexec/xdg-dbus-proxy" };
+    const char *bwrap = NULL;
+    bool proxy = false;
+    for (usize i = 0; i < sizeof bwraps / sizeof bwraps[0] && !bwrap; i++)
+        if (access(bwraps[i], X_OK) == 0) bwrap = bwraps[i];
+    for (usize i = 0; i < sizeof proxies / sizeof proxies[0] && !proxy; i++)
+        proxy = access(proxies[i], X_OK) == 0;
+    if (!bwrap || !proxy || access("/bin/true", X_OK) != 0) return false;
+    char *argv[] = { (char *)bwrap, (char *)"--ro-bind", (char *)"/", (char *)"/",
+                     (char *)"--unshare-pid", (char *)"--dev", (char *)"/dev",
+                     (char *)"--proc", (char *)"/proc", (char *)"/bin/true", NULL };
+    char *envp[] = { NULL };
+    posix_spawn_file_actions_t fa;
+    if (posix_spawn_file_actions_init(&fa) != 0) return false;
+    posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+    pid_t pid = -1;
+    bool started = posix_spawn(&pid, bwrap, &fa, NULL, argv, envp) == 0;
+    posix_spawn_file_actions_destroy(&fa);
+    if (!started) return false;
+    int st = 0;
+    for (int waited = 0; waited < 200; waited++) {          /* up to 2 s */
+        pid_t r = waitpid(pid, &st, WNOHANG);
+        if (r == pid) return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+        if (r < 0) return false;
+        struct timespec t = { 0, 10 * 1000 * 1000 };
+        nanosleep(&t, NULL);
+    }
+    kill(pid, SIGKILL);
+    waitpid(pid, &st, 0);
+    return false;
+}
+
 static bool wk_load(void) {
     if (g_wk_state) return g_wk_state > 0;
     g_wk_state = -1;
@@ -203,6 +251,8 @@ static bool wk_load(void) {
     WK_FUNCS(WK_SYM)
 #undef WK_SYM
     *(void **)(&W.webkit_web_view_get_theme_color) = dlsym(g_wk_lib, "webkit_web_view_get_theme_color");
+    *(void **)(&W.webkit_web_context_get_default) = dlsym(g_wk_lib, "webkit_web_context_get_default");
+    *(void **)(&W.webkit_web_context_set_sandbox_enabled) = dlsym(g_wk_lib, "webkit_web_context_set_sandbox_enabled");
     *(void **)(&g_shape_mask) = dlsym(g_wk_lib, "XShapeCombineMask");
     C.ok = true;
 #define WK_SYM(fn) *(void **)(&C.fn) = dlsym(g_wk_lib, #fn); if (!C.fn) C.ok = false;
@@ -232,6 +282,11 @@ static bool wk_load(void) {
     static const PlatformPollSource src = {
         .prepare = wk_prepare, .dispatch = wk_dispatch, .pump = wk_pump, .ctx = NULL };
     platform_x11_set_poll_source(&src);
+    /* The pages' processes in WebKit's sandbox where it can run: without it a
+     * page's process has every permission Liu has. Set before the first page,
+     * as WebKit requires. */
+    if (W.webkit_web_context_get_default && W.webkit_web_context_set_sandbox_enabled && wk_sandbox_works())
+        (W.webkit_web_context_set_sandbox_enabled)((W.webkit_web_context_get_default)(), TRUE);
     g_wk_state = 1;
     return true;
 missing:
@@ -879,7 +934,7 @@ static bool set_pick_mode(BrowserNative *n, bool on) {
 /* --- script messages (top frame, Liu's world) ------------------------------ */
 
 /* A string property of a message, clipped to `cap` bytes on a character; NULL
- * when it is absent or not a string. g_free'd by the caller via free_js. */
+ * when it is absent or not a string. malloc'd: the caller frees it. */
 static char *js_str(JSCValue *obj, const char *key, usize cap) {
     JSCValue *v = (W.jsc_value_object_get_property)(obj, key);
     if (!v) return NULL;
@@ -1338,8 +1393,9 @@ static gboolean on_load_failed(WebKitWebView *v, WebKitLoadEvent e, gchar *uri, 
     return TRUE;
 }
 
-/* The loopback trust exception belongs to this view alone: a certificate a
- * local dev server made for itself. Anything else fails as WebKit decides. */
+/* A certificate a local dev server made for itself is trusted for its
+ * loopback host: the exception is the web context's, so every page Liu shows
+ * takes it for that host. Anything else fails as WebKit decides. */
 static gboolean on_tls_error(WebKitWebView *v, gchar *uri, GTlsCertificate *cert, GTlsCertificateFlags f,
                              gpointer data) {
     (void)f;

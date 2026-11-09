@@ -674,43 +674,6 @@ static bool notify_default_sound_path(const char *name, char *out, usize cap) {
     return true;
 }
 
-/* Resolve the absolute path of the liu-notify binary that ships next to
- * Liu. The Claude hook installer needs an absolute path so Claude can
- * spawn it regardless of the shell PATH it inherits. Falls back to the
- * bare name "liu-notify" if introspection fails — that still works when
- * the user has the binary on PATH. */
-static bool resolve_liu_notify_path(char *out, size_t cap) {
-    if (!out || cap < 4) return false;
-#if defined(__APPLE__)
-    char exe[1024]; uint32_t exe_sz = sizeof exe;
-    if (_NSGetExecutablePath(exe, &exe_sz) == 0) {
-        char *slash = strrchr(exe, '/');
-        if (slash) {
-            *slash = '\0';
-            int n = snprintf(out, cap, "%s/liu-notify", exe);
-            if (n > 0 && (usize)n < cap) return true;
-        }
-    }
-#elif defined(__linux__)
-    /* /proc/self/exe is the Linux _NSGetExecutablePath: the hook command
-     * written into ~/.claude/settings.json must be absolute, because the agent
-     * that runs it does not inherit the user's interactive shell PATH. */
-    char exe[1024];
-    ssize_t elen = readlink("/proc/self/exe", exe, sizeof exe - 1);
-    if (elen > 0) {
-        exe[elen] = '\0';
-        char *slash = strrchr(exe, '/');
-        if (slash) {
-            *slash = '\0';
-            int n = snprintf(out, cap, "%s/liu-notify", exe);
-            if (n > 0 && (usize)n < cap && access(out, X_OK) == 0) return true;
-        }
-    }
-#endif
-    int n = snprintf(out, cap, "liu-notify");
-    return n > 0 && (usize)n < cap;
-}
-
 /* Populate the freshly-loaded config with bundled defaults. Called from (a)
  * first-install (no notify.conf existed) and (b) "Reset to bundled defaults"
  * — both want a clean slate so the bundled (any, event) rules (rank 1 in the
@@ -8497,7 +8460,7 @@ static bool settings_handle_click_impl(SettingsPanel *sp, f32 x, f32 y, f32 sw, 
                          * build is cleaned or the app moves, which is what
                          * the shim exists for (agent_hooks.h). */
                         char nbin[1024];
-                        resolve_liu_notify_path(nbin, sizeof nbin);
+                        if (!diag_notify_bin(nbin, sizeof nbin)) nbin[0] = '\0';
                         res = agent_hook_install_shimmed(id, nbin);
                         if (res.ok)
                             snprintf(sp->notify_hook_installed,

@@ -7,7 +7,7 @@
 <p align="center">
   <strong>一个终端，连接所有 AI 代理。</strong><br>
   Liu 位于你与各类编码代理之间，让十余条并行线程像在同一个地方工作。<br>
-  使用 <strong>C</strong> 编写，macOS 原生，GPU 加速。
+  使用 <strong>C</strong> 编写，macOS 与 Linux 原生，GPU 加速。
 </p>
 
 <p align="center">
@@ -143,12 +143,15 @@ Liu 在运行时就会保存你的标签页，因此退出、崩溃或重启后�
 | :--- | :--- | :--- |
 | **macOS** | Apple Silicon (arm64) | `.dmg` |
 | **macOS** | Intel (x86_64) | `.dmg` |
+| **Linux** | x86_64 | `.deb` · `.rpm` · `.AppImage` · `.tar.gz` |
+| **Linux** | ARM64 (aarch64) | `.deb` · `.rpm` · `.AppImage` · `.tar.gz` |
 
-macOS 是主要且目前唯一支持的目标平台。
+Linux 需要 glibc 2.35 或更高版本（Ubuntu 22.04、Debian 12、Fedora 36 及以后）以及 X11 会话；在 Wayland 桌面上 Liu 通过 XWayland 运行。浏览器面板在已安装 WebKitGTK 4.1 时使用它。在 Linux 上，每个快捷键都与 macOS 相同，只是 ⌘ 换成 Ctrl+Shift，⌘⇧ 换成 Ctrl+Alt+Shift（⌘K 即 Ctrl+Shift+K）；用 Super 加相同按键也可以。可从 [Releases](https://github.com/calculusteam/liu/releases) 页面安装，或运行 `curl -fsSL https://raw.githubusercontent.com/calculusteam/liu/main/scripts/install.sh | bash`。
 
 ## 我们的目标
 
-- [ ] **Linux 支持**，ARM64 与 x86_64 构建（`.tar.gz`）、apt (PPA)、dnf (COPR) 与 AUR。Linux 已在规划中，但当前不受支持。
+- [x] **Linux 支持**，ARM64 与 x86_64 构建（`.deb`、`.rpm`、`.AppImage`、`.tar.gz`）。
+- [ ] **Linux 软件源**，apt (PPA)、dnf (COPR) 与 AUR。
 
 ---
 
@@ -157,6 +160,7 @@ macOS 是主要且目前唯一支持的目标平台。
 **依赖**
 
 - macOS，`brew install libssh2`
+- Linux (Debian, Ubuntu)，`sudo apt install build-essential cmake ninja-build pkg-config libx11-dev libxcursor-dev libxi-dev libxrandr-dev libfontconfig1-dev libfreetype-dev libharfbuzz-dev libdbus-1-dev libgl1-mesa-dev libssh2-1-dev libssl-dev`
 - SQLite3、stb_truetype、stb_image 与 cJSON 已置于 `third_party/`
 
 ```bash
@@ -169,6 +173,7 @@ git clone https://github.com/calculusteam/liu.git && cd liu
 # 或直接使用 CMake：
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(sysctl -n hw.ncpu)
+# Linux: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DUSE_METAL=OFF && cmake --build build -j$(nproc)
 ./build/Liu
 ```
 

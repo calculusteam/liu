@@ -79,6 +79,10 @@ void anim_wake_at(f64 t);
 f64  anim_wake_in(f64 now);
 bool anim_wake_due_for(const void *owner, f64 now);
 void anim_wake_settle(f64 now);
+/* `owner`'s window is going away: what it registered is forgotten, so no
+ * deadline or pending moment of a window nobody asks about any more keeps the
+ * loop awake, and its slot is free for another window. */
+void anim_forget_owner(const void *owner);
 
 /* -------------------------------------------------------------------------
  * Universal hover easing.

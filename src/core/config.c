@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <pwd.h>
+#include <fcntl.h>
 
 #ifdef PLATFORM_MACOS
     #include <mach-o/dyld.h>
@@ -1309,6 +1310,93 @@ const char *liu_executable_dir(void) {
     static char cached[1024] = {0};
     if (cached[0]) return cached;
     if (!resolve_executable_dir(cached, sizeof(cached))) cached[0] = '\0';
+    return cached;
+}
+
+#ifdef __linux__
+/* `dst` made a copy of `src` unless it is one already: written beside it and
+ * renamed over it, so a copy is never seen half written. */
+static bool helper_copy(const char *src, const char *dst) {
+    int in = open(src, O_RDONLY | O_CLOEXEC);
+    if (in < 0) return false;
+    struct stat ss, ds;
+    bool same = false;
+    if (fstat(in, &ss) == 0 && lstat(dst, &ds) == 0 && S_ISREG(ds.st_mode) && ds.st_size == ss.st_size) {
+        int cur = open(dst, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (cur >= 0) {
+            same = true;
+            char a[65536], b[65536];
+            for (;;) {
+                ssize_t na = read(in, a, sizeof a), nb = read(cur, b, sizeof b);
+                if (na < 0 || nb < 0 || na != nb || memcmp(a, b, (usize)na)) { same = false; break; }
+                if (na == 0) break;
+            }
+            close(cur);
+        }
+    }
+    if (same) { close(in); return true; }
+    if (lseek(in, 0, SEEK_SET) != 0) { close(in); return false; }
+    char tmp[1100];
+    if ((usize)snprintf(tmp, sizeof tmp, "%s.part", dst) >= sizeof tmp) { close(in); return false; }
+    unlink(tmp);
+    int out = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0700);
+    if (out < 0) { close(in); return false; }
+    bool ok = true;
+    char buf[65536];
+    for (;;) {
+        ssize_t n = read(in, buf, sizeof buf);
+        if (n == 0) break;
+        if (n < 0 || write(out, buf, (usize)n) != n) { ok = false; break; }
+    }
+    close(in);
+    if (close(out) != 0) ok = false;
+    if (ok && rename(tmp, dst) != 0) ok = false;
+    if (!ok) unlink(tmp);
+    return ok;
+}
+#endif
+
+const char *liu_helper_exe_dir(void) {
+    static char cached[1024];
+    static bool done;
+    if (done) return cached;
+    done = true;
+    const char *exe = liu_executable_dir();
+    snprintf(cached, sizeof cached, "%s", exe ? exe : "");
+#ifdef __linux__
+    /* An AppImage runs from a folder its runtime mounts for this process and
+     * names in APPDIR. */
+    const char *appdir = getenv("APPDIR");
+    usize an = appdir ? strlen(appdir) : 0;
+    if (!an || !exe || strncmp(exe, appdir, an) != 0 || (exe[an] != '/' && exe[an] != '\0')) return cached;
+    const char *home = getenv("HOME");
+    if (!home || home[0] != '/') {
+        struct passwd *pw = getpwuid(getuid());
+        home = pw ? pw->pw_dir : NULL;
+    }
+    if (!home || home[0] != '/') return cached;
+    char base[1024], dir[1024];
+    if ((usize)snprintf(base, sizeof base, "%s/.liu", home) >= sizeof base ||
+        (usize)snprintf(dir, sizeof dir, "%s/helpers", base) >= sizeof dir) return cached;
+    (void)mkdir(base, 0755);
+    (void)mkdir(dir, 0700);
+    /* Used only when both are this user's own directories, reached through
+     * no link, and nobody else can write the folder the copies are in. */
+    struct stat st;
+    if (lstat(base, &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != geteuid() ||
+        (st.st_mode & (S_IWGRP | S_IWOTH)) != 0) return cached;
+    if (lstat(dir, &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != geteuid() ||
+        (st.st_mode & (S_IRWXG | S_IRWXO)) != 0) return cached;
+    static const char *const names[] = { "liu-notify", "liu-history" };
+    for (usize i = 0; i < sizeof names / sizeof names[0]; i++) {
+        char src[1100], dst[1100];
+        snprintf(src, sizeof src, "%s/%s", exe, names[i]);
+        snprintf(dst, sizeof dst, "%s/%s", dir, names[i]);
+        if (access(src, X_OK) != 0) continue;
+        if (!helper_copy(src, dst)) return cached;
+    }
+    snprintf(cached, sizeof cached, "%s", dir);
+#endif
     return cached;
 }
 

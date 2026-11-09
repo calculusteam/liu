@@ -591,7 +591,8 @@ bool session_is_sftp_only(const Session *s);
 const char *session_fg_process(Session *s);
 /* Keystroke-safe lookup: never scans processes or argv. Empty when the cached
  * answer is expired or no longer belongs to the current foreground group. On
- * Linux, where the lookup is one /proc read, it is session_fg_process(). */
+ * Linux, where the lookup reads a few /proc files of the pane's own process
+ * tree, it is session_fg_process(). */
 const char *session_fg_process_cached(Session *s);
 
 /* Foreground process-group leader pid on the tab's PTY (local PTY only).

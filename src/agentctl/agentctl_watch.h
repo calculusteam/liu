@@ -30,7 +30,7 @@ static inline bool agentctl_watch_skip_name(const char *name, usize len) {
     static const char *const names[] = {
         ".git", "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".next",
         ".turbo", ".parcel-cache", ".gradle", "DerivedData", ".venv", ".idea", ".DS_Store", "4913",
-        "Library", ".cache", ".Trash",
+        "Library", ".cache", ".Trash", "target", "venv", ".tox",
     };
     for (usize i = 0; i < sizeof names / sizeof names[0]; i++)
         if (strlen(names[i]) == len && !strncmp(name, names[i], len)) return true;

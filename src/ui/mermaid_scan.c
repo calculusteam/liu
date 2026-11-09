@@ -475,8 +475,12 @@ static void mmd_math_source(MmdOut *o, MmdKind kind) {
 /* Walk the block whose header is on row `head` (its label on `row0`), with
  * `width` the column the agent's wrap stops at. `force` is the kind a label
  * gave it (-1: from its header); `fenced`, that the label opened a fence. */
+static u64 g_rows_walked;
+u64 mmd_rows_walked(void) { return g_rows_walked; }
+
 static bool mmd_walk(const MmdScreen *scr, i32 row0, i32 head, i32 width, i32 force, bool fenced,
-                     MmdBlock *b, char *dst, u32 cap) {
+                     MmdBlock *b, char *dst, u32 cap, i32 *budget) {
+    if (--*budget < 0) return false;
     const MmdRow *rows = scr->rows;
     const MmdRow *hr = &rows[head];
     i32 col0 = hr->t0;
@@ -528,6 +532,10 @@ static bool mmd_walk(const MmdScreen *scr, i32 row0, i32 head, i32 width, i32 fo
     if (closed) row1 = head;
     i32 y;
     for (y = head + 1; y < scr->nrows && !closed; y++) {
+        /* a source that no longer fits is not a block; the rows after it
+         * would only be read to be thrown away */
+        if (out.full || --*budget < 0) return false;
+        g_rows_walked++;
         const MmdRow *r = &rows[y];
         if (r->kind == MMD_ROW_BLANK) {
             /* math under a label ends at its first blank row: display math has none */
@@ -643,10 +651,16 @@ static bool mmd_walk(const MmdScreen *scr, i32 row0, i32 head, i32 width, i32 fo
     return out.len > 0;
 }
 
+#define MMD_FIND_PASSES 6
+
 u32 mmd_find(const MmdScreen *scr, MmdBlock *out, u32 cap, char *src, u32 src_cap) {
     if (!scr || !scr->rows || scr->nrows <= 0 || scr->cols <= 0 || !out || !src) return 0;
     u32 nb = 0, used = 0;
-    for (i32 y = 0; y < scr->nrows && nb < cap; y++) {
+    /* Rows whose text is read, in all, as a few passes over the screen: a run
+     * of headers whose blocks never close would otherwise each be walked to
+     * the end. (The summaries alone, as the width is worked out, cost little.) */
+    i32 budget = MMD_FIND_PASSES * scr->nrows + 64;
+    for (i32 y = 0; y < scr->nrows && nb < cap && budget > 0; y++) {
         const MmdRow *r = &scr->rows[y];
         i32 head = -1, force = -1;
         bool fenced = false;
@@ -687,7 +701,7 @@ u32 mmd_find(const MmdScreen *scr, MmdBlock *out, u32 cap, char *src, u32 src_ca
             i32 rl = framed ? rk->t1 : rk->last;
             if (rl + 1 > width) width = rl + 1;
         }
-        bool walked = mmd_walk(scr, y, head, width, force, fenced, &b, src + used, room);
+        bool walked = mmd_walk(scr, y, head, width, force, fenced, &b, src + used, room, &budget);
         if (walked) {
             i32 own = hr->t1 + 1;
             for (i32 k = head + 1; k <= b.row1 && k < scr->nrows; k++) {
@@ -696,7 +710,7 @@ u32 mmd_find(const MmdScreen *scr, MmdBlock *out, u32 cap, char *src, u32 src_ca
                 i32 rl = framed ? rk->t1 : rk->last;
                 if (rl + 1 > own) own = rl + 1;
             }
-            if (own != width) walked = mmd_walk(scr, y, head, own, force, fenced, &b, src + used, room);
+            if (own != width) walked = mmd_walk(scr, y, head, own, force, fenced, &b, src + used, room, &budget);
         }
         if (walked && scr->want_n > 0 &&
             (b.row1 < scr->want_lo || b.row0 >= scr->want_lo + scr->want_n)) {

@@ -1932,21 +1932,36 @@ static i32 linux_gtk_work_areas(X11Rect *out, i32 cap) {
 /* The monitor holding (or nearest to) a root point, less the panels: the work
  * area clipped to it (x11_monitor.h). The whole screen is the monitor when
  * the server lists none. */
+/* The monitors and work areas change seldom (a monitor plugged in, a panel
+ * moved), and a tab dragged across the screen asks for them at every motion:
+ * they are read from the server again at most every LINUX_FRAME_TTL s. */
+#define LINUX_FRAME_TTL 0.5
+static struct {
+    f64     at;
+    X11Rect screen, work;
+    X11Rect mons[X11_MONITORS_MAX];
+    i32     nm;
+    X11Rect areas[X11_WORKAREAS_MAX];
+    i32     na;
+} g_frame_cache;
+
 static X11Rect linux_visible_frame(i32 px, i32 py) {
     Display *dpy = g_platform.display;
-    X11Rect mon = { 0, 0, DisplayWidth(dpy, g_platform.screen),
-                    DisplayHeight(dpy, g_platform.screen) };
-    {
-        X11Rect r[X11_MONITORS_MAX];
-        i32 n = x11x_monitors(dpy, g_platform.screen, r, X11_MONITORS_MAX, NULL);
-        i32 at = x11_monitor_at(r, n, px, py);
-        if (at >= 0) mon = r[at];
+    f64 now = platform_time_sec();
+    if (g_frame_cache.at <= 0.0 || now - g_frame_cache.at > LINUX_FRAME_TTL) {
+        g_frame_cache.screen = (X11Rect){ 0, 0, DisplayWidth(dpy, g_platform.screen),
+                                          DisplayHeight(dpy, g_platform.screen) };
+        g_frame_cache.nm = x11x_monitors(dpy, g_platform.screen, g_frame_cache.mons, X11_MONITORS_MAX, NULL);
+        i32 ax, ay, aw, ah;
+        linux_work_area(&ax, &ay, &aw, &ah);
+        g_frame_cache.work = (X11Rect){ ax, ay, aw, ah };
+        g_frame_cache.na = linux_gtk_work_areas(g_frame_cache.areas, X11_WORKAREAS_MAX);
+        g_frame_cache.at = now;
     }
-    i32 ax, ay, aw, ah;
-    linux_work_area(&ax, &ay, &aw, &ah);
-    X11Rect areas[X11_WORKAREAS_MAX];
-    i32 na = linux_gtk_work_areas(areas, X11_WORKAREAS_MAX);
-    return x11_monitor_work(mon, areas, na, (X11Rect){ ax, ay, aw, ah });
+    X11Rect mon = g_frame_cache.screen;
+    i32 at = x11_monitor_at(g_frame_cache.mons, g_frame_cache.nm, px, py);
+    if (at >= 0) mon = g_frame_cache.mons[at];
+    return x11_monitor_work(mon, g_frame_cache.areas, g_frame_cache.na, g_frame_cache.work);
 }
 
 bool platform_screen_visible_frame_at(f32 sx, f32 sy,

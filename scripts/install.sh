@@ -1,15 +1,15 @@
 #!/bin/bash
 #
-# Liu installer — https://github.com/calculusteam/liu/releases/latest/download/install.sh
+# Liu installer — https://raw.githubusercontent.com/calculusteam/liu/main/scripts/install.sh
 #
 # Downloads the latest signed Liu build from the release feed, verifies it, and
 # installs it: on macOS the .app (-> /Applications), on Linux the release
 # tarball (-> /opt/liu, or ~/.local/liu without write access to /opt).
 #
 # Usage:
-#   curl -fsSL https://github.com/calculusteam/liu/releases/latest/download/install.sh | bash             # latest
-#   curl -fsSL https://github.com/calculusteam/liu/releases/latest/download/install.sh | bash -s 0.1.0    # specific version
-#   curl -fsSL https://github.com/calculusteam/liu/releases/latest/download/install.sh | bash -s -- --uninstall   # Linux: remove it again
+#   curl -fsSL https://raw.githubusercontent.com/calculusteam/liu/main/scripts/install.sh | bash             # latest
+#   curl -fsSL https://raw.githubusercontent.com/calculusteam/liu/main/scripts/install.sh | bash -s 0.1.0    # specific version
+#   curl -fsSL https://raw.githubusercontent.com/calculusteam/liu/main/scripts/install.sh | bash -s -- --uninstall   # Linux: remove it again
 #   install.sh --help                    # the same, and what --uninstall removes
 #
 # Env:
@@ -403,8 +403,19 @@ un_by_manifest() {
     _um="$UN_PREFIX/$MF_NAME"
     awk -F'\t' '$1 == "f" && NF == 3 { print $2 "\t" $3 }' "$_um" > "$UN_TMP/f.list"
     awk -F'\t' '$1 == "l" && NF == 3 { print $2 "\t" $3 }' "$_um" > "$UN_TMP/l.list"
-    awk -F'\t' '$1 == "d" && NF == 2 { print length($2) "\t" $2 }' "$_um" | LC_ALL=C sort -t "$TAB" -k1,1nr -k2 | cut -f2- > "$UN_TMP/d.list"
-    awk -F'\t' '$1 == "cache" && NF == 2 { print $2 }' "$_um" > "$UN_TMP/c.list"
+    # A directory outside the prefix is one the install made for a file or a link
+    # it recorded below it; an icon cache is a hicolor theme's.
+    awk -F'\t' -v p="$UN_PREFIX" '
+        ($1 == "f" || $1 == "l") && NF == 3 { below[++nb] = $2 }
+        $1 == "d" && NF == 2 { d[++nd] = $2 }
+        END {
+            for (i = 1; i <= nd; i++) {
+                ok = (d[i] == p || substr(d[i], 1, length(p) + 1) == p "/")
+                for (j = 1; j <= nb && !ok; j++) ok = substr(below[j], 1, length(d[i]) + 1) == d[i] "/"
+                if (ok) print length(d[i]) "\t" d[i]
+            }
+        }' "$_um" | LC_ALL=C sort -t "$TAB" -k1,1nr -k2 | cut -f2- > "$UN_TMP/d.list"
+    awk -F'\t' '$1 == "cache" && NF == 2 && $2 ~ /\/icons\/hicolor$/ { print $2 }' "$_um" > "$UN_TMP/c.list"
     # outside the prefix first (that is what points into it), then the tree
     while IFS="$TAB" read -r _up _uh; do un_under "$_up" "$UN_PREFIX" || un_file "$_up" "$_uh"; done < "$UN_TMP/f.list"
     while IFS="$TAB" read -r _up _ut; do un_under "$_up" "$UN_PREFIX" || un_link "$_up" "$_ut"; done < "$UN_TMP/l.list"
@@ -459,6 +470,11 @@ un_prefix() {
     fi
     if [ "$UN_DRY" != 1 ] && [ ! -w "$UN_PREFIX" ]; then
         un_say "$UN_PREFIX is not writable by you. It was installed by another user, probably root: run this as that user (sudo)."; return 1
+    fi
+    # A tree another user owns is theirs to remove: root never acts on a tree its owner can change under it.
+    _uown="$(stat -c %u -- "$UN_PREFIX" 2>/dev/null)" || _uown=""
+    if [ "$UN_DRY" != 1 ] && [ -n "$_uown" ] && [ "$_uown" != "$(id -u)" ]; then
+        un_say "Not removing $UN_PREFIX: it belongs to another user (uid $_uown). Run this as that user."; return 2
     fi
     UN_PHYS="$(cd "$UN_PREFIX" && pwd -P)"
     UN_TMP="$(mktemp -d "${TMPDIR:-/tmp}/liu-uninstall.XXXXXX")" || { un_say "couldn't create a temporary directory."; return 1; }
@@ -935,6 +951,15 @@ else
     if [ -n "$(ls -A "$PREFIX" 2>/dev/null)" ] && [ ! -f "$PREFIX/VERSION" ] && [ ! -f "$PREFIX/$MF_NAME" ]; then
         err "$PREFIX is not empty and is not a Liu install (no VERSION file), so it is not replaced. Use another LIU_PREFIX, or empty it first."
     fi
+    # A tree apt, dnf or zypper installed is theirs to update: replaced here, the
+    # package database would no longer match the files.
+    if [ -f "$PREFIX/bin/Liu" ] && _po="$(un_pkg_owner "$PREFIX/bin/Liu")"; then
+        err "$PREFIX belongs to a package (${_po%%:*}): update it with the package manager, not this script."
+    fi
+
+    # The tree is the release the feed named: its own VERSION says so.
+    _sv="$(tr -d '[:space:]' < "$SRC_ROOT/VERSION" 2>/dev/null)"
+    [ "$_sv" = "$VER" ] || err "the downloaded tree is version ${_sv:-unknown}, the feed says $VER; not installed."
 
     # --- signed-downgrade guard (Linux) --------------------------------------
     # Linux has no Info.plist to read: the guard compares against the VERSION
@@ -980,8 +1005,13 @@ else
     printf '%s\n' "$VER" > "$STAGE/VERSION"
 
     # An earlier install's manifest outlives the swap only as its records outside the prefix.
+    # Only one this user wrote, for this prefix: its records outside the prefix
+    # become this install's to remove.
     OLD_MF=""
-    if [ -f "$PREFIX/$MF_NAME" ] && cp "$PREFIX/$MF_NAME" "$TMP/install-manifest.old" 2>/dev/null; then
+    if [ -f "$PREFIX/$MF_NAME" ] && [ ! -L "$PREFIX/$MF_NAME" ] \
+            && [ "$(stat -c %u -- "$PREFIX/$MF_NAME" 2>/dev/null)" = "$(id -u)" ] \
+            && [ "$(awk -F'\t' '$1 == "prefix" { print $2; exit }' "$PREFIX/$MF_NAME")" = "$PREFIX" ] \
+            && cp "$PREFIX/$MF_NAME" "$TMP/install-manifest.old" 2>/dev/null; then
         OLD_MF="$TMP/install-manifest.old"
     fi
 

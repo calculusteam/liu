@@ -7,7 +7,7 @@
 <p align="center">
   <strong>Un terminal pour chaque agent IA.</strong><br>
   Liu s’intercale entre vous et une variété d’agents de codage et fait en sorte que dix fils parallèles se sentent comme un seul lieu.<br>
-  Écrit en <strong>C</strong>, natif sur macOS, accéléré par GPU.
+  Écrit en <strong>C</strong>, natif sur macOS et Linux, accéléré par GPU.
 </p>
 
 <p align="center">
@@ -143,12 +143,15 @@ Activez le sélecteur d'éléments dans le navigateur intégré de Liu et clique
 | :--- | :--- | :--- |
 | **macOS** | Apple Silicon (arm64) | `.dmg` |
 | **macOS** | Intel (x86_64) | `.dmg` |
+| **Linux** | x86_64 | `.deb` · `.rpm` · `.AppImage` · `.tar.gz` |
+| **Linux** | ARM64 (aarch64) | `.deb` · `.rpm` · `.AppImage` · `.tar.gz` |
 
-macOS est la cible principale et la seule actuellement prise en charge.
+Linux nécessite glibc 2.35 ou plus récent (Ubuntu 22.04, Debian 12, Fedora 36 et suivantes) et une session X11 ; sur un bureau Wayland, Liu fonctionne via XWayland. Le panneau navigateur utilise WebKitGTK 4.1 lorsqu’il est installé. Sous Linux, chaque raccourci est celui de macOS avec Ctrl+Maj pour ⌘ et Ctrl+Alt+Maj pour ⌘⇧ (⌘K devient Ctrl+Maj+K) ; les mêmes touches avec Super fonctionnent aussi. Installation depuis la page [Releases](https://github.com/calculusteam/liu/releases) ou avec `curl -fsSL https://raw.githubusercontent.com/calculusteam/liu/main/scripts/install.sh | bash`.
 
 ## Notre objectif
 
-- [ ] **Support Linux**, builds ARM64 et x86_64 (`.tar.gz`), apt (PPA), dnf (COPR) et AUR. Linux est prévu mais pas encore pris en charge.
+- [x] **Support Linux**, builds ARM64 et x86_64 (`.deb`, `.rpm`, `.AppImage`, `.tar.gz`).
+- [ ] **Dépôts de paquets Linux**, apt (PPA), dnf (COPR) et AUR.
 
 ---
 
@@ -157,6 +160,7 @@ macOS est la cible principale et la seule actuellement prise en charge.
 **Dépendances**
 
 - macOS, `brew install libssh2`
+- Linux (Debian, Ubuntu), `sudo apt install build-essential cmake ninja-build pkg-config libx11-dev libxcursor-dev libxi-dev libxrandr-dev libfontconfig1-dev libfreetype-dev libharfbuzz-dev libdbus-1-dev libgl1-mesa-dev libssh2-1-dev libssl-dev`
 - SQLite3, stb_truetype, stb_image et cJSON sont sous `third_party/`
 
 ```bash
@@ -169,6 +173,7 @@ git clone https://github.com/calculusteam/liu.git && cd liu
 # Ou CMake directement :
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(sysctl -n hw.ncpu)
+# Linux: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DUSE_METAL=OFF && cmake --build build -j$(nproc)
 ./build/Liu
 ```
 

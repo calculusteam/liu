@@ -17,19 +17,23 @@
 #define AGV_SVG_EDGE_MIN 64
 #define AGV_CSS_ADVANCE 8.4f       /* a 14 pt face's advance, in CSS pixels */
 
-static void (*g_wake)(void);
+static void (*_Atomic g_wake)(void);
 static _Atomic u64 g_revision;
 
-void agv_set_wake(void (*wake)(void)) { g_wake = wake; }
+void agv_set_wake(void (*wake)(void)) { atomic_store_explicit(&g_wake, wake, memory_order_release); }
 u64  agv_revision(void) { return atomic_load_explicit(&g_revision, memory_order_acquire); }
 
-/* ---- the SVG worker ----
+/* ---- the SVG workers ----
  *
- * A job is shared by the visual and its thread: whoever lets go of it last
+ * A job is shared by the visual and the queue: whoever lets go of it last
  * frees it, so a visual destroyed while its picture is being drawn costs
- * nothing but the drawing. */
+ * nothing but the drawing. At most AGV_SVG_WORKERS pictures are drawn at once,
+ * oldest first, each by a detached thread that ends when the queue is empty;
+ * a job whose visual went before its turn is not drawn. */
 
-typedef struct {
+#define AGV_SVG_WORKERS 2
+
+typedef struct AgvSvgJob {
     _Atomic i32 refs;
     _Atomic i32 state;              /* 0 drawing, 1 drawn, 2 failed */
     char       *src;
@@ -38,9 +42,13 @@ typedef struct {
     SvgImage    img;
     SvgStatus   status;
     u64         gen;                /* the texture's identity: a pointer is reused, this is not */
+    struct AgvSvgJob *next;         /* in the queue */
 } AgvSvgJob;
 
 static _Atomic u64 g_job_gen;
+static pthread_mutex_t g_jobs_mu = PTHREAD_MUTEX_INITIALIZER;
+static AgvSvgJob *g_jobs_head, *g_jobs_tail;
+static i32 g_jobs_workers;
 
 static void job_release(AgvSvgJob *j) {
     if (!j) return;
@@ -50,8 +58,7 @@ static void job_release(AgvSvgJob *j) {
     free(j);
 }
 
-static void *job_main(void *arg) {
-    AgvSvgJob *j = (AgvSvgJob *)arg;
+static void job_draw(AgvSvgJob *j) {
     SvgLimits lim = { .max_file_bytes = 256u * 1024u, .long_edge = j->long_edge,
                       .max_rgba_bytes = (usize)AGV_SVG_EDGE_MAX * AGV_SVG_EDGE_MAX * 4u, .max_seconds = 0 };
     SvgImage img;
@@ -60,9 +67,24 @@ static void *job_main(void *arg) {
     if (st == SVG_OK) j->img = img;
     atomic_store_explicit(&j->state, st == SVG_OK ? 1 : 2, memory_order_release);
     atomic_fetch_add_explicit(&g_revision, 1, memory_order_acq_rel);
-    if (g_wake) g_wake();
-    job_release(j);
-    return NULL;
+    void (*wake)(void) = atomic_load_explicit(&g_wake, memory_order_acquire);
+    if (wake) wake();
+}
+
+static void *job_main(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&g_jobs_mu);
+        AgvSvgJob *j = g_jobs_head;
+        if (!j) { g_jobs_workers--; pthread_mutex_unlock(&g_jobs_mu); return NULL; }
+        g_jobs_head = j->next;
+        if (!g_jobs_head) g_jobs_tail = NULL;
+        pthread_mutex_unlock(&g_jobs_mu);
+        /* The queue's reference is the last one: the visual has gone. */
+        if (atomic_load_explicit(&j->refs, memory_order_acquire) > 1) job_draw(j);
+        else atomic_store_explicit(&j->state, 2, memory_order_release);
+        job_release(j);
+    }
 }
 
 static AgvSvgJob *job_start(const char *src, u32 len, i32 long_edge) {
@@ -76,18 +98,39 @@ static AgvSvgJob *job_start(const char *src, u32 len, i32 long_edge) {
     j->long_edge = long_edge;
     j->gen = atomic_fetch_add_explicit(&g_job_gen, 1, memory_order_relaxed) + 1;
     atomic_store(&j->refs, 2);
-    pthread_t th;
-    pthread_attr_t at;
-    bool started = false;
-    if (pthread_attr_init(&at) == 0) {
-        pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
-        started = pthread_create(&th, &at, job_main, j) == 0;
-        pthread_attr_destroy(&at);
-    }
-    if (!started) {
-        j->status = SVG_ERR_MEMORY;
-        atomic_store(&j->state, 2);
-        atomic_store(&j->refs, 1);
+    pthread_mutex_lock(&g_jobs_mu);
+    if (g_jobs_tail) g_jobs_tail->next = j; else g_jobs_head = j;
+    g_jobs_tail = j;
+    bool spawn = g_jobs_workers < AGV_SVG_WORKERS;
+    if (spawn) g_jobs_workers++;
+    pthread_mutex_unlock(&g_jobs_mu);
+    if (spawn) {
+        pthread_t th;
+        pthread_attr_t at;
+        bool started = false;
+        if (pthread_attr_init(&at) == 0) {
+            pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+            started = pthread_create(&th, &at, job_main, NULL) == 0;
+            pthread_attr_destroy(&at);
+        }
+        if (!started) {
+            /* No thread: the job is taken back out and refused. Another
+             * worker already running would still have drawn it. */
+            pthread_mutex_lock(&g_jobs_mu);
+            g_jobs_workers--;
+            bool alone = g_jobs_workers == 0;
+            if (alone) {
+                AgvSvgJob **pp = &g_jobs_head, *prev = NULL;
+                while (*pp && *pp != j) { prev = *pp; pp = &(*pp)->next; }
+                if (*pp) { *pp = j->next; if (g_jobs_tail == j) g_jobs_tail = prev; }
+            }
+            pthread_mutex_unlock(&g_jobs_mu);
+            if (alone) {
+                j->status = SVG_ERR_MEMORY;
+                atomic_store(&j->state, 2);
+                atomic_store(&j->refs, 1);
+            }
+        }
     }
     return j;
 }
@@ -594,6 +637,10 @@ bool agv_svg_layout(const char *src, u32 len, f32 *doc_w, f32 *doc_h,
 /* ---- create / destroy ---- */
 
 AgentVisual *agv_create(const char *src, u32 len, f32 cw, f32 ch, bool compact) {
+    return agv_create_fit(src, len, cw, ch, compact, 0.0f);
+}
+
+AgentVisual *agv_create_fit(const char *src, u32 len, f32 cw, f32 ch, bool compact, f32 fit_edge) {
     if (!src || !len || !(cw > 0) || !(ch > 0)) return NULL;
     AgentVisual *v = (AgentVisual *)calloc(1, sizeof *v);
     if (!v) return NULL;
@@ -638,6 +685,7 @@ AgentVisual *agv_create(const char *src, u32 len, f32 cw, f32 ch, bool compact) 
         f32 longest = fmaxf(v->w, v->h) * (compact ? 1.0f : 2.0f);
         i32 edge = (i32)ceilf(longest);
         if (edge > AGV_SVG_EDGE_MAX) edge = AGV_SVG_EDGE_MAX;
+        if (isfinite(fit_edge) && fit_edge > 0.0f && (f32)edge > fit_edge) edge = (i32)ceilf(fit_edge);
         if (edge < AGV_SVG_EDGE_MIN) edge = AGV_SVG_EDGE_MIN;
         v->job = job_start(src, len, edge);
         if (!v->job) break;

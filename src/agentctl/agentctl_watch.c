@@ -260,16 +260,35 @@ static void wake(void) {
 
 static void batch_flush(void);
 
+/* The batch's paths by hash, so a path already in it is found in a probe or
+ * two: a build writes thousands of files a second. Open addressing, twice the
+ * batch's size; 0 is an empty slot, else the entry's index + 1. */
+#define WATCH_BATCH_SLOTS (2 * WATCH_BATCH_MAX)
+static u16 g_bslot[WATCH_BATCH_SLOTS];
+
+static u32 path_hash(const char *p) {
+    u32 h = 2166136261u;
+    for (; *p; p++) { h ^= (u8)*p; h *= 16777619u; }
+    return h;
+}
+
 static void batch_add(const char *path, u32 flags) {
-    for (usize i = 0; i < g_bn; i++)
+    u32 at = path_hash(path) & (WATCH_BATCH_SLOTS - 1);
+    for (; g_bslot[at]; at = (at + 1) & (WATCH_BATCH_SLOTS - 1)) {
+        usize i = (usize)g_bslot[at] - 1;
         if (!strcmp(g_bpath[i], path)) { g_bflag[i] |= flags; return; }
-    if (g_bn >= WATCH_BATCH_MAX) batch_flush();     /* a full batch goes early, nothing is dropped */
+    }
+    if (g_bn >= WATCH_BATCH_MAX) {               /* a full batch goes early, nothing is dropped */
+        batch_flush();
+        at = path_hash(path) & (WATCH_BATCH_SLOTS - 1);
+    }
     char *copy = strdup(path);
     if (!copy) return;
     if (!g_bn) g_bdue = mono_ms() + WATCH_LATENCY_MS;
     g_bpath[g_bn] = copy;
     g_bflag[g_bn] = flags;
     g_bn++;
+    g_bslot[at] = (u16)g_bn;
 }
 
 static void batch_flush(void) {
@@ -277,6 +296,7 @@ static void batch_flush(void) {
     if (!atomic_load(&g_stopped) && g_fn) g_fn(g_ctx, (const char *const *)g_bpath, g_bflag, g_bn);
     for (usize i = 0; i < g_bn; i++) free(g_bpath[i]);
     g_bn = 0;
+    memset(g_bslot, 0, sizeof g_bslot);
 }
 
 static void root_lost(i32 root) {
@@ -285,15 +305,66 @@ static void root_lost(i32 root) {
     batch_add(g_root[root], AGW_LOST | AGW_DIR);
 }
 
+/* g_dirs' index by watch descriptor: open addressing over a power of two at
+ * least twice the watches, so an event finds its folder in a probe or two
+ * instead of a walk over every watch. A slot holds the index + 1; 0 is empty
+ * and -1 a removed entry the probe passes over. */
+static i32  *g_wdslot;
+static usize g_wdcap, g_wdused;
+
+static usize wd_home(int wd) { return ((usize)(u32)wd * 2654435761u) & (g_wdcap - 1); }
+
+static void wdmap_rebuild(usize want) {
+    usize cap = 64;
+    while (cap < want * 2) cap <<= 1;
+    i32 *slots = calloc(cap, sizeof *slots);
+    if (!slots) return;                     /* the old table stays */
+    free(g_wdslot);
+    g_wdslot = slots;
+    g_wdcap = cap;
+    g_wdused = 0;
+    for (usize i = 0; i < g_ndirs; i++) {
+        usize at = wd_home(g_dirs[i].wd);
+        while (g_wdslot[at] != 0) at = (at + 1) & (g_wdcap - 1);
+        g_wdslot[at] = (i32)i + 1;
+        g_wdused++;
+    }
+}
+
+static i32 wdmap_find(int wd, usize *slot) {
+    if (!g_wdcap) return -1;
+    for (usize at = wd_home(wd), n = 0; n < g_wdcap; at = (at + 1) & (g_wdcap - 1), n++) {
+        i32 v = g_wdslot[at];
+        if (v == 0) return -1;
+        if (v > 0 && g_dirs[v - 1].wd == wd) { if (slot) *slot = at; return v - 1; }
+    }
+    return -1;
+}
+
+/* g_dirs[i] was just appended or moved to i. */
+static void wdmap_set(usize i) {
+    usize at;
+    if (wdmap_find(g_dirs[i].wd, &at) >= 0) { g_wdslot[at] = (i32)i + 1; return; }
+    if ((g_wdused + 1) * 2 > g_wdcap) { wdmap_rebuild(g_ndirs + 1); if (wdmap_find(g_dirs[i].wd, NULL) >= 0) return; }
+    if (!g_wdcap) return;
+    at = wd_home(g_dirs[i].wd);
+    while (g_wdslot[at] > 0) at = (at + 1) & (g_wdcap - 1);
+    if (g_wdslot[at] == 0) g_wdused++;
+    g_wdslot[at] = (i32)i + 1;
+}
+
 static WDir *dir_of(int wd) {
-    for (usize i = 0; i < g_ndirs; i++) if (g_dirs[i].wd == wd) return &g_dirs[i];
-    return NULL;
+    i32 i = wdmap_find(wd, NULL);
+    return i >= 0 ? &g_dirs[i] : NULL;
 }
 
 static void dir_forget_at(usize i) {
+    usize at;
+    if (wdmap_find(g_dirs[i].wd, &at) >= 0) g_wdslot[at] = -1;
     free(g_dirs[i].path);
     if (g_dirs[i].root >= 0) g_root_dirs[g_dirs[i].root]--;
     g_dirs[i] = g_dirs[--g_ndirs];
+    if (i < g_ndirs) wdmap_set(i);
 }
 
 /* Watches `path` for `root`. False when it could not be (gone, not a folder,
@@ -321,6 +392,7 @@ static bool dir_add(i32 root, const char *path) {
     char *copy = strdup(path);
     if (!copy) { inotify_rm_watch(g_ifd, wd); return false; }
     g_dirs[g_ndirs++] = (WDir){ wd, root, copy };
+    wdmap_set(g_ndirs - 1);
     g_root_dirs[root]++;
     return true;
 }
@@ -411,9 +483,28 @@ static bool set_has(const FolderSet *fs, const char *dir) {
     return false;
 }
 
+/* `p` is `dir` or a path below it. */
+static bool path_within(const char *p, const char *dir) {
+    usize n = strlen(dir);
+    return !strncmp(p, dir, n) && (p[n] == '\0' || p[n] == '/' || (n && dir[n - 1] == '/'));
+}
+
 static void apply_folders(const FolderSet *fs) {
+    /* inotify keeps one watch per folder, owned by whichever root added it
+     * first, so a root inside another shares the folders they have in common:
+     * closing one takes those watches from the other, which walks its tree
+     * again (folders still watched cost a lookup). */
+    bool rewalk[AGENTCTL_WATCH_MAX] = { false };
+    for (i32 r = 0; r < AGENTCTL_WATCH_MAX; r++) {
+        if (!g_root_on[r] || set_has(fs, g_root[r])) continue;
+        for (i32 i = 0; i < AGENTCTL_WATCH_MAX; i++)
+            if (i != r && g_root_on[i] && set_has(fs, g_root[i]) &&
+                (path_within(g_root[i], g_root[r]) || path_within(g_root[r], g_root[i])))
+                rewalk[i] = true;
+        root_close(r);
+    }
     for (i32 i = 0; i < AGENTCTL_WATCH_MAX; i++)
-        if (g_root_on[i] && !set_has(fs, g_root[i])) root_close(i);
+        if (rewalk[i] && g_root_on[i] && dir_add(i, g_root[i])) walk(i, g_root[i], false, 0);
     for (usize k = 0; k < fs->n; k++) {
         i32 slot = -1;
         bool have = false;
@@ -532,8 +623,12 @@ static void *watch_main(void *arg) {
     }
     for (usize i = 0; i < g_bn; i++) free(g_bpath[i]);
     g_bn = 0;
+    memset(g_bslot, 0, sizeof g_bslot);
     for (i32 r = 0; r < AGENTCTL_WATCH_MAX; r++) if (g_root_on[r]) root_close(r);
     free(g_dirs);
+    free(g_wdslot);
+    g_wdslot = NULL;
+    g_wdcap = g_wdused = 0;
     g_dirs = NULL;
     g_ndirs = g_capdirs = 0;
     return NULL;

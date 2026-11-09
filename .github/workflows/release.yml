@@ -43,7 +43,9 @@ jobs:
           - { runner: ubuntu-24.04, arch: x86_64 }
           - { runner: ubuntu-24.04-arm, arch: arm64 }
     runs-on: ${{ matrix.runner }}
-    container: ubuntu:22.04
+    # By digest, like the actions: the image the release binaries are built in
+    # cannot change under a tag.
+    container: ubuntu:22.04@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11
     timeout-minutes: 45
     steps:
       # Before the checkout: without git in the container actions/checkout
@@ -160,19 +162,19 @@ jobs:
   # --version`, every library resolved, and the app started on a virtual
   # display with an empty home, alive when stopped.
   install:
-    name: Install ${{ matrix.arch }} ${{ matrix.target.format }} on ${{ matrix.target.image }}
+    name: Install ${{ matrix.arch }} ${{ matrix.target.format }} on ${{ matrix.target.os }}
     needs: build
     strategy:
       fail-fast: false
       matrix:
         arch: [x86_64, arm64]
         target:
-          - { image: "ubuntu:22.04", format: deb }
-          - { image: "ubuntu:24.04", format: deb }
-          - { image: "debian:12", format: deb }
-          - { image: "fedora:41", format: rpm }
-          - { image: "ubuntu:24.04", format: appimage }
-          - { image: "ubuntu:22.04", format: tarball }
+          - { os: "ubuntu:22.04", image: "ubuntu:22.04@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11", format: deb }
+          - { os: "ubuntu:24.04", image: "ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852", format: deb }
+          - { os: "debian:12", image: "debian:12@sha256:268fb24c39bca92d326dd83ea3abebe4a3f7751c804ffef23bb6d857dd343ff8", format: deb }
+          - { os: "fedora:41", image: "fedora:41@sha256:f1a3fab47bcb3c3ddf3135d5ee7ba8b7b25f2e809a47440936212a3a50957f3d", format: rpm }
+          - { os: "ubuntu:24.04", image: "ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852", format: appimage }
+          - { os: "ubuntu:22.04", image: "ubuntu:22.04@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11", format: tarball }
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     container: ${{ matrix.target.image }}
     timeout-minutes: 20

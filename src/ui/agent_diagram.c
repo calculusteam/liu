@@ -6,6 +6,7 @@
 #include "ui/layout.h"
 #include "ui/chrome_palette.h"
 #include "ui/icon.h"
+#include "ui/anim.h"
 #include "core/utf8.h"
 #include "platform/platform.h"
 
@@ -57,14 +58,18 @@ struct AgentDiagramPane {
     AdgCard  cards[MMD_MAX_BLOCKS];
     u32      ncards;
     bool     dirty;               /* a summary changed since the cards were placed */
+    f64      placed_at;           /* when the cards were last placed */
     bool     busy;
     f32      cw, ch;              /* the cell the cards were placed for */
+    f32      fit_edge;            /* the pane's longer side when the cards were built: none is drawn larger */
     /* The agent's output as the pane has shown it, so a block taller than
      * the pane is found whole; out0..out1 are this picture's output rows,
      * the rows a card may cover. */
     MmdTape  tape;
     i32      out0, out1;
 };
+
+#define ADG_TEXT_PLACE_SEC 0.1
 
 /* ---- pane state ---- */
 
@@ -170,7 +175,7 @@ static i32 adg_known_add(AgentDiagramPane *p, const char *src, u32 len, u64 hash
     k->src_hash = hash;
     k->cw = cw; k->ch = ch;
     agv_set_wake(platform_wake_event_loop);
-    k->d = agv_create(src, len, cw, ch, true);
+    k->d = agv_create_fit(src, len, cw, ch, true, p->fit_edge);
     k->used = ++p->clock;
     return slot;
 }
@@ -437,7 +442,19 @@ static void adg_draw_card(AppState *app, const Terminal *source, const AgentDiag
         return;
     }
 
-    renderer_push_scissor(r, x0 - 2.0f, cy0, x1 - x0 + 4.0f, cy1 - cy0);
+    /* Scissors do not nest: the card's clip is cut to the one the pane is
+     * drawn in (a pane moving in a split's animation), and that one comes back
+     * after the card. */
+    bool clip_had = r->scissor_active;
+    f32 clip_x = r->scissor_x, clip_y = r->scissor_y, clip_w = r->scissor_w, clip_h = r->scissor_h;
+    {
+        f32 sx0 = x0 - 2.0f, sy0 = cy0, sx1 = x1 + 2.0f, sy1 = cy1;
+        if (clip_had) {
+            sx0 = fmaxf(sx0, clip_x);          sy0 = fmaxf(sy0, clip_y);
+            sx1 = fminf(sx1, clip_x + clip_w); sy1 = fminf(sy1, clip_y + clip_h);
+        }
+        renderer_push_scissor(r, sx0, sy0, fmaxf(0.0f, sx1 - sx0), fmaxf(0.0f, sy1 - sy0));
+    }
     f32 rad = 7.0f * dpi;
     renderer_draw_rrect_bordered(r, x0, vy0 + 1.0f, x1 - x0, vy1 - vy0 - 2.0f,
                                  cp.surface_neutral, cp.divider_subtle, fmaxf(1.0f, dpi),
@@ -492,7 +509,8 @@ static void adg_draw_card(AppState *app, const Terminal *source, const AgentDiag
         agv_draw(r, kn->d, &inks, gx, gy, s, 1.0f);
         renderer_reset_ui_scale(r);
     }
-    renderer_pop_scissor(r);
+    if (clip_had) renderer_push_scissor(r, clip_x, clip_y, clip_w, clip_h);
+    else renderer_pop_scissor(r);
 
     /* The card takes the click everywhere the buttons do not: published
      * after them, so a hit test that takes the first match finds a button
@@ -519,9 +537,25 @@ void agent_diagram_pane_pass(AppState *app, Terminal *source, Terminal *view,
     AgentDiagramPane *p = *state;
     Renderer *r = &app->renderer;
     f32 cw = r->font.cell_width, ch = r->font.cell_height;
+    /* A card is never drawn larger than its pane, so its picture is not made
+     * larger either; a pane that grew well past that has them made again. */
+    f32 fit = fmaxf((f32)cols * cw, (f32)rows * ch);
+    bool refit = false;
+    if (fit > p->fit_edge * 1.25f) {
+        refit = true;
+        for (i32 i = 0; i < ADG_KNOWN; i++)
+            if (p->known[i].src && agv_type(p->known[i].d) == AGV_SVG) adg_known_clear(&p->known[i]);
+        p->fit_edge = fit;
+        p->dirty = true;
+    }
 
     /* Rows that changed are summarised again; only a summary that differs
-     * asks for the cards to be placed again. */
+     * asks for the cards to be placed again. A row of plain text that is the
+     * same kind of row over the same columns again (an agent's spinner, its
+     * input box, a timer) moves no card: those changes are placed at most every
+     * ADG_TEXT_PLACE_SEC, and a block one of them completes gets its card that
+     * much later. Anything else is placed at once. */
+    bool now_place = full || fresh || refit;
     for (i32 row = 0; row < rows; row++) {
         if (!(full || fresh || term_row_dirty(view, row))) continue;
         MmdRow s;
@@ -529,16 +563,30 @@ void agent_diagram_pane_pass(AppState *app, Terminal *source, Terminal *view,
         else { memset(&s, 0, sizeof s); s.first = s.last = s.t0 = s.t1 = -1; }
         MmdRow *o = &p->sum[row];
         if (s.hash != o->hash || s.kind != o->kind || s.first != o->first || s.last != o->last) {
+            if (s.kind != MMD_ROW_TEXT || o->kind != MMD_ROW_TEXT ||
+                s.first != o->first || s.last != o->last) now_place = true;
             *o = s;
             p->dirty = true;
         }
     }
-    bool busy = platform_time_sec() < pa->work_until;
-    if (busy != p->busy) { p->busy = busy; p->dirty = true; }
-    if (cw != p->cw || ch != p->ch) { p->cw = cw; p->ch = ch; p->dirty = true; }
+    f64 now = platform_time_sec();
+    bool busy = now < pa->work_until;
+    if (busy != p->busy) { p->busy = busy; p->dirty = true; now_place = true; }
+    if (cw != p->cw || ch != p->ch) {
+        p->cw = cw; p->ch = ch; p->dirty = true; now_place = true;
+        /* What was built for another cell size is never drawn at this one. */
+        for (i32 i = 0; i < ADG_KNOWN; i++)
+            if (p->known[i].src && (p->known[i].cw != cw || p->known[i].ch != ch))
+                adg_known_clear(&p->known[i]);
+    }
     if (p->dirty) {
-        p->dirty = false;
-        adg_place(p, view, cw, ch);
+        if (now_place || now - p->placed_at >= ADG_TEXT_PLACE_SEC) {
+            p->dirty = false;
+            p->placed_at = now;
+            adg_place(p, view, cw, ch);
+        } else {
+            anim_wake_at(p->placed_at + ADG_TEXT_PLACE_SEC);
+        }
     }
     if (!draw) return;
     for (u32 i = 0; i < p->ncards; i++)

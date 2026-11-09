@@ -52,6 +52,8 @@ bool browser_any_metal_overlay(const AppState *app) {
      * under a full-tab page, and its typing went into the address bar), and
      * the sidebar's Customize popover (it opens over the content area). */
     if (app->lightbox.open || app->fb_prompt_active || app->sbc_open) return true;
+    /* The diagram viewer is modal over its window as the lightbox is. */
+    if (app->dgv.open || diagram_viewer_animating(&app->dgv)) return true;
     /* Pane layout drag: the drop-zone highlight and the ghost of the dragged
      * pane are Metal chrome drawn into the pane area. With the web view on
      * screen the browser pane is the one place that feedback would vanish —

@@ -270,6 +270,12 @@ static char    g_rankdir[4];
 
 static void dot_stmts(Lex *x, i32 cluster, Side *made);
 
+/* Braced sets and subgraphs inside one another: each level is a C frame of a
+ * few KB, so a source of nothing but `{` would run the stack out long before
+ * DG_MAX_SRC. Past the cap the graph is refused. */
+#define DOT_DEPTH_MAX 32
+static u32 g_dot_depth;
+
 /* A node id with its port, or a `{ … }` / `subgraph` set, into `side`. */
 static bool dot_side(Lex *x, i32 cluster, Side *side) {
     side->na = 0;
@@ -296,6 +302,13 @@ static bool dot_side(Lex *x, i32 cluster, Side *side) {
 /* Statements up to the closing brace; `made` collects every node named in a
  * braced set, for an edge to or from it. */
 static void dot_stmts(Lex *x, i32 cluster, Side *made) {
+    if (g_dot_depth >= DOT_DEPTH_MAX) {
+        g_overflow = true;
+        x->i = x->n;                    /* nothing more is read: every loop ends */
+        x->cur = (Tok){ T_END, NULL, 0 };
+        return;
+    }
+    g_dot_depth++;
     i32 here = cluster;
     if (x->cur.k == T_ID && x->cur.n == 8 && !memcmp(x->cur.s, "subgraph", 8)) {
         lex_next(x);
@@ -312,7 +325,7 @@ static void dot_stmts(Lex *x, i32 cluster, Side *made) {
             g_cparent[here] = cluster;
         }
     }
-    if (x->cur.k != T_LBRACE) return;
+    if (x->cur.k != T_LBRACE) { g_dot_depth--; return; }
     lex_next(x);
     NodeAttr saved_node = g_node_default;
     EdgeAttr saved_edge = g_edge_default;
@@ -386,6 +399,7 @@ static void dot_stmts(Lex *x, i32 cluster, Side *made) {
     if (x->cur.k == T_RBRACE) lex_next(x);
     g_node_default = saved_node;
     g_edge_default = saved_edge;
+    g_dot_depth--;
 }
 
 static void dot_cluster(Out *o, i32 c) {
@@ -408,6 +422,7 @@ static bool dot_translate(const u8 *src, u32 len, Out *o) {
     lex_next(&x);
     if (x.cur.k == T_ID) lex_next(&x);              /* the graph's name */
     if (x.cur.k != T_LBRACE) return false;
+    g_dot_depth = 0;
     dot_stmts(&x, -1, NULL);
     if (g_overflow || !g_nnames) return false;
     const char *dir = !strcmp(g_rankdir, "LR") ? "LR" : !strcmp(g_rankdir, "RL") ? "RL" :

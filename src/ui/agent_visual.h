@@ -38,6 +38,9 @@ AgvType agv_type_of(const char *src, u32 len);
  * `compact` visual is a card's: a diagram's compact spacing, an SVG drawn at
  * its own size (the viewer's twice that). */
 AgentVisual *agv_create(const char *src, u32 len, f32 cw, f32 ch, bool compact);
+/* The same, for a picture never drawn larger than `fit_edge` pixels on its
+ * longer side (a card in a window that size): an SVG is rasterised no larger. */
+AgentVisual *agv_create_fit(const char *src, u32 len, f32 cw, f32 ch, bool compact, f32 fit_edge);
 void    agv_destroy(AgentVisual *v);
 AgvType agv_type(const AgentVisual *v);
 /* A formula set in text style (limits beside their operator: a sum stands two

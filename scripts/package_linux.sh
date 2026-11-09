@@ -119,7 +119,7 @@ tools_for() {
         tarball)  echo "tar python3" ;;
         deb)      echo "dpkg-deb dpkg-shlibdeps" ;;
         rpm)      echo "rpmbuild" ;;
-        appimage) echo "mksquashfs patchelf ldd sha256sum" ;;
+        appimage) echo "mksquashfs patchelf ldd sha256sum cmake patch" ;;
     esac
 }
 missing_tools() {
@@ -360,11 +360,16 @@ if want appimage; then
     ln -s liu.png "${AD}/.DirIcon"
     ln -s usr/bin/Liu "${AD}/AppRun"
 
-    # libssh2, the library a desktop is least likely to have, rides along; the
-    # loader finds it through the RUNPATH given to this copy of Liu only.
-    SSH2="$(ldd "${AD}/usr/bin/Liu" | awk '$1 == "libssh2.so.1" { print $3 }')"
-    [[ -n "${SSH2}" && -f "${SSH2}" ]] || die "Liu does not resolve libssh2.so.1 on this machine."
-    cp -L "${SSH2}" "${AD}/usr/lib/libssh2.so.1"
+    # libssh2, the library a desktop is least likely to have, rides along: not
+    # this machine's copy, which no update would reach inside the image, but
+    # the release with Liu's security backports (scripts/build_linux_libssh2.sh).
+    # The loader finds it through the RUNPATH given to this copy of Liu only.
+    if [[ -n "${LIU_APPIMAGE_LIBSSH2:-}" ]]; then
+        cp -L "${LIU_APPIMAGE_LIBSSH2}" "${AD}/usr/lib/libssh2.so.1"
+    else
+        "${ROOT_DIR}/scripts/build_linux_libssh2.sh" "${AD}/usr/lib" >/dev/null \
+            || die "could not build the AppImage's libssh2."
+    fi
     patchelf --set-rpath '$ORIGIN/../lib' "${AD}/usr/bin/Liu"
     normalise_tree "${AD}"
     chmod 0755 "${AD}/usr/lib/libssh2.so.1"

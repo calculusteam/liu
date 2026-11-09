@@ -7,7 +7,7 @@
 <p align="center">
   <strong>Her yapay zeka ajanı için tek terminal.</strong><br>
   Liu, sizi çeşitli kodlama ajanlarıyla buluşturur ve on paralel iş parçacığını tek bir yer gibi hissettirir.<br>
-  <strong>C</strong> ile yazılmıştır, macOS'ta yerel, GPU hızlandırmalı.
+  <strong>C</strong> ile yazılmıştır, macOS'ta ve Linux'ta yerel, GPU hızlandırmalı.
 </p>
 
 <p align="center">
@@ -143,12 +143,15 @@ Liu'nun yerleşik tarayıcısında element seçiciyi açın ve canlı bir sayfad
 | :--- | :--- | :--- |
 | **macOS** | Apple Silicon (arm64) | `.dmg` |
 | **macOS** | Intel (x86_64) | `.dmg` |
+| **Linux** | x86_64 | `.deb` · `.rpm` · `.AppImage` · `.tar.gz` |
+| **Linux** | ARM64 (aarch64) | `.deb` · `.rpm` · `.AppImage` · `.tar.gz` |
 
-macOS birincil ve şu an desteklenen tek hedeftir.
+Linux için glibc 2.35 veya üstü (Ubuntu 22.04, Debian 12, Fedora 36 ve sonrası) ve bir X11 oturumu gerekir; Wayland masaüstünde Liu XWayland üzerinden çalışır. Tarayıcı paneli, kuruluysa WebKitGTK 4.1'i kullanır. Linux'ta her kısayol macOS'takidir: ⌘ yerine Ctrl+Shift, ⌘⇧ yerine Ctrl+Alt+Shift (⌘K, Ctrl+Shift+K olur); aynı tuşlar Super ile de çalışır. [Releases](https://github.com/calculusteam/liu/releases) sayfasından ya da `curl -fsSL https://raw.githubusercontent.com/calculusteam/liu/main/scripts/install.sh | bash` ile kurulur.
 
 ## Hedefimiz
 
-- [ ] **Linux desteği**, ARM64 ve x86_64 derlemeleri (`.tar.gz`), apt (PPA), dnf (COPR) ve AUR paketleri. Linux planlanıyor ancak şu an desteklenmiyor.
+- [x] **Linux desteği**, ARM64 ve x86_64 derlemeleri (`.deb`, `.rpm`, `.AppImage`, `.tar.gz`).
+- [ ] **Linux paket depoları**, apt (PPA), dnf (COPR) ve AUR.
 
 ---
 
@@ -157,6 +160,7 @@ macOS birincil ve şu an desteklenen tek hedeftir.
 **Bağımlılıklar**
 
 - macOS, `brew install libssh2`
+- Linux (Debian, Ubuntu), `sudo apt install build-essential cmake ninja-build pkg-config libx11-dev libxcursor-dev libxi-dev libxrandr-dev libfontconfig1-dev libfreetype-dev libharfbuzz-dev libdbus-1-dev libgl1-mesa-dev libssh2-1-dev libssl-dev`
 - SQLite3, stb_truetype, stb_image ve cJSON `third_party/` altında gömülüdür
 
 ```bash
@@ -169,6 +173,7 @@ git clone https://github.com/calculusteam/liu.git && cd liu
 # Veya doğrudan CMake:
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(sysctl -n hw.ncpu)
+# Linux: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DUSE_METAL=OFF && cmake --build build -j$(nproc)
 ./build/Liu
 ```
 

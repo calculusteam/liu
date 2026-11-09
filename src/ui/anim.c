@@ -178,6 +178,16 @@ void anim_wake_settle(f64 now) {
     if (g_anim_unscoped_wake != 0.0 && now >= g_anim_unscoped_wake) g_anim_unscoped_wake = 0.0;
 }
 
+void anim_forget_owner(const void *owner) {
+    u32 sc = anim_scope_of(owner);
+    for (i32 i = 0; sc && i < ANIM_SCOPE_SLOTS; i++) {
+        if (g_anim_scopes[i].scope != sc) continue;
+        g_anim_scopes[i].scope = 0;
+        g_anim_scopes[i].until = g_anim_scopes[i].soft_until = g_anim_scopes[i].wake_at = 0.0;
+    }
+    if (g_hover_scope == sc) g_hover_scope = 0;
+}
+
 /* Auto-hiding overlay scrollbars — see the header note in anim.h. */
 f32 ui_autohide_alpha(f64 last_active, bool active_now) {
     if (active_now) return 1.0f;

@@ -7,7 +7,7 @@
 <p align="center">
   <strong>모든 AI 에이전트를 위한 하나의 터미널.</strong><br>
   Liu는 여러 코딩 에이전트 사이에 자리하며, 열 개의 병렬 스레드가 한 공간처럼 느껴지게 합니다.<br>
-  <strong>C</strong>로 작성, macOS 네이티브, GPU 가속.
+  <strong>C</strong>로 작성, macOS·Linux 네이티브, GPU 가속.
 </p>
 
 <p align="center">
@@ -143,12 +143,15 @@ Liu 내장 브라우저에서 요소 선택기를 켜고 실시간 페이지의 
 | :--- | :--- | :--- |
 | **macOS** | Apple Silicon (arm64) | `.dmg` |
 | **macOS** | Intel (x86_64) | `.dmg` |
+| **Linux** | x86_64 | `.deb` · `.rpm` · `.AppImage` · `.tar.gz` |
+| **Linux** | ARM64 (aarch64) | `.deb` · `.rpm` · `.AppImage` · `.tar.gz` |
 
-macOS가 기본이자 현재 유일하게 지원되는 대상입니다.
+Linux에는 glibc 2.35 이상(Ubuntu 22.04, Debian 12, Fedora 36 이후)과 X11 세션이 필요합니다. Wayland 데스크톱에서는 XWayland를 통해 실행됩니다. 브라우저 패널은 WebKitGTK 4.1이 설치되어 있으면 이를 사용합니다. Linux에서 모든 단축키는 macOS와 같으며 ⌘ 대신 Ctrl+Shift, ⌘⇧ 대신 Ctrl+Alt+Shift를 씁니다(⌘K는 Ctrl+Shift+K). 같은 키를 Super와 눌러도 됩니다. [Releases](https://github.com/calculusteam/liu/releases) 페이지에서 또는 `curl -fsSL https://raw.githubusercontent.com/calculusteam/liu/main/scripts/install.sh | bash`로 설치합니다.
 
 ## 목표
 
-- [ ] **Linux 지원**, ARM64·x86_64 빌드(`.tar.gz`), apt(PPA), dnf(COPR), AUR. Linux는 계획 중이며 현재 미지원.
+- [x] **Linux 지원**, ARM64·x86_64 빌드(`.deb`, `.rpm`, `.AppImage`, `.tar.gz`).
+- [ ] **Linux 패키지 저장소**, apt(PPA), dnf(COPR), AUR.
 
 ---
 
@@ -157,6 +160,7 @@ macOS가 기본이자 현재 유일하게 지원되는 대상입니다.
 **의존성**
 
 - macOS, `brew install libssh2`
+- Linux (Debian, Ubuntu), `sudo apt install build-essential cmake ninja-build pkg-config libx11-dev libxcursor-dev libxi-dev libxrandr-dev libfontconfig1-dev libfreetype-dev libharfbuzz-dev libdbus-1-dev libgl1-mesa-dev libssh2-1-dev libssl-dev`
 - SQLite3, stb_truetype, stb_image, cJSON은 `third_party/`에 포함
 
 ```bash
@@ -169,6 +173,7 @@ git clone https://github.com/calculusteam/liu.git && cd liu
 # 또는 CMake 직접:
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(sysctl -n hw.ncpu)
+# Linux: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DUSE_METAL=OFF && cmake --build build -j$(nproc)
 ./build/Liu
 ```
 

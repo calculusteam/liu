@@ -415,7 +415,7 @@ if(LIU_E2E_PROBE AND NOT USE_METAL)
 endif()
 
 # In-app browser (WKWebView) — macOS default ON
-option(LIU_BROWSER "Enable in-app WKWebView browser (macOS)" ON)
+option(LIU_BROWSER "Enable the in-app browser (WKWebView on macOS, WebKitGTK on Linux)" ON)
 
 # Animation pacing probe — a diagnostic build that drives a modal open/closed on
 # a timer with no user input and prints every present-to-present interval while
@@ -1302,7 +1302,6 @@ endif()
 # is WebKitGTK's when the system has it: built against its headers only and
 # loaded at run time (src/browser/browser_gtk.c), so a system without it runs
 # the same binary and hands pages to its browser. No headers: that stub alone.
-set(LIU_BROWSER_GTK OFF)
 if(LIU_BROWSER AND APPLE)
     find_library(WEBKIT_FRAMEWORK WebKit REQUIRED)
     list(APPEND PLATFORM_LIBS ${WEBKIT_FRAMEWORK})
@@ -1314,7 +1313,6 @@ elseif(NOT APPLE)
         pkg_check_modules(LIU_WEBKITGTK QUIET webkit2gtk-4.1 gtk+-3.0)
     endif()
     if(LIU_WEBKITGTK_FOUND)
-        set(LIU_BROWSER_GTK ON)
         list(APPEND CORE_SOURCES src/browser/browser_gtk.c)
         set_source_files_properties(src/browser/browser_gtk.c PROPERTIES
             INCLUDE_DIRECTORIES "${LIU_WEBKITGTK_INCLUDE_DIRS}")

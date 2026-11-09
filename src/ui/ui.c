@@ -1990,6 +1990,7 @@ static void app_drop_terminal_pair(Terminal **terminal,Session **session) {
 
 void app_destroy_window(AppState *app) {
     palette_release_owner(app);
+    anim_forget_owner(app);
     if (app && liu_dev_env("LIU_RENDER_PREPARE_STATS"))
         fprintf(stderr,"render_prepare: submitted=%llu adopted=%llu discarded=%llu expired=%llu\n",
             (unsigned long long)app->prepare_submitted,(unsigned long long)app->prepare_adopted,
@@ -18324,6 +18325,11 @@ void app_explorer_open_for_active_tab(AppState *app) {
  * answer behind the scrim. The ones that keep their own events are listed as
  * well: the rule is what is in front. The find bar is not here: it covers
  * nothing, and the pane is scrolled while it is open. */
+bool app_fb_status_card_room(const AppState *app) {
+    return app->sidebar_visible && app->sidebar_width >= 150.0f * app->dpi_scale &&
+           !sftp_transfer_active();
+}
+
 bool app_dialog_has_pointer(const AppState *a) {
     return a->palette_active || a->transcript_viewer_active || a->settings.open ||
            a->sites.active || a->ssh_dialog_active || a->create_theme_active ||
@@ -18333,7 +18339,7 @@ bool app_dialog_has_pointer(const AppState *a) {
            a->agent_picker_active || a->cmd_history_active || a->sbc_open ||
            a->close_confirm_active || a->paste_confirm_active || a->agentctl_prompt_active ||
            a->agentctl_panel_open || a->agentctl_team_open ||
-           a->lightbox.open || a->sketch.open ||
+           a->lightbox.open || a->sketch.open || a->dgv.open ||
            a->term_ctx_menu_active || a->tab_ctx_menu_active || a->group_ctx_menu_active ||
            a->job_ctx_menu_active ||
            a->fb_ctx_menu_active || a->fb_prompt_active ||
@@ -18360,6 +18366,7 @@ static bool app_cursor_layer_allowed(const AppState *a) {
         app_voice_hud_animating() ||
         a->tab_ctx_menu_active || a->group_ctx_menu_active || a->fb_ctx_menu_active ||
         a->fb_prompt_active || a->lightbox.open || a->sketch.open || a->tab_popup.want_open ||
+        a->dgv.open || diagram_viewer_animating(&a->dgv) ||
         a->tab_popup.kind || sftp_transfer_active() ||
         !anim_done(&a->settings.close_anim) || !anim_done(&a->sites.close_anim) ||
         !anim_done(&a->lightbox.close_anim) || !anim_done(&a->sketch.close_anim) || !anim_done(&a->tab_popup.close_anim)) return false;
@@ -26086,8 +26093,7 @@ void app_render(AppState *app) {
      * arrives and leaves on the clock (fb_status_alpha), so it is one of the
      * loop's clock-driven visuals while it fades and a still picture between
      * (liu_continuous_visual + the wait ladder's fb_status_wake_in). */
-    else if (app->fb_status[0] && app->sidebar_visible &&
-             app->sidebar_width >= 150.0f * app->dpi_scale) {
+    else if (app->fb_status[0] && app_fb_status_card_room(app)) {
         f32 sa = fb_status_alpha(platform_time_sec() - app->fb_status_since,
                                  app->fb_status_until - app->fb_status_since);
         if (sa > 0.001f) {

@@ -42,10 +42,21 @@ void forward_open_reserve(LIBSSH2_SESSION *owner, bool on);
 bool forward_open_idle(LIBSSH2_SESSION *owner);
 /* The pane that owns the forwards is leaving a connection that goes on: a TCP /
  * SOCKS open of it that is in flight is carried to its end (the session is in
- * blocking mode) and its channel closed, because libssh2 cannot cancel it and
- * the next open on the connection would be handed it. */
+ * blocking mode, for a short bound) and its channel closed, because libssh2
+ * cannot cancel it and the next open on the connection would be handed it. One
+ * the bound cuts short stays in flight: forward_cleanup_pane keeps it. */
 void forward_open_settle(LIBSSH2_SESSION *owner);
 void forward_cleanup(LIBSSH2_SESSION *owner);
+/* The pane that started `owner`'s forwards leaves a connection other panes go
+ * on using: its rules, connections and handshakes end as forward_cleanup ends
+ * them, but an open still in flight stays as an orphan that the connection's
+ * next forward poll carries to its end before any new open starts — libssh2
+ * would hand its channel to the next open on the connection. */
+void forward_cleanup_pane(LIBSSH2_SESSION *owner);
+/* An open on `owner` that no forward knows (a Unix-socket forward's, left in
+ * flight when its set ended) is carried to its end the same way: an orphan
+ * whose own request is never sent, since libssh2 continues the open it has. */
+void forward_open_carry(LIBSSH2_SESSION *owner);
 void forward_cleanup_all(void);
 
 #endif

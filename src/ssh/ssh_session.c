@@ -3,7 +3,7 @@
  */
 #include "ssh/ssh_session.h"
 #include "ssh/ssh_env_bootstrap.h"
-#include "core/config.h"       /* liu_executable_dir() */
+#include "core/config.h"       /* liu_executable_dir(), liu_helper_exe_dir() */
 #include "core/memory.h"       /* secure_zero() */
 #include "core/checked.h"
 #include "core/path_escape.h"   /* liu_path_has_control_bytes() */
@@ -515,10 +515,88 @@ void session_proc_scan_stats(u64 *out_sweeps, f64 *out_seconds) {
 }
 
 /* The pids of process group `pgid`, in the kernel's list order. Returns the
- * count; *out is `stack` or a heap block the caller frees. */
+ * count; *out is `stack` or a heap block the caller frees. `root` is the
+ * pane's shell when known (0: not known). */
 #ifdef PLATFORM_LINUX
-static i32 session_pgrp_members(pid_t pgid, pid_t *stack, i32 stack_n, pid_t **out) {
+/* Processes a walk below a shell looks at, at most: a pane's tree is a few;
+ * a build that forks hundreds is cut short, its agent (if any) found first. */
+#define SESSION_TREE_MAX 512
+
+/* Appends the pids a thread's children list names to `q` (up to `cap`). A
+ * list longer than the buffer ends inside a number: that one is left out. */
+static void session_tree_children(const char *path, pid_t *q, i32 *n, i32 cap) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    char buf[4096];
+    ssize_t r;
+    do { r = read(fd, buf, sizeof buf - 1); } while (r < 0 && errno == EINTR);
+    close(fd);
+    if (r <= 0) return;
+    buf[r] = '\0';
+    char *end = buf + r;
+    if ((usize)r == sizeof buf - 1)
+        while (end > buf && end[-1] >= '0' && end[-1] <= '9') end--;
+    for (char *p = buf; p < end; ) {
+        char *e = NULL;
+        long v = strtol(p, &e, 10);
+        if (e == p) { p++; continue; }
+        if (e > end) break;
+        if (v > 0 && *n < cap) q[(*n)++] = (pid_t)v;
+        p = e;
+    }
+}
+
+/* The members of `pgid` among `root` and the processes below it. The shell
+ * puts a job's processes in a group of its own session, as its children and
+ * theirs, so the group is found without reading every process on the
+ * machine. Read from the kernel's per-thread children lists, breadth first.
+ * False when the kernel keeps no such list (then every process is read). A
+ * member whose parent exited and was adopted elsewhere is not seen. */
+static bool session_pgrp_members_below(pid_t root, pid_t pgid, pid_t *stack, i32 stack_n,
+                                       pid_t **out, i32 *count) {
+    char path[96];
+    snprintf(path, sizeof path, "/proc/%d/task/%d/children", (int)root, (int)root);
+    if (access(path, R_OK) != 0) return false;
+    pid_t q[SESSION_TREE_MAX];
+    i32 qn = 1, n = 0;
+    q[0] = root;
+    pid_t *list = stack;
+    i32 cap = stack_n;
+    for (i32 h = 0; h < qn; h++) {
+        pid_t pid = q[h];
+        pid_t pg = 0;
+        if (session_proc_stat(pid, NULL, 0, &pg) && pg == pgid) {
+            if (n == cap) {
+                pid_t *grown = (pid_t *)malloc((usize)cap * 2 * sizeof *grown);
+                if (!grown) break;
+                memcpy(grown, list, (usize)n * sizeof *list);
+                if (list != stack) free(list);
+                list = grown;
+                cap *= 2;
+            }
+            list[n++] = pid;
+        }
+        if (qn >= SESSION_TREE_MAX) continue;
+        snprintf(path, sizeof path, "/proc/%d/task", (int)pid);
+        DIR *d = opendir(path);
+        if (!d) continue;
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL && qn < SESSION_TREE_MAX) {
+            if (e->d_name[0] < '1' || e->d_name[0] > '9') continue;
+            snprintf(path, sizeof path, "/proc/%d/task/%.16s/children", (int)pid, e->d_name);
+            session_tree_children(path, q, &qn, SESSION_TREE_MAX);
+        }
+        closedir(d);
+    }
+    *out = list;
+    *count = n;
+    return true;
+}
+
+static i32 session_pgrp_members(pid_t pgid, pid_t root, pid_t *stack, i32 stack_n, pid_t **out) {
     *out = stack;
+    i32 below = 0;
+    if (root > 0 && session_pgrp_members_below(root, pgid, stack, stack_n, out, &below)) return below;
     DIR *d = opendir("/proc");
     if (!d) return 0;
     pid_t *list = stack;
@@ -546,7 +624,8 @@ static i32 session_pgrp_members(pid_t pgid, pid_t *stack, i32 stack_n, pid_t **o
     return n;
 }
 #else
-static i32 session_pgrp_members(pid_t pgid, pid_t *stack, i32 stack_n, pid_t **out) {
+static i32 session_pgrp_members(pid_t pgid, pid_t root, pid_t *stack, i32 stack_n, pid_t **out) {
+    (void)root;                         /* the kernel lists a group's members itself */
     *out = stack;
     i32 got = proc_listpids(PROC_PGRP_ONLY, (uint32_t)pgid, stack,
                             stack_n * (i32)sizeof(pid_t));
@@ -567,7 +646,7 @@ static i32 session_pgrp_members(pid_t pgid, pid_t *stack, i32 stack_n, pid_t **o
 }
 #endif
 
-static bool session_find_interesting_pgrp_process(pid_t pgid,
+static bool session_find_interesting_pgrp_process(pid_t pgid, pid_t root,
                                                   const char *leader,
                                                   char *out, usize out_cap,
                                                   bool *out_found_agent) {
@@ -579,7 +658,7 @@ static bool session_find_interesting_pgrp_process(pid_t pgid,
     f64 t0 = session_mono_now();
     pid_t stack[SESSION_PGRP_STACK];
     pid_t *members = NULL;
-    i32 count = session_pgrp_members(pgid, stack, SESSION_PGRP_STACK, &members);
+    i32 count = session_pgrp_members(pgid, root, stack, SESSION_PGRP_STACK, &members);
     char fallback[256] = {0};
     bool hit = false;
 
@@ -647,7 +726,7 @@ static bool session_find_interesting_pgrp_process(pid_t pgid,
 #ifdef LIU_AGENT_ARGV_PROBE
 bool session_pgrp_probe_for_bench(i32 pgid, const char *leader,
                                   char *out, usize out_cap, bool *found_agent) {
-    return session_find_interesting_pgrp_process((pid_t)pgid, leader, out, out_cap,
+    return session_find_interesting_pgrp_process((pid_t)pgid, 0, leader, out, out_cap,
                                                  found_agent);
 }
 #endif
@@ -1406,6 +1485,24 @@ static void connect_fd_forget(Session *s, int fd) {
     pthread_mutex_unlock(&s->status_lock);
 }
 
+/* The moment a connect worker is about to publish a question (a host key, the
+ * server's prompts, a password) and wait for the answer: past its last look at
+ * the cancel flag, before the lock. A build may name a function to run there
+ * (SSH_PROMPT_SEAM_FN); nothing runs by default. */
+#ifdef SSH_PROMPT_SEAM_FN
+void SSH_PROMPT_SEAM_FN(void *session);
+#define SSH_PROMPT_SEAM(s) SSH_PROMPT_SEAM_FN(s)
+#else
+#define SSH_PROMPT_SEAM(s) ((void)(s))
+#endif
+
+/* A question the worker waits on ends when it is answered or when the connect
+ * is being stopped. ssh_connect_worker_stop sets the flag before it wakes the
+ * waits, so a wait that begins after that wake finds the flag instead. */
+static bool ssh_connect_cancelled(Session *s) {
+    return atomic_load_explicit(&s->connect_cancel, memory_order_acquire);
+}
+
 static void connect_fds_clear(Session *s) {
     pthread_mutex_lock(&s->status_lock);
     s->connect_fd_count = 0;
@@ -1544,6 +1641,7 @@ static LIBSSH2_USERAUTH_KBDINT_RESPONSE_FUNC(ssh_kbdint_callback) {
 
     /* Multi-prompt / OTP / 2FA path: store prompts in Session, set
      * SESSION_KBI_PENDING, and block until the UI fills in responses. */
+    SSH_PROMPT_SEAM(s);
     pthread_mutex_lock(&s->kbi_lock);
 
     /* Name, instruction and prompts are the SERVER's words, drawn in a Liu
@@ -1594,7 +1692,7 @@ static LIBSSH2_USERAUTH_KBDINT_RESPONSE_FUNC(ssh_kbdint_callback) {
     session_notify_main();
 
     /* Block until UI thread calls session_kbi_submit() */
-    while (!s->kbi_ready) {
+    while (!s->kbi_ready && !ssh_connect_cancelled(s)) {
         pthread_cond_wait(&s->kbi_cond, &s->kbi_lock);
     }
 
@@ -1616,6 +1714,9 @@ static LIBSSH2_USERAUTH_KBDINT_RESPONSE_FUNC(ssh_kbdint_callback) {
             responses[i].length = 0;
         }
     }
+    /* The answers (a password, a one-time code) live on only in libssh2's
+     * copies, for as long as it takes to send them. */
+    secure_zero(s->kbi_responses, (usize)KBI_MAX_PROMPTS * sizeof(*s->kbi_responses));
 
     pthread_mutex_unlock(&s->kbi_lock);
 }
@@ -1640,6 +1741,7 @@ const char *session_auth_asked(Session *s) {
  * connect is being stopped. Blocks the connect worker until answered. */
 static bool ssh_ask_password_dialog(Session *s, const char *note, char *out, usize cap) {
     out[0] = '\0';
+    SSH_PROMPT_SEAM(s);
     pthread_mutex_lock(&s->kbi_lock);
     if (!s->kbi_prompts) s->kbi_prompts = calloc(KBI_MAX_PROMPTS, sizeof(*s->kbi_prompts));
     if (!s->kbi_responses) s->kbi_responses = calloc(KBI_MAX_PROMPTS, sizeof(*s->kbi_responses));
@@ -1661,7 +1763,7 @@ static bool ssh_ask_password_dialog(Session *s, const char *note, char *out, usi
     s->status = SESSION_KBI_PENDING;
     pthread_mutex_unlock(&s->status_lock);
     session_notify_main();
-    while (!s->kbi_ready)
+    while (!s->kbi_ready && !ssh_connect_cancelled(s))
         pthread_cond_wait(&s->kbi_cond, &s->kbi_lock);
     pthread_mutex_lock(&s->status_lock);
     s->status = SESSION_AUTHENTICATING;
@@ -1671,7 +1773,7 @@ static bool ssh_ask_password_dialog(Session *s, const char *note, char *out, usi
     secure_zero(s->kbi_responses[0], sizeof s->kbi_responses[0]);
     s->kbi_liu = false;
     pthread_mutex_unlock(&s->kbi_lock);
-    if (atomic_load_explicit(&s->connect_cancel, memory_order_acquire)) {
+    if (ssh_connect_cancelled(s)) {
         secure_zero(out, cap);
         return false;
     }
@@ -1822,6 +1924,7 @@ static int ssh_verify_hostkey_for(Session *s, LIBSSH2_SESSION *ssh,
     if (hk == HOST_KEY_CHANGED) {
         /* Host key has changed — present dialog to user.
          * The worker thread blocks on hostkey_cond until the UI responds. */
+        SSH_PROMPT_SEAM(s);
         pthread_mutex_lock(&s->hostkey_lock);
         s->hostkey_is_change = true;
         snprintf(s->hostkey_new_fp, sizeof(s->hostkey_new_fp), "%s", fp);
@@ -1833,9 +1936,10 @@ static int ssh_verify_hostkey_for(Session *s, LIBSSH2_SESSION *ssh,
         session_notify_main();     /* the dialog is raised by the loop's scan */
 
         /* Wait for UI thread to signal a decision */
-        while (s->hostkey_pending) {
+        while (s->hostkey_pending && !ssh_connect_cancelled(s)) {
             pthread_cond_wait(&s->hostkey_cond, &s->hostkey_lock);
         }
+        s->hostkey_pending = false;
         bool accepted = s->hostkey_accepted;
         pthread_mutex_unlock(&s->hostkey_lock);
 
@@ -1860,6 +1964,7 @@ static int ssh_verify_hostkey_for(Session *s, LIBSSH2_SESSION *ssh,
     }
 
     /* HOST_KEY_NEW — ask user to trust via GUI dialog */
+    SSH_PROMPT_SEAM(s);
     pthread_mutex_lock(&s->hostkey_lock);
     s->hostkey_is_change = false;
     snprintf(s->hostkey_new_fp, sizeof(s->hostkey_new_fp), "%s", fp);
@@ -1870,9 +1975,10 @@ static int ssh_verify_hostkey_for(Session *s, LIBSSH2_SESSION *ssh,
     s->hostkey_accepted = false;
     session_notify_main();
 
-    while (s->hostkey_pending) {
+    while (s->hostkey_pending && !ssh_connect_cancelled(s)) {
         pthread_cond_wait(&s->hostkey_cond, &s->hostkey_lock);
     }
+    s->hostkey_pending = false;
     bool accepted = s->hostkey_accepted;
     pthread_mutex_unlock(&s->hostkey_lock);
 
@@ -2070,7 +2176,7 @@ static const char *liu_helper_bin_dir(void) {
                 (st.st_mode & (S_IWGRP | S_IWOTH)) != 0) return NULL;
     }
 
-    const char *exe_dir = liu_executable_dir();
+    const char *exe_dir = liu_helper_exe_dir();
     if (!exe_dir || !exe_dir[0]) return NULL;
 
     /* Every helper Liu ships. Missing ones are skipped rather than failing the
@@ -4431,7 +4537,7 @@ void session_release(Session *s) {
 }
 
 #ifndef PLATFORM_WIN32
-static void session_streamlocal_settle(Session *s);
+static bool session_streamlocal_settle(Session *s);
 #endif
 
 /* The owner's pane is leaving, but other sessions still use its connection
@@ -4450,7 +4556,7 @@ static void session_retire_pane(Session *s) {
         /* What the forwards have in flight on the connection is finished before
          * they are dropped: the connection stays, and so would the open. */
 #ifndef PLATFORM_WIN32
-        session_streamlocal_settle(s);
+        bool stream_open_left = session_streamlocal_settle(s);
 #endif
         forward_open_settle(ssh);
         session_stop_stream_forwards(s);
@@ -4460,7 +4566,10 @@ static void session_retire_pane(Session *s) {
         }
         x11_pending_cleanup(s);
         remote_forward_cleanup_all(s);
-        forward_cleanup(ssh);
+        forward_cleanup_pane(ssh);
+#ifndef PLATFORM_WIN32
+        if (stream_open_left) forward_open_carry(ssh);
+#endif
         shared_blocking_end(&blk);
     }
     pthread_mutex_unlock(&s->io_lock);
@@ -6087,7 +6196,7 @@ const char *session_fg_process(Session *s) {
              * get a title. */
             char leader[256] = {0};
             proc_name(fg, leader, sizeof leader);
-            (void)session_find_interesting_pgrp_process(fg, leader,
+            (void)session_find_interesting_pgrp_process(fg, (pid_t)s->child_pid, leader,
                                                         s->fg_cache, sizeof s->fg_cache,
                                                         &found_agent);
         }
@@ -6120,7 +6229,7 @@ const char *session_fg_process(Session *s) {
             if (fg == s->child_pid && session_proc_name_is_shell(leader))
                 snprintf(s->fg_cache, sizeof s->fg_cache, "%s", leader);
             else
-                (void)session_find_interesting_pgrp_process(fg, leader,
+                (void)session_find_interesting_pgrp_process(fg, (pid_t)s->child_pid, leader,
                                                             s->fg_cache, sizeof s->fg_cache,
                                                             &found_agent);
         }
@@ -8086,23 +8195,26 @@ static LIBSSH2_CHANNEL *streamlocal_channel_open(LIBSSH2_SESSION *session,
 
 /* The pane that owns the Unix-socket forwards is leaving a connection that goes
  * on being used: an open of theirs that is in flight is carried to its end here
- * (the session is in blocking mode) and its channel closed. libssh2 cannot
- * cancel it, and the next open on the connection — a forward's, a pane's shell —
- * would be handed it. */
-static void session_streamlocal_settle(Session *s) {
-    if (!s || !s->stream_fwds || !s->ssh_session) return;
+ * (the session is in blocking mode, for a short bound) and its channel closed.
+ * libssh2 cannot cancel it, and the next open on the connection — a forward's,
+ * a pane's shell — would be handed it. True when the bound cut it short and it
+ * is still in flight (the caller leaves it to forward_open_carry). */
+static bool session_streamlocal_settle(Session *s) {
+    if (!s || !s->stream_fwds || !s->ssh_session) return false;
     const StreamSched *sc = &s->stream_fwds->sched;
-    if (sc->inflight < 0 || sc->inflight >= SLS_RULES) return;
+    if (sc->inflight < 0 || sc->inflight >= SLS_RULES) return false;
     long timeout = libssh2_session_get_timeout(s->ssh_session);
     libssh2_session_set_timeout(s->ssh_session, SSH_SETTLE_OPEN_MS);
     bool would_block = false;
     LIBSSH2_CHANNEL *ch = streamlocal_channel_open(
         s->ssh_session, s->stream_fwds->rule[sc->inflight].remote_socket, &would_block);
+    bool left = !ch && libssh2_session_last_errno(s->ssh_session) == LIBSSH2_ERROR_TIMEOUT;
     libssh2_session_set_timeout(s->ssh_session, timeout);
     if (ch) {
         libssh2_channel_close(ch);
         libssh2_channel_free(ch);
     }
+    return left;
 }
 
 /* A connection's end of a Unix-socket forward is a heap relay (32 KB of
