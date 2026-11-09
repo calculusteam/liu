@@ -28,12 +28,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { runner: macos-14, arch: arm64, profile: Debug, sanitize: "ON" }    # Apple Silicon (Metal)
-          - { runner: macos-14, arch: arm64, profile: Release, sanitize: "OFF" }
+          - { runner: macos-15, arch: arm64, profile: Debug, sanitize: "ON" }    # Apple Silicon (Metal)
+          - { runner: macos-15, arch: arm64, profile: Release, sanitize: "OFF" }
           - { runner: macos-15-intel, arch: x86_64, profile: Debug, sanitize: "ON" }  # Intel x86_64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: Ensure selected Xcode Metal toolchain
         run: |
           if ! xcrun -sdk macosx metal --version; then
@@ -64,7 +64,7 @@ jobs:
           - { runner: ubuntu-24.04-arm, arch: arm64, build_type: Release }
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: Install deps
         run: |
           sudo apt-get update -qq
