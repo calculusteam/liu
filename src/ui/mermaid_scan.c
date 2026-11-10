@@ -296,15 +296,27 @@ static bool mmd_statement(MmdKind kind, const char *t, i32 braces) {
     return false;
 }
 
+/* The brace at s[i] is part of an entity-relationship mark and opens or
+ * closes nothing: `o{` and `|{` after a relationship's line (`--`, `..`),
+ * `}o` and `}|` before it. */
+static bool mmd_er_mark(const char *s, u32 n, u32 i) {
+    if (s[i] == '{')
+        return i >= 2 && (s[i - 1] == 'o' || s[i - 1] == '|') && (s[i - 2] == '-' || s[i - 2] == '.');
+    if (s[i] == '}')
+        return i + 2 < n && (s[i + 1] == 'o' || s[i + 1] == '|') && (s[i + 2] == '-' || s[i + 2] == '.');
+    return false;
+}
+
 /* The line so far is not finished: an open bracket or quote, or a link
  * operator with nothing after it. */
-static bool mmd_open_line(const char *s, u32 n) {
+static bool mmd_open_line(MmdKind kind, const char *s, u32 n) {
     i32 depth = 0;
     bool q = false;
     for (u32 i = 0; i < n; i++) {
         char c = s[i];
         if (c == '"') { q = !q; continue; }
         if (q) continue;
+        if (kind == K_ER && mmd_er_mark(s, n, i)) continue;
         if (c == '[' || c == '(' || c == '{') depth++;
         else if ((c == ']' || c == ')' || c == '}') && depth > 0) depth--;
     }
@@ -339,11 +351,13 @@ static void mmd_note_line(MmdKind kind, const char *t, MmdOpen *o) {
         return;
     }
     bool q = false;
-    for (const char *p = t; *p; p++) {
-        if (*p == '"') { q = !q; continue; }
+    u32 n = (u32)strlen(t);
+    for (u32 i = 0; i < n; i++) {
+        if (t[i] == '"') { q = !q; continue; }
         if (q) continue;
-        if (*p == '{') o->braces++;
-        else if (*p == '}' && o->braces > 0) o->braces--;
+        if (kind == K_ER && mmd_er_mark(t, n, i)) continue;
+        if (t[i] == '{') o->braces++;
+        else if (t[i] == '}' && o->braces > 0) o->braces--;
     }
 }
 
@@ -558,7 +572,7 @@ static bool mmd_walk(const MmdScreen *scr, i32 row0, i32 head, i32 width, i32 fo
         (void)tn;
         const char *trimmed = mmd_trim(text);
         bool cont = ll > 0 && blank == 0 && rf == col0 &&
-                    (mmd_open_line(line, ll) || (kind == K_SVG && mmd_tag_open(line, ll)) ||
+                    (mmd_open_line(kind, line, ll) || (kind == K_SVG && mmd_tag_open(line, ll)) ||
                      (may_wrap && prev_last + 2 + (i32)r->first_word > width));
         if (cont) {
             u32 tl = (u32)strlen(trimmed);
@@ -581,7 +595,16 @@ static bool mmd_walk(const MmdScreen *scr, i32 row0, i32 head, i32 width, i32 fo
                 line[ll] = 0;
             }
         } else {
-            if (!closes && rf == col0 && !mmd_statement(kind, trimmed, open.braces)) {
+            /* The line before this row is not written down yet: a body it
+             * closes is closed for this row, and one it opens holds it. */
+            MmdOpen upto = open;
+            if (ll && !closes) {
+                char prev[MMD_LINE_CAP];
+                memcpy(prev, line, ll);
+                prev[ll] = 0;
+                mmd_note_line(kind, mmd_trim(prev), &upto);
+            }
+            if (!closes && rf == col0 && !mmd_statement(kind, trimmed, upto.braces)) {
                 end = MMD_END_PROSE;
                 break;
             }
