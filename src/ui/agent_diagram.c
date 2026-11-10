@@ -30,6 +30,7 @@ typedef struct {
     u32        len;
     AgentVisual *d;               /* NULL: seen, and not drawable */
     f32        cw, ch;
+    f32        box_w, box_h;      /* the room its card had when it was laid out */
     u64       *rows;
     i32        nrows;
     i32        col0, col1;
@@ -154,10 +155,30 @@ static i32 adg_known_find(AgentDiagramPane *p, u64 hash, f32 cw, f32 ch) {
     return -1;
 }
 
+/* A card of fewer rows than this has no header row: what it holds takes all
+ * of it, and its two buttons stand in its top corner while the pointer is on
+ * it. A formula of one or two rows read at a third of its size under one. */
+#define ADG_HEADER_ROWS 4
+
+/* The room a block's card gives its drawing, as the card's geometry works it
+ * out once the card is placed: the pane's width from the block's column, the
+ * block's rows less the header's (or, without one, the buttons' corner). */
+static void adg_block_box(const AgentDiagramPane *p, const MmdBlock *bl, f32 cw, f32 ch, f32 *box_w, f32 *box_h) {
+    i32 nrows = bl->row1 - bl->row0 + 1;
+    f32 w = (f32)(p->cols - bl->col0) * cw - cw * 1.4f;
+    f32 h;
+    if (nrows >= ADG_HEADER_ROWS) h = (f32)nrows * ch - ch * 1.25f;
+    else { w -= ch * 1.6f + cw * 0.9f; h = (f32)nrows * ch - ch * 0.16f; }
+    f32 out_h = (f32)(p->out1 - p->out0) * ch - ch * 1.25f;
+    if (out_h > 0.0f && h > out_h) h = out_h;
+    *box_w = w > 0.0f ? w : 0.0f;
+    *box_h = h > 0.0f ? h : 0.0f;
+}
+
 /* Remember a block seen whole, building its diagram once: an empty slot,
  * else the one used longest ago that no card placed this pass stands on. */
 static i32 adg_known_add(AgentDiagramPane *p, const char *src, u32 len, u64 hash,
-                         f32 cw, f32 ch, const bool *in_use) {
+                         f32 cw, f32 ch, f32 box_w, f32 box_h, const bool *in_use) {
     i32 slot = -1;
     for (i32 i = 0; i < ADG_KNOWN; i++) {
         if (in_use[i]) continue;
@@ -175,7 +196,8 @@ static i32 adg_known_add(AgentDiagramPane *p, const char *src, u32 len, u64 hash
     k->src_hash = hash;
     k->cw = cw; k->ch = ch;
     agv_set_wake(platform_wake_event_loop);
-    k->d = agv_create_fit(src, len, cw, ch, true, p->fit_edge);
+    k->box_w = box_w; k->box_h = box_h;
+    k->d = agv_create_fit(src, len, cw, ch, true, p->fit_edge, box_w, box_h);
     k->used = ++p->clock;
     return slot;
 }
@@ -219,10 +241,6 @@ static AdgCard adg_grow(const AgentDiagramPane *p, AdgCard c) {
     return c;
 }
 
-/* A card of fewer rows than this has no header row: what it holds takes all
- * of it, and its two buttons stand in its top corner while the pointer is on
- * it. A formula of one or two rows read at a third of its size under one. */
-#define ADG_HEADER_ROWS 4
 /* A formula is carded only where it is drawn at this much of the terminal's
  * text or more: under it the TeX the agent printed reads better. */
 #define ADG_MATH_MIN_SCALE 0.6f
@@ -329,9 +347,19 @@ static void adg_place(AgentDiagramPane *p, Terminal *view, f32 cw, f32 ch) {
         /* A block known whole stays whole: the same source was seen ended.
          * The agent at work again under it changes nothing about it. */
         if (k < 0 && !bl->complete) continue;
-        if (k < 0) k = adg_known_add(p, p->src + bl->src_off, bl->src_len, bl->src_hash, cw, ch, placed);
+        f32 box_w, box_h;
+        adg_block_box(p, bl, cw, ch, &box_w, &box_h);
+        if (k < 0) k = adg_known_add(p, p->src + bl->src_off, bl->src_len, bl->src_hash, cw, ch, box_w, box_h, placed);
         if (k < 0) continue;
         AdgKnown *kn = &p->known[k];
+        /* A diagram laid out for another room (the pane was resized, the
+         * block wrapped onto other rows) is laid out again for this one. */
+        if (kn->d && agv_type(kn->d) == AGV_DIAGRAM &&
+            (fabsf(kn->box_w - box_w) > box_w * 0.2f || fabsf(kn->box_h - box_h) > box_h * 0.2f)) {
+            agv_destroy(kn->d);
+            kn->box_w = box_w; kn->box_h = box_h;
+            kn->d = agv_create_fit(kn->src, kn->len, cw, ch, true, p->fit_edge, box_w, box_h);
+        }
         kn->used = ++p->clock;
         adg_known_rows(kn, scr.rows, bl->row0, bl->row1, bl->col0, bl->col1);
         placed[k] = true;
@@ -456,9 +484,16 @@ static void adg_draw_card(AppState *app, const Terminal *source, const AgentDiag
         renderer_push_scissor(r, sx0, sy0, fmaxf(0.0f, sx1 - sx0), fmaxf(0.0f, sy1 - sy0));
     }
     f32 rad = 7.0f * dpi;
+    /* The card answers the pointer: its edge takes the accent while the
+     * pointer is on it, and its header says what a click does. */
+    f32 over = 0.0f;
+    {
+        f32 oy0 = fmaxf(cy0, vy0), oy1 = fminf(cy1, vy1);
+        if (oy1 > oy0) over = ui_hover_amount(x0, oy0, x1 - x0, oy1 - oy0, app->hover_x, app->hover_y);
+    }
     renderer_draw_rrect_bordered(r, x0, vy0 + 1.0f, x1 - x0, vy1 - vy0 - 2.0f,
-                                 cp.surface_neutral, cp.divider_subtle, fmaxf(1.0f, dpi),
-                                 rad, rad, rad, rad, 0, 0, 0, 0);
+                                 cp.surface_neutral, color_lerp(cp.divider_subtle, accent, 0.55f * over),
+                                 fmaxf(1.0f, dpi), rad, rad, rad, rad, 0, 0, 0, 0);
     renderer_flush_rrects(r);
 
     f32 bx0 = g.bx0, bx1 = g.bx1, by0 = g.by0, by1 = g.by1, s = g.s;
@@ -477,14 +512,14 @@ static void adg_draw_card(AppState *app, const Terminal *source, const AgentDiag
         adg_type_mark(r, agv_type(kn->d), x0 + cw * 0.7f, vy0, isz, cw, ch, accent);
         char title[64], head[112];
         agv_title(kn->d, title, sizeof title);
-        snprintf(head, sizeof head, "%s%s", title, s > 0.0f && s < 0.7f ? "  \xC2\xB7  click to enlarge" : "");
+        snprintf(head, sizeof head, "%s%s", title,
+                 s > 0.0f && (s < 0.7f || over > 0.5f) ? "  \xC2\xB7  click to enlarge" : "");
         renderer_reset_ui_scale(r);
         draw_text_ex(r, head, x0 + cw * 0.7f + isz + cw * 0.6f, vy0, dim,
                      (i32)utf8_len((const u8 *)head, strlen(head)), cw);
         renderer_flush_glyphs(r);
     } else {
-        f32 hy0 = fmaxf(cy0, vy0), hy1 = fminf(cy1, vy1);
-        buttons = hy1 > hy0 && ui_hover_amount(x0, hy0, x1 - x0, hy1 - hy0, app->hover_x, app->hover_y) > 0.01f;
+        buttons = over > 0.01f;
     }
     if (buttons) {
         f32 bx = x1 - bsz - cw * 0.4f;
@@ -691,10 +726,10 @@ void diagram_viewer_close(AppState *app) {
 }
 
 /* The box the diagram is shown in: the window less its margins and the
- * caption's band. */
+ * bar's band. */
 static void dgv_box(const AppState *app, f32 *x, f32 *y, f32 *w, f32 *h) {
     f32 dpi = app->dpi_scale;
-    f32 m = 40.0f * dpi, cap = 64.0f * dpi;
+    f32 m = 40.0f * dpi, cap = 76.0f * dpi;
     *x = m; *y = m;
     *w = fmaxf(1.0f, (f32)app->fb_width - m * 2.0f);
     *h = fmaxf(1.0f, (f32)app->fb_height - m - cap - m * 0.5f);
@@ -763,6 +798,107 @@ void diagram_viewer_panel_rect(const AppState *app, f32 *x, f32 *y, f32 *w, f32 
     *h = ph;
 }
 
+/* ---- the viewer's bar ---- */
+
+/* What a button says under the pointer: what it does and its key. */
+static const char *dgv_button_hint(i32 button) {
+#ifdef PLATFORM_MACOS
+    static const char *const hints[DGV_BTN_COUNT] = {
+        "Zoom out  \xC2\xB7  \xE2\x8C\x98\xE2\x88\x92", "Fit to window  \xC2\xB7  \xE2\x8C\x98" "0",
+        "Zoom in  \xC2\xB7  \xE2\x8C\x98+", "Copy source  \xC2\xB7  \xE2\x8C\x98" "C", "Close  \xC2\xB7  Esc",
+    };
+#else
+    static const char *const hints[DGV_BTN_COUNT] = {
+        "Zoom out  \xC2\xB7  Ctrl+\xE2\x88\x92", "Fit to window  \xC2\xB7  Ctrl+0",
+        "Zoom in  \xC2\xB7  Ctrl+=", "Copy source  \xC2\xB7  Ctrl+C", "Close  \xC2\xB7  Esc",
+    };
+#endif
+    return button >= 0 && button < DGV_BTN_COUNT ? hints[button] : "";
+}
+
+const char *diagram_viewer_button_name(i32 button) {
+    static const char *const names[DGV_BTN_COUNT] = { "zoom-out", "fit", "zoom-in", "copy", "close" };
+    return button >= 0 && button < DGV_BTN_COUNT ? names[button] : "";
+}
+
+static i32 dgv_cells(const char *s) { return (i32)utf8_len((const u8 *)s, strlen(s)); }
+
+/* The bar under the box: what the viewer holds on its left, its buttons on
+ * its right, a line of keys under both. It stays where it is while the
+ * drawing is zoomed and panned. One geometry for the painter and the click. */
+typedef struct {
+    f32 x, y, w, h;                    /* the plate */
+    f32 row_y, row_h;                  /* the row of the title and the buttons */
+    f32 mark_x, mark, title_x;
+    i32 title_cells;                   /* how much of the title the row has room for */
+    f32 btn_x[DGV_BTN_COUNT], btn_w[DGV_BTN_COUNT];
+    f32 hint_x, hint_y;
+    i32 hint_cells;
+    f32 ui_cw, ui_ch;
+} DgvBar;
+
+static void dgv_bar(const AppState *app, DgvBar *b) {
+    f32 dpi = app->dpi_scale;
+    f32 bx, by, bw, bh;
+    dgv_box(app, &bx, &by, &bw, &bh);
+    b->ui_cw = 8.0f * dpi;
+    b->ui_ch = 16.0f * dpi;
+    f32 btn = 24.0f * dpi, pad_x = 12.0f * dpi, pad_y = 8.0f * dpi;
+    f32 sep = 10.0f * dpi, gap = 2.0f * dpi;
+    for (i32 i = 0; i < DGV_BTN_COUNT; i++) b->btn_w[i] = btn;
+    b->btn_w[DGV_BTN_FIT] = b->ui_cw * 6.0f;          /* the size it is drawn at: "800%" and room */
+    f32 group = sep * 2.0f + gap * 2.0f;
+    for (i32 i = 0; i < DGV_BTN_COUNT; i++) group += b->btn_w[i];
+    char title[64];
+    agv_title(app->dgv.vis, title, sizeof title);
+    i32 nt = dgv_cells(title);
+    b->mark = b->ui_ch;
+    f32 title_w = b->mark + b->ui_cw * 0.75f + (f32)nt * b->ui_cw;
+    i32 nh = dgv_cells(diagram_viewer_hint());
+    for (i32 i = 0; i < DGV_BTN_COUNT; i++) {
+        i32 n = dgv_cells(dgv_button_hint(i));
+        if (n > nh) nh = n;
+    }
+    f32 inner = fmaxf(title_w + 28.0f * dpi + group, (f32)nh * b->ui_cw);
+    f32 most = fmaxf(group, (f32)app->fb_width - 16.0f * dpi - pad_x * 2.0f);
+    if (inner > most) inner = most;
+    b->w = inner + pad_x * 2.0f;
+    b->h = pad_y + btn + 4.0f * dpi + b->ui_ch + pad_y;
+    b->x = floorf(((f32)app->fb_width - b->w) * 0.5f);
+    b->y = floorf(by + bh + 24.0f * dpi);             /* the panel's margin, then a gap */
+    b->row_y = b->y + pad_y;
+    b->row_h = btn;
+    b->mark_x = b->x + pad_x;
+    b->title_x = b->mark_x + b->mark + b->ui_cw * 0.75f;
+    f32 gx = b->x + b->w - pad_x - group;
+    b->btn_x[DGV_BTN_ZOOM_OUT] = gx;
+    b->btn_x[DGV_BTN_FIT] = b->btn_x[DGV_BTN_ZOOM_OUT] + b->btn_w[DGV_BTN_ZOOM_OUT] + gap;
+    b->btn_x[DGV_BTN_ZOOM_IN] = b->btn_x[DGV_BTN_FIT] + b->btn_w[DGV_BTN_FIT] + gap;
+    b->btn_x[DGV_BTN_COPY] = b->btn_x[DGV_BTN_ZOOM_IN] + b->btn_w[DGV_BTN_ZOOM_IN] + sep;
+    b->btn_x[DGV_BTN_CLOSE] = b->btn_x[DGV_BTN_COPY] + b->btn_w[DGV_BTN_COPY] + sep;
+    f32 room = gx - 12.0f * dpi - b->title_x;
+    i32 fit = room > 0.0f ? (i32)(room / b->ui_cw) : 0;
+    b->title_cells = nt < fit ? nt : fit;
+    b->hint_x = b->x + pad_x;
+    b->hint_y = b->row_y + btn + 4.0f * dpi;
+    b->hint_cells = (i32)(inner / b->ui_cw);
+}
+
+bool diagram_viewer_button_rect(const AppState *app, i32 button, f32 *x, f32 *y, f32 *w, f32 *h) {
+    if (!app || !app->dgv.open || !app->dgv.vis || button < 0 || button >= DGV_BTN_COUNT) return false;
+    DgvBar b;
+    dgv_bar(app, &b);
+    *x = b.btn_x[button]; *y = b.row_y; *w = b.btn_w[button]; *h = b.row_h;
+    return true;
+}
+
+/* A button that has nothing left to do: the drawing is as small, or as
+ * large, as it gets. */
+static bool dgv_button_spent(const DiagramViewer *v, i32 button) {
+    return (button == DGV_BTN_ZOOM_OUT && v->zoom <= DGV_ZOOM_MIN * 1.001f) ||
+           (button == DGV_BTN_ZOOM_IN && v->zoom >= DGV_ZOOM_MAX * 0.999f);
+}
+
 void diagram_viewer_render(AppState *app) {
     if (!app) return;
     DiagramViewer *v = &app->dgv;
@@ -819,38 +955,74 @@ void diagram_viewer_render(AppState *app) {
     renderer_reset_ui_scale(r);
     renderer_pop_scissor(r);
 
-    /* Caption on a plate under the panel, in the UI's own cell. */
-    f32 ui_cw = 8.0f * dpi, ui_ch = 16.0f * dpi;
-    char title[64], line[112];
-    agv_title(v->vis, title, sizeof title);
-    snprintf(line, sizeof line, "%s  \xC2\xB7  %.0f%%", title, (f64)(s * 100.0f / fmaxf(1e-3f, 1.0f)));
-    const char *hint = diagram_viewer_hint();
-    i32 nl = (i32)utf8_len((const u8 *)line, strlen(line));
-    i32 nh = (i32)utf8_len((const u8 *)hint, strlen(hint));
-    f32 cap_y = by + bh + 14.0f * dpi;
-    f32 pad_x = 14.0f * dpi, pad_y = 8.0f * dpi;
-    i32 widest = nl > nh ? nl : nh;
-    f32 cwid = (f32)widest * ui_cw + pad_x * 2.0f;
-    f32 chei = ui_ch * 2.0f + 6.0f * dpi + pad_y * 2.0f;
-    f32 cx = ((f32)app->fb_width - cwid) * 0.5f;
+    /* The bar, in the UI's own cell. */
+    DgvBar bar;
+    dgv_bar(app, &bar);
     Color plate = cp.surface_neutral; plate.a = prog;
-    renderer_draw_rrect_simple(r, cx, cap_y, cwid, chei, plate, 8.0f * dpi);
+    Color bar_edge = cp.divider_subtle; bar_edge.a *= prog;
+    f32 brad = 9.0f * dpi;
+    renderer_draw_rrect_bordered(r, bar.x, bar.y, bar.w, bar.h, plate, bar_edge, fmaxf(1.0f, dpi),
+                                 brad, brad, brad, brad, 0, 0, 0, 0);
     renderer_flush_rrects(r);
     Color fg = t->fg; fg.a = prog;
     Color dim = color_lerp(cp.surface_neutral, t->fg, 0.62f); dim.a = prog;
-    renderer_set_ui_scale(r, ui_cw, ui_ch);
-    draw_text_ex(r, line, ((f32)app->fb_width - (f32)nl * ui_cw) * 0.5f, cap_y + pad_y, fg, nl, ui_cw);
-    draw_text_ex(r, hint, ((f32)app->fb_width - (f32)nh * ui_cw) * 0.5f,
-                 cap_y + pad_y + ui_ch + 6.0f * dpi, dim, nh, ui_cw);
+    /* The buttons answer the pointer; the one under it names itself and its
+     * key on the line below. */
+    static const IconKind icons[DGV_BTN_COUNT] = { ICON_MINUS, ICON_NONE, ICON_PLUS, ICON_COPY, ICON_CLOSE };
+    i32 over = -1;
+    f32 hov[DGV_BTN_COUNT];
+    for (i32 i = 0; i < DGV_BTN_COUNT; i++) {
+        bool spent = dgv_button_spent(v, i);
+        hov[i] = v->open && !v->dragging && !spent
+               ? ui_hover_amount(bar.btn_x[i], bar.row_y, bar.btn_w[i], bar.row_h, app->hover_x, app->hover_y) : 0.0f;
+        if (hov[i] > 0.5f) over = i;
+        if (hov[i] > 0.01f) {
+            Color wash = accent;
+            wash.a = 0.18f * hov[i] * prog;
+            renderer_draw_rrect_simple(r, bar.btn_x[i], bar.row_y, bar.btn_w[i], bar.row_h, wash, 5.0f * dpi);
+        }
+    }
+    renderer_flush_rrects(r);
+    f32 isz = floorf(bar.row_h * 0.58f);
+    for (i32 i = 0; i < DGV_BTN_COUNT; i++) {
+        if (icons[i] == ICON_NONE) continue;
+        Color c = fg;
+        c.a *= dgv_button_spent(v, i) ? 0.28f : 0.72f + 0.28f * hov[i];
+        icon_draw(r, icons[i], bar.btn_x[i] + (bar.btn_w[i] - isz) * 0.5f, bar.row_y + (bar.row_h - isz) * 0.5f, isz, c);
+    }
+    AgvType vty = agv_type(v->vis);
+    f32 msz = floorf(bar.mark * 0.88f);
+    Color mark_ink = color_lerp(dim, accent, 0.75f); mark_ink.a = prog;
+    if (vty != AGV_MATH)
+        icon_draw(r, vty == AGV_SVG ? ICON_FT_IMAGE : ICON_GRAPH, bar.mark_x + (bar.mark - msz) * 0.5f,
+                  bar.row_y + (bar.row_h - msz) * 0.5f, msz, mark_ink);
+
+    char title[64], pct[16];
+    agv_title(v->vis, title, sizeof title);
+    snprintf(pct, sizeof pct, "%.0f%%", (f64)(s * 100.0f));
+    i32 np = dgv_cells(pct);
+    const char *hint = over >= 0 ? dgv_button_hint(over) : diagram_viewer_hint();
+    i32 nh = dgv_cells(hint);
+    if (nh > bar.hint_cells) nh = bar.hint_cells;
+    renderer_set_ui_scale(r, bar.ui_cw, bar.ui_ch);
+    f32 ty = renderer_ui_cap_center_y(r, bar.row_y, bar.row_h);
+    if (vty == AGV_MATH) renderer_push_glyph(r, bar.mark_x + (bar.mark - bar.ui_cw) * 0.5f, ty, 0x2211, mark_ink);
+    if (bar.title_cells > 0) draw_text_ex(r, title, bar.title_x, ty, fg, bar.title_cells, bar.ui_cw);
+    Color pct_ink = color_lerp(dim, fg, hov[DGV_BTN_FIT]); pct_ink.a = prog;
+    draw_text_ex(r, pct, bar.btn_x[DGV_BTN_FIT] + (bar.btn_w[DGV_BTN_FIT] - (f32)np * bar.ui_cw) * 0.5f, ty,
+                 pct_ink, np, bar.ui_cw);
+    if (nh > 0)
+        draw_text_ex(r, hint, bar.hint_x + ((bar.w - (bar.hint_x - bar.x) * 2.0f) - (f32)nh * bar.ui_cw) * 0.5f,
+                     bar.hint_y, over >= 0 ? fg : dim, nh, bar.ui_cw);
     renderer_flush_glyphs(r);
     renderer_reset_ui_scale(r);
 }
 
 const char *diagram_viewer_hint(void) {
 #ifdef PLATFORM_MACOS
-    return "Esc close  \xC2\xB7  drag or scroll to pan  \xC2\xB7  \xE2\x8C\x98 scroll or \xE2\x8C\x98+/\xE2\x88\x92 to zoom  \xC2\xB7  \xE2\x8C\x98" "0 fit  \xC2\xB7  \xE2\x8C\x98" "C copy source";
+    return "Drag or scroll to pan  \xC2\xB7  \xE2\x8C\x98 scroll to zoom  \xC2\xB7  Esc to close";
 #else
-    return "Esc close  \xC2\xB7  drag or scroll to pan  \xC2\xB7  Ctrl+scroll or Ctrl+=/\xE2\x88\x92 to zoom  \xC2\xB7  Ctrl+0 fit  \xC2\xB7  Ctrl+C copy source";
+    return "Drag or scroll to pan  \xC2\xB7  Ctrl+scroll to zoom  \xC2\xB7  Esc to close";
 #endif
 }
 
@@ -868,16 +1040,18 @@ static void dgv_zoom_to(AppState *app, f32 z) {
     dgv_clamp_pan(app);
 }
 
+static void dgv_copy_source(AppState *app) {
+    DiagramViewer *v = &app->dgv;
+    AgvType ty = agv_type(v->vis);
+    (void)app_clipboard_copy(app, v->src, ty == AGV_MATH ? "Formula source copied"
+                                         : ty == AGV_SVG ? "SVG source copied" : "Diagram source copied");
+}
+
 bool diagram_viewer_key(AppState *app, i32 key, u32 mods) {
     if (!app || !app->dgv.open) return false;
     DiagramViewer *v = &app->dgv;
     if (key == KEY_ESCAPE) { diagram_viewer_close(app); return true; }
-    if ((mods & MOD_APP) && key == KEY_C) {
-        AgvType ty = agv_type(v->vis);
-        (void)app_clipboard_copy(app, v->src, ty == AGV_MATH ? "Formula source copied"
-                                             : ty == AGV_SVG ? "SVG source copied" : "Diagram source copied");
-        return true;
-    }
+    if ((mods & MOD_APP) && key == KEY_C) { dgv_copy_source(app); return true; }
     if (key == KEY_0) { diagram_viewer_zoom(app, 0); return true; }
     /* X11 reports these keys, and with Ctrl held it sends no text for them;
      * a bare one zooms through its text (diagram_viewer_char). */
@@ -914,6 +1088,22 @@ void diagram_viewer_zoom(AppState *app, i32 dir) {
 bool diagram_viewer_mouse_down(AppState *app, f32 x, f32 y) {
     if (!app || !app->dgv.open) return false;
     DiagramViewer *v = &app->dgv;
+    DgvBar bar;
+    dgv_bar(app, &bar);
+    for (i32 i = 0; i < DGV_BTN_COUNT; i++) {
+        if (x < bar.btn_x[i] || x >= bar.btn_x[i] + bar.btn_w[i] || y < bar.row_y || y >= bar.row_y + bar.row_h) continue;
+        switch (i) {
+        case DGV_BTN_ZOOM_OUT: diagram_viewer_zoom(app, -1); break;
+        case DGV_BTN_ZOOM_IN:  diagram_viewer_zoom(app, 1); break;
+        case DGV_BTN_FIT:      diagram_viewer_zoom(app, 0); break;
+        case DGV_BTN_COPY:     dgv_copy_source(app); break;
+        default:               diagram_viewer_close(app); break;
+        }
+        return true;
+    }
+    /* The bar between its buttons is no way out: a click that missed one
+     * leaves the viewer up. */
+    if (x >= bar.x && x < bar.x + bar.w && y >= bar.y && y < bar.y + bar.h) return true;
     f32 px, py, pw, ph;
     diagram_viewer_panel_rect(app, &px, &py, &pw, &ph);
     f32 m = 14.0f * app->dpi_scale;

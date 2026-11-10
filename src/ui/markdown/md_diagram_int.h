@@ -215,6 +215,18 @@ void dg_wrap_label(char *s, u32 limit);
 /* Eight soft fills after the eight slices: the categorical colours washed
  * into the surface, for boxes text is drawn on. */
 #define DI_SOFT0 (DI_SLICE0 + 8)
+/* ...and eight fainter ones: a field behind marks and text, where the soft
+ * fill would compete with what stands on it. */
+#define DI_TINT0 (DI_SOFT0 + 8)
+
+/* md_diagram_create_fit: a graph drawn at this share of its size or more in
+ * its box is kept as written; turned, it has to draw this much larger to be
+ * taken. */
+#define DG_FIT_KEEP 0.85f
+#define DG_FIT_GAIN 1.25f
+/* The box the diagram being built is laid out for, 0 when none was named: a
+ * chart sizes its plot to it and keeps its text's size. */
+extern f32 g_fit_w, g_fit_h;
 
 /* ---- the kinds in md_diagram_more.c: gantt, mindmap, timeline, gitGraph,
  * xychart, quadrantChart, journey ---- */

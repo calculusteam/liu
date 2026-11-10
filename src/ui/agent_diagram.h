@@ -107,8 +107,16 @@ void diagram_viewer_render(AppState *app);
 bool diagram_viewer_animating(const DiagramViewer *v);
 /* The viewer's panel in pixels, as drawn (the driver's state). */
 void diagram_viewer_panel_rect(const AppState *app, f32 *x, f32 *y, f32 *w, f32 *h);
-/* The keys line of the viewer's caption, with the platform's app modifier. */
+/* The line under the viewer's bar: its gestures, with the platform's app
+ * modifier. A button under the pointer shows its own name and key there. */
 const char *diagram_viewer_hint(void);
+/* The bar's buttons, left to right. The size the drawing is shown at stands
+ * between the two zoom buttons and is the way back to the fitted size. */
+enum { DGV_BTN_ZOOM_OUT, DGV_BTN_FIT, DGV_BTN_ZOOM_IN, DGV_BTN_COPY, DGV_BTN_CLOSE, DGV_BTN_COUNT };
+/* A button's rect in pixels while the viewer is up, and its name (the
+ * driver's state). */
+bool diagram_viewer_button_rect(const AppState *app, i32 button, f32 *x, f32 *y, f32 *w, f32 *h);
+const char *diagram_viewer_button_name(i32 button);
 
 bool diagram_viewer_key(AppState *app, i32 key, u32 mods);
 bool diagram_viewer_char(AppState *app, u32 codepoint);
