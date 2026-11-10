@@ -1036,12 +1036,14 @@ void forward_open_settle(LIBSSH2_SESSION *owner) {
     if (!owner) return;
     char host[sizeof g_fwd.opening[0].host] = {0};
     i32 port = 0;
+    u64 seq = 0;
     FWD_LOCK();
     for (i32 i = 0; i < MAX_FORWARD_OPENING && !port; i++) {
         const ForwardOpening *p = &g_fwd.opening[i];
         if (!p->active || p->owner != owner || !p->started) continue;
         snprintf(host, sizeof host, "%s", p->host);
         port = p->port;
+        seq = p->seq;
     }
     FWD_UNLOCK();
     if (!port) return;
@@ -1050,11 +1052,25 @@ void forward_open_settle(LIBSSH2_SESSION *owner) {
     long timeout = libssh2_session_get_timeout(owner);
     libssh2_session_set_timeout(owner, FORWARD_SETTLE_MS);
     LIBSSH2_CHANNEL *ch = libssh2_channel_direct_tcpip(owner, host, port);
+    bool left = !ch && libssh2_session_last_errno(owner) == LIBSSH2_ERROR_TIMEOUT;
     libssh2_session_set_timeout(owner, timeout);
     if (ch) {
         libssh2_channel_close(ch);
         libssh2_channel_free(ch);
     }
+    if (left) return;
+    /* The open ended here, as a channel or as a refusal: libssh2 holds nothing
+     * of it, so its connection is let go now. Left as it was, it would be
+     * asked for again as an open of its own. */
+    FWD_LOCK();
+    for (i32 i = 0; i < MAX_FORWARD_OPENING; i++) {
+        ForwardOpening *p = &g_fwd.opening[i];
+        if (!p->active || p->owner != owner || !p->started || p->seq != seq) continue;
+        p->started = false;
+        opening_abandon(p, true);
+        break;
+    }
+    FWD_UNLOCK();
 }
 
 void forward_cleanup_all(void) {

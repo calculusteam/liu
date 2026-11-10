@@ -958,7 +958,7 @@ else
     fi
 
     # The tree is the release the feed named: its own VERSION says so.
-    _sv="$(tr -d '[:space:]' < "$SRC_ROOT/VERSION" 2>/dev/null)"
+    _sv="$( { tr -d '[:space:]' < "$SRC_ROOT/VERSION"; } 2>/dev/null || true)"
     [ "$_sv" = "$VER" ] || err "the downloaded tree is version ${_sv:-unknown}, the feed says $VER; not installed."
 
     # --- signed-downgrade guard (Linux) --------------------------------------

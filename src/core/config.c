@@ -1337,8 +1337,10 @@ static bool helper_copy(const char *src, const char *dst) {
     }
     if (same) { close(in); return true; }
     if (lseek(in, 0, SEEK_SET) != 0) { close(in); return false; }
+    /* A name of this process's own: two copies of Liu starting together each
+     * write and rename their own file. */
     char tmp[1100];
-    if ((usize)snprintf(tmp, sizeof tmp, "%s.part", dst) >= sizeof tmp) { close(in); return false; }
+    if ((usize)snprintf(tmp, sizeof tmp, "%s.%ld.part", dst, (long)getpid()) >= sizeof tmp) { close(in); return false; }
     unlink(tmp);
     int out = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0700);
     if (out < 0) { close(in); return false; }

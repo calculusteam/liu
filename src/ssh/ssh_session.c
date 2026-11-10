@@ -595,8 +595,12 @@ static bool session_pgrp_members_below(pid_t root, pid_t pgid, pid_t *stack, i32
 
 static i32 session_pgrp_members(pid_t pgid, pid_t root, pid_t *stack, i32 stack_n, pid_t **out) {
     *out = stack;
+    /* A group with no member below the shell has them elsewhere (a member
+     * whose parent exited is adopted outside the tree): every process is read. */
     i32 below = 0;
-    if (root > 0 && session_pgrp_members_below(root, pgid, stack, stack_n, out, &below)) return below;
+    if (root > 0 && session_pgrp_members_below(root, pgid, stack, stack_n, out, &below) && below > 0)
+        return below;
+    *out = stack;
     DIR *d = opendir("/proc");
     if (!d) return 0;
     pid_t *list = stack;
