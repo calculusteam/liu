@@ -30,6 +30,7 @@
 
 static u8 soft(u32 i)  { return (u8)(DI_SOFT0 + (i % 8u)); }
 static u8 vivid(u32 i) { return (u8)(DI_SLICE0 + (i % 8u)); }
+static u8 tint(u32 i)  { return (u8)(DI_TINT0 + (i % 8u)); }
 
 static void trim(const u8 **s, u32 *n) {
     while (*n && (dg_is_space((*s)[0]) || (*s)[0] == '\r')) { (*s)++; (*n)--; }
@@ -503,14 +504,19 @@ static void gantt_emit(void) {
         u8 fill = DI_NODE_FILL, edge = DI_NODE_STROKE;
         if (k->flags & GT_CRIT)        { fill = soft(5); edge = vivid(5); }
         else if (k->flags & GT_ACTIVE) { fill = DI_ACTIVATION; edge = DI_ACCENT; }
-        else if (k->flags & GT_DONE)   { fill = DI_CHIP; edge = DI_GROUP_STROKE; ink = DI_TEXT_DIM; }
+        else if (k->flags & GT_DONE)   { fill = DI_GROUP_STROKE; edge = DI_GROUP_TEXT; ink = DI_TEXT; }
         em_box(P_NODE, bx, by, bw, bar, g_ch * 0.22f, t, fill, edge);
         f32 ty = by + (bar - g_ch) * 0.5f;
-        if (nw + g_cw * 1.2f <= bw) em_text(bx + (bw - nw) * 0.5f, ty, k->name, (u32)strlen(k->name), ink);
-        else if (bx + bw + g_cw * 0.6f + nw <= x0 + chart) em_text(bx + bw + g_cw * 0.6f, ty, k->name, (u32)strlen(k->name), DI_TEXT);
-        else em_text(bx - g_cw * 0.6f - nw, ty, k->name, (u32)strlen(k->name), DI_TEXT);
+        /* a finished task carries a tick before its name */
+        char name[DG_LABEL_CAP + 8];
+        snprintf(name, sizeof name, "%s%s", (k->flags & GT_DONE) ? "\xE2\x9C\x93 " : "", k->name);
+        nw = text_w(name);
+        u32 nl = (u32)strlen(name);
+        if (nw + g_cw * 1.2f <= bw) em_text(bx + (bw - nw) * 0.5f, ty, name, nl, ink);
+        else if (bx + bw + g_cw * 0.6f + nw <= x0 + chart) em_text(bx + bw + g_cw * 0.6f, ty, name, nl, DI_TEXT);
+        else em_text(bx - g_cw * 0.6f - nw, ty, name, nl, DI_TEXT);
     }
-    emit_title(0, x0 + chart);
+    emit_title(x0, x0 + chart);
 }
 
 /* =========================================================================
@@ -571,21 +577,44 @@ static bool timeline_parse(DScan *sc) {
 
 static void timeline_emit(void) {
     f32 pad = g_cw * 1.2f, gap = g_cw * (0.8f + 0.6f * g_gap), t = dg_stroke_w();
-    f32 colw[DGM_MAX_GROUPS * 2];
-    f32 x = 0;
-    f32 head_h = 0;
+    /* A box named: the rows close up, and the text keeps its size. */
+    bool fitted = g_fit_h > 0.0f;
+    f32 ev_pad = g_ch * 0.7f, ev_step = g_ch * (0.35f + 0.25f * g_gap), ev_side = g_cw * 0.9f;
+    f32 colw[DGM_MAX_GROUPS * 2], roww[DGM_MAX_GROUPS * 2];
+    f32 head_h = 0, stack_h = 0, row_h = 0, stack_w = 0, row_w = 0;
     for (u32 i = 0; i < ntp; i++) {
-        f32 w = text_w(tp[i].label);
-        for (u32 k = 0; k < tp[i].nev; k++) w = fmaxf(w, text_w(tev[tp[i].ev0 + k]));
+        f32 w = text_w(tp[i].label), rw = 0, sh = 0;
+        for (u32 k = 0; k < tp[i].nev; k++) {
+            const char *ev = tev[tp[i].ev0 + k];
+            w = fmaxf(w, text_w(ev));
+            rw += text_w(ev) + pad * 1.4f + (k ? ev_side : 0.0f);
+            sh += text_h(ev) + ev_pad + (k ? ev_step : 0.0f);
+            row_h = fmaxf(row_h, text_h(ev) + ev_pad);
+        }
         colw[i] = fmaxf(w + pad * 2.0f, g_cw * 14.0f);
+        roww[i] = fmaxf(fmaxf(text_w(tp[i].label) + pad * 2.0f, rw), g_cw * 8.0f);
+        stack_w += colw[i] + (i ? gap : 0.0f);
+        row_w += roww[i] + (i ? gap : 0.0f);
+        stack_h = fmaxf(stack_h, sh);
         head_h = fmaxf(head_h, text_h(tp[i].label));
     }
-    f32 top = title_h();
-    f32 sec_h = ntsec ? g_ch * 1.8f : 0.0f;
-    f32 py = top + sec_h + (ntsec ? g_ch * 0.4f : 0.0f);
-    f32 ph = head_h + g_ch * 0.9f;
-    f32 line_y = py + ph + g_ch * 1.1f;
+    f32 top = g_title[0] ? text_h(g_title) + g_ch * (fitted ? 0.5f : 0.9f) : 0.0f;
+    f32 sec_h = ntsec ? g_ch * (fitted ? 1.4f : 1.8f) : 0.0f;
+    f32 py = top + sec_h + (ntsec ? g_ch * (fitted ? 0.3f : 0.4f) : 0.0f);
+    f32 ph = head_h + g_ch * (fitted ? 0.6f : 0.9f);
+    f32 line_y = py + ph + g_ch * (fitted ? 0.8f : 1.1f);
+    f32 ev_y = line_y + g_ch * (fitted ? 0.9f : 1.2f);
+    /* A period's events stand side by side under it where the box is too low
+     * for them one under another and that draws the whole larger. */
+    bool side = false;
+    if (fitted && g_fit_w > 0.0f && stack_h > row_h && ev_y + stack_h > g_fit_h) {
+        f32 stacked = fminf(1.0f, fminf(g_fit_w / fmaxf(1.0f, stack_w), g_fit_h / (ev_y + stack_h)));
+        f32 beside = fminf(1.0f, fminf(g_fit_w / fmaxf(1.0f, row_w), g_fit_h / (ev_y + row_h)));
+        side = beside > stacked * 1.1f;
+    }
+    if (side) memcpy(colw, roww, (usize)ntp * sizeof colw[0]);
     f32 xs[DGM_MAX_GROUPS * 2];
+    f32 x = 0;
     for (u32 i = 0; i < ntp; i++) { xs[i] = x; x += colw[i] + gap; }
     f32 total = x - gap;
 
@@ -601,26 +630,48 @@ static void timeline_emit(void) {
     /* the line the periods hang on, with an arrow at its end */
     em_seg(P_EDGE, -g_cw, line_y, total + g_cw * 1.5f, line_y, t * 1.6f, DI_EDGE);
     em_wedge(P_EDGE, total + g_cw * 2.6f, line_y, total + g_cw * 1.4f, line_y, g_ch * 0.3f, DI_EDGE);
-    f32 maxy = line_y;
     for (u32 i = 0; i < ntp; i++) {
         u32 c = ntsec && tp[i].section >= 0 ? (u32)tp[i].section : i;
         f32 cx = xs[i] + colw[i] * 0.5f;
+        f32 stem = fmaxf(1.0f, t * 0.8f);
         em_box(P_NODE, xs[i], py, colw[i], ph, g_ch * 0.25f, t, soft(c), vivid(c));
         em_text_box(tp[i].label, xs[i], py, colw[i], ph, DI_TEXT);
         em_seg(P_EDGE, cx, py + ph, cx, line_y, t, vivid(c));
-        f32 ey = line_y + g_ch * 1.2f;
-        f32 last = line_y;
-        for (u32 k = 0; k < tp[i].nev; k++) {
-            const char *ev = tev[tp[i].ev0 + k];
-            f32 eh = text_h(ev) + g_ch * 0.7f;
-            em_box(P_NODE, xs[i] + g_cw * 0.4f, ey, colw[i] - g_cw * 0.8f, eh, g_ch * 0.2f, t, DI_NODE_FILL, vivid(c));
-            em_text_box(ev, xs[i] + g_cw * 0.4f, ey, colw[i] - g_cw * 0.8f, eh, DI_TEXT);
-            last = ey;
-            ey += eh + g_ch * (0.35f + 0.25f * g_gap);
+        if (side && tp[i].nev) {
+            /* one row: a rail under the line, a drop to each event */
+            f32 rw = 0;
+            for (u32 k = 0; k < tp[i].nev; k++) rw += text_w(tev[tp[i].ev0 + k]) + pad * 1.4f + (k ? ev_side : 0.0f);
+            f32 ex = xs[i] + (colw[i] - rw) * 0.5f;
+            f32 rail = (line_y + ev_y) * 0.5f, first = 0, last = 0;
+            for (u32 k = 0; k < tp[i].nev; k++) {
+                const char *ev = tev[tp[i].ev0 + k];
+                f32 ew = text_w(ev) + pad * 1.4f, mid = ex + ew * 0.5f;
+                em_box(P_NODE, ex, ev_y, ew, row_h, g_ch * 0.2f, t, DI_NODE_FILL, vivid(c));
+                em_text_box(ev, ex, ev_y, ew, row_h, DI_TEXT);
+                if (tp[i].nev > 1) em_seg(P_BACK, mid, rail, mid, ev_y, stem, vivid(c));
+                if (!k) first = mid;
+                last = mid;
+                ex += ew + ev_side;
+            }
+            if (tp[i].nev > 1) {
+                em_seg(P_BACK, first, rail, last, rail, stem, vivid(c));
+                em_seg(P_BACK, cx, line_y, cx, rail, stem, vivid(c));
+            } else {
+                em_seg(P_BACK, cx, line_y, cx, ev_y, stem, vivid(c));
+            }
+        } else {
+            f32 ey = ev_y, last = line_y;
+            for (u32 k = 0; k < tp[i].nev; k++) {
+                const char *ev = tev[tp[i].ev0 + k];
+                f32 eh = text_h(ev) + ev_pad;
+                em_box(P_NODE, xs[i] + g_cw * 0.4f, ey, colw[i] - g_cw * 0.8f, eh, g_ch * 0.2f, t, DI_NODE_FILL, vivid(c));
+                em_text_box(ev, xs[i] + g_cw * 0.4f, ey, colw[i] - g_cw * 0.8f, eh, DI_TEXT);
+                last = ey;
+                ey += eh + ev_step;
+            }
+            if (tp[i].nev) em_seg(P_BACK, cx, line_y, cx, last, stem, vivid(c));
         }
-        if (tp[i].nev) em_seg(P_BACK, cx, line_y, cx, last, fmaxf(1.0f, t * 0.8f), vivid(c));
         dot(cx, line_y, g_ch * 0.32f, vivid(c), DI_NONE, 0);
-        maxy = fmaxf(maxy, ey);
     }
     emit_title(0, total);
 }
@@ -870,12 +921,6 @@ static void xychart_emit(void) {
     if (y_given) { lo = fmin(y_lo, y_hi); hi = fmax(y_lo, y_hi); }
     else { if (lo > 0) lo = 0; if (hi < 0) hi = 0; }
     if (!(hi > lo)) hi = lo + 1.0;
-    f64 step = nice_step((hi - lo) / 5.0);
-    if (!y_given) { lo = floor(lo / step) * step; hi = ceil(hi / step) * step; }
-    /* The value ticks by count, not by adding up a step: near a large bound a
-     * small step can be below the spacing of doubles there. */
-    f64 span = (hi - lo) / step;
-    u32 nticks = isfinite(span) && span > 0.0 ? (u32)fmin(span + 0.5, 64.0) : 1u;
     /* category labels */
     char labs[DGM_MAX_VALUES][DG_ELABEL_CAP];
     for (u32 i = 0; i < n; i++) {
@@ -889,10 +934,29 @@ static void xychart_emit(void) {
     f32 band = xy_horizontal ? g_ch * 1.9f : fmaxf(lab_w + g_cw * 1.4f, g_cw * 5.0f);
     f32 along = band * (f32)n;
     f32 across = xy_horizontal ? g_cw * 60.0f : g_ch * 14.0f;
+    /* A box named: the plot takes what it leaves between the title and the
+     * category row, down to a few rows, and the text keeps its size. The
+     * value axis's name then stands on the title's row, left of it, where
+     * the two do not meet. */
+    bool y_on_title = false;
+    if (!xy_horizontal && g_fit_h > 0.0f) {
+        y_on_title = g_title[0] && y_title[0] && (along - text_w(g_title)) * 0.5f >= text_w(y_title);
+        f32 above = title_h() + (y_title[0] && !y_on_title ? g_ch * 1.4f : 0.0f);
+        f32 below = g_ch * 1.5f + (x_title[0] ? g_ch * 1.4f : 0.0f);
+        across = fminf(across, fmaxf(g_ch * 3.5f, g_fit_h - above - below));
+    }
+    /* as many divisions as the value axis has room to name */
+    f64 divs = xy_horizontal ? 5.0 : fmin(5.0, fmax(1.0, floor((f64)(across / (g_ch * 1.5f)))));
+    f64 step = nice_step((hi - lo) / divs);
+    if (!y_given) { lo = floor(lo / step) * step; hi = ceil(hi / step) * step; }
+    /* The value ticks by count, not by adding up a step: near a large bound a
+     * small step can be below the spacing of doubles there. */
+    f64 span = (hi - lo) / step;
+    u32 nticks = isfinite(span) && span > 0.0 ? (u32)fmin(span + 0.5, 64.0) : 1u;
     char vl[32];
     f32 val_w = 0;
     for (u32 k = 0; k <= nticks; k++) { fmt_num(lo + step * (f64)k, vl, sizeof vl); val_w = fmaxf(val_w, text_w(vl)); }
-    f32 top = title_h() + (y_title[0] && !xy_horizontal ? g_ch * 1.4f : 0.0f);
+    f32 top = title_h() + (y_title[0] && !xy_horizontal && !y_on_title ? g_ch * 1.4f : 0.0f);
     f32 t = dg_stroke_w();
     f32 ox, oy, pw, ph;                            /* the plot box */
     if (!xy_horizontal) { ox = val_w + g_cw * 1.5f; oy = top; pw = along; ph = across; }
@@ -956,7 +1020,8 @@ static void xychart_emit(void) {
     }
     /* axis titles */
     if (y_title[0]) {
-        if (!xy_horizontal) em_text(ox - val_w - g_cw * 0.6f, oy - g_ch * 1.4f, y_title, (u32)strlen(y_title), DI_TEXT_DIM);
+        if (!xy_horizontal) em_text(ox - val_w - g_cw * 0.6f, y_on_title ? (text_h(g_title) - g_ch) * 0.5f : oy - g_ch * 1.4f,
+                                    y_title, (u32)strlen(y_title), DI_TEXT_DIM);
         else { f32 w = text_w(y_title); em_text(ox + (pw - w) * 0.5f, oy + ph + g_ch * 1.5f, y_title, (u32)strlen(y_title), DI_TEXT_DIM); }
     }
     if (x_title[0]) {
@@ -1024,6 +1089,9 @@ static bool quadrant_parse(DScan *sc) {
 static void quadrant_emit(void) {
     f32 t = dg_stroke_w();
     f32 side = g_ch * 22.0f;
+    /* a box named: the square is as tall as it leaves under the title and
+     * over the axis's names, down to one that still holds its points apart */
+    if (g_fit_h > 0.0f) side = fminf(side, fmaxf(g_ch * 9.0f, g_fit_h - title_h() - g_ch * 1.6f));
     f32 left = fmaxf(text_w(qy_lo), text_w(qy_hi));
     if (left > 0) left += g_cw * 1.5f;
     f32 top = title_h();
@@ -1032,7 +1100,7 @@ static void quadrant_emit(void) {
     const f32 qx[4] = { x0 + h, x0, x0, x0 + h }, qy[4] = { y0, y0, y0 + h, y0 + h };
     const u32 col[4] = { 0, 4, 2, 3 };
     for (u32 q = 0; q < 4; q++) {
-        em_box(P_BACK, qx[q], qy[q], h, h, 0, 0, soft(col[q]), DI_NONE);
+        em_box(P_BACK, qx[q], qy[q], h, h, 0, 0, tint(col[q]), DI_NONE);
         if (q_label[q][0]) {
             f32 lh = text_h(q_label[q]);
             em_text_box(q_label[q], qx[q], qy[q] + g_ch * 0.5f, h, lh, DI_TEXT_DIM);
@@ -1046,9 +1114,12 @@ static void quadrant_emit(void) {
         f32 px = x0 + qp[i].x * side, py = y0 + (1.0f - qp[i].y) * side;
         dot(px, py, g_ch * 0.32f, DI_ACCENT, DI_SURFACE, t);
         f32 w = text_w(qp[i].label);
-        f32 lx = px + g_ch * 0.5f;
-        if (lx + w > x0 + side) lx = px - g_ch * 0.5f - w;
-        em_text(lx, py - g_ch * 0.5f, qp[i].label, (u32)strlen(qp[i].label), DI_TEXT);
+        f32 lx = px + g_ch * 0.7f;
+        if (lx + w + g_cw * 0.4f > x0 + side) lx = px - g_ch * 0.7f - w;
+        f32 ly = py - g_ch * 0.5f;
+        em_box(P_NODE, lx - g_cw * 0.4f, ly - g_ch * 0.08f, w + g_cw * 0.8f, g_ch * 1.16f, g_ch * 0.22f, 0,
+               DI_CHIP, DI_NONE);
+        em_text(lx, ly, qp[i].label, (u32)strlen(qp[i].label), DI_TEXT);
     }
     f32 ay = y0 + side + g_ch * 0.4f;
     if (qx_lo[0]) em_text(x0, ay, qx_lo, (u32)strlen(qx_lo), DI_TEXT_DIM);
@@ -1439,8 +1510,10 @@ static void gitgraph_emit(void) {
         }
         if (k->id[0]) {
             f32 w = text_w(k->id);
-            if (git_vertical) em_text(x + r * 1.6f, y - g_ch * 0.5f, k->id, (u32)strlen(k->id), DI_TEXT_DIM);
-            else em_text(x - w * 0.5f, y + r * 1.4f, k->id, (u32)strlen(k->id), DI_TEXT_DIM);
+            f32 tx = git_vertical ? x + r * 1.6f : x - w * 0.5f;
+            f32 ty = git_vertical ? y - g_ch * 0.5f : y + r * 1.4f;
+            em_box(P_NODE, tx - g_cw * 0.35f, ty, w + g_cw * 0.7f, g_ch, g_ch * 0.2f, 0, DI_SURFACE, DI_NONE);
+            em_text(tx, ty, k->id, (u32)strlen(k->id), DI_TEXT_DIM);
         }
         if (k->tag[0]) {
             f32 w = text_w(k->tag) + g_cw, h = g_ch * 1.15f;

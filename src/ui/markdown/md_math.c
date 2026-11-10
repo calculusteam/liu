@@ -860,6 +860,26 @@ static MBox *attach_script(MP *p, MBox *base, u8 which, MBox *arg, f32 scale) {
     return mb_script(base, sup, sub);
 }
 
+/* What the atom at p->i is for the space around it: 0 an ordinary one, 1 a
+ * binary operator, 2 a relation. */
+static u8 mm_spacing_class(const MP *p) {
+    if (p->i >= p->n) return 0;
+    u8 c = p->s[p->i];
+    if (c == '=' || c == '<' || c == '>') return 2;
+    if (c == '+' || c == '-') return 1;
+    if (c != '\\') return 0;
+    static const char *const rel[] = {
+        "le", "leq", "ge", "geq", "ne", "neq", "approx", "equiv", "sim", "simeq", "cong", "propto",
+        "to", "rightarrow", "leftarrow", "leftrightarrow", "Rightarrow", "Leftarrow", "Leftrightarrow",
+        "mapsto", "in", "notin", "subset", "subseteq", "supset", "supseteq", "ll", "gg", NULL };
+    static const char *const bin[] = {
+        "pm", "mp", "times", "cdot", "div", "cup", "cap", "oplus", "otimes", "setminus", "wedge",
+        "vee", "circ", "ast", NULL };
+    for (u32 k = 0; rel[k]; k++) if (at_cmd(p, rel[k])) return 2;
+    for (u32 k = 0; bin[k]; k++) if (at_cmd(p, bin[k])) return 1;
+    return 0;
+}
+
 static MBox *parse_list(MP *p, f32 scale, u32 stop, int depth) {
     /* Depth cap: consume the rest of this list without building so the caller
      * still makes progress and nothing recurses further. A cell/fence list is
@@ -871,6 +891,10 @@ static MBox *parse_list(MP *p, f32 scale, u32 stop, int depth) {
         return mb_kern(0);
     }
     MBox *kids[256]; u32 nk = 0;
+    /* The class of the atom before this one, 0 when it is an ordinary one:
+     * an operator after nothing, or after another, is a sign and takes no
+     * space. */
+    u8 before = 1;
     while (p->i < p->n && nk < 255) {
         u8 c = p->s[p->i];
         if ((stop & MM_STOP_BRACE) && c == '}') { p->i++; break; }
@@ -891,6 +915,8 @@ static MBox *parse_list(MP *p, f32 scale, u32 stop, int depth) {
             continue;
         }
 
+        /* Scripts are set tight, as text style is not. */
+        u8 cls = scale > 0.8f ? mm_spacing_class(p) : 0;
         MBox *u = parse_unit(p, scale, depth + 1);
         if (!u) {
             if (stop & MM_STOP_BRACE) continue;
@@ -912,7 +938,21 @@ static MBox *parse_list(MP *p, f32 scale, u32 stop, int depth) {
             u = attach_script(p, u, which, arg, scale);
             if (!u) break;   /* scratch exhausted — stop attaching, don't deref NULL */
         }
+        if (u && (cls == 2 || (cls == 1 && before == 0)) && nk + 3 < 255) {
+            /* a relation stands a thick space off what it relates, a binary
+             * operator a medium one */
+            f32 sp = (cls == 2 ? 0.34f : 0.22f) * g_cw * scale;
+            MBox *l = mb_kern(sp), *r = mb_kern(sp);
+            if (l && r) {
+                kids[nk++] = l;
+                kids[nk++] = u;
+                kids[nk++] = r;
+                before = cls;
+                continue;
+            }
+        }
         if (u && nk < 255) kids[nk++] = u;
+        if (u) before = cls;
     }
     if (nk == 0) return mb_kern(0);
     return mb_hlist(kids, nk);

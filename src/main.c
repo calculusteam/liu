@@ -17203,6 +17203,18 @@ static void liu_script_state(AppState *a, PlatformWindow *pw) {
                  (double)vx, (double)vy, (double)vw, (double)vh, (double)a->dgv.zoom);
         liu_script_kv("diagram_viewer_panel", vv);
         liu_script_kv("diagram_viewer_hint", diagram_viewer_hint());
+        char vb[512];
+        usize vo = 0;
+        for (i32 bi = 0; bi < DGV_BTN_COUNT && vo < sizeof vb; bi++) {
+            f32 bx, by, bw, bh;
+            if (!diagram_viewer_button_rect(a, bi, &bx, &by, &bw, &bh)) continue;
+            i32 wr = snprintf(vb + vo, sizeof vb - vo, "%s%s:%.0f,%.0f,%.0f,%.0f", vo ? ";" : "",
+                              diagram_viewer_button_name(bi), (double)bx, (double)by, (double)bw, (double)bh);
+            if (wr < 0 || (usize)wr >= sizeof vb - vo) break;
+            vo += (usize)wr;
+        }
+        vb[vo < sizeof vb ? vo : sizeof vb - 1] = 0;
+        liu_script_kv("diagram_viewer_buttons", vb);
     }
     SAYI("lightbox", a->lightbox.open);
     if (a->lightbox.open) {                              /* the caption's plate: x,y,w,h in pixels */

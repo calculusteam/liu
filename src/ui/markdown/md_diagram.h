@@ -110,6 +110,13 @@ MdDiagram    *md_diagram_create(const u8 *src, u32 len, f32 cw, f32 ch);
  * to fit the rows it was given; text keeps its size. */
 typedef enum { MD_DIAGRAM_READING = 0, MD_DIAGRAM_COMPACT } MdDiagramSpacing;
 MdDiagram    *md_diagram_create_ex(const u8 *src, u32 len, f32 cw, f32 ch, MdDiagramSpacing spacing);
+/* The same for a diagram shown whole in a box of `box_w` x `box_h` pixels: a
+ * graph (flowchart, state, class, entity relationship) that has to shrink to
+ * fit is laid out across its written direction instead when that draws it
+ * markedly larger there — a top-down chart in a wide, low box runs left to
+ * right. What it holds is the same either way. */
+MdDiagram    *md_diagram_create_fit(const u8 *src, u32 len, f32 cw, f32 ch, MdDiagramSpacing spacing,
+                                    f32 box_w, f32 box_h);
 void          md_diagram_destroy(MdDiagram *d);
 MdDiagramKind md_diagram_kind_of(const MdDiagram *d);
 MdDiagramLang md_diagram_lang_of(const MdDiagram *d);
@@ -131,6 +138,7 @@ typedef struct {
     Color accent, activation, solid;
     Color slice[8];
     Color soft[8];           /* the slices washed into the surface: fills text sits on */
+    Color tint[8];           /* fainter still: a field behind marks and their names */
 } MdDiagramInks;
 
 /* Inks for `theme` (NULL: a neutral dark set) on `surface`, with `accent` as

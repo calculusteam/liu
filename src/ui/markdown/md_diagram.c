@@ -1965,10 +1965,12 @@ static void dg_size_node(DNode *n) {
         f32 head = th + g_ch * 0.9f;
         f32 total = head;
         f32 wmax = tw;
+        /* a class that names no member is its name alone */
+        bool bare = n->shape == SH_CLASS && !n->body[0] && !n->body2[0];
         for (u32 part = 0; part < 2; part++) {
             const char *b = part ? n->body2 : n->body;
             if (!b[0]) {
-                if (n->shape == SH_CLASS) total += g_ch * 0.6f;
+                if (n->shape == SH_CLASS && !bare) total += g_ch * 0.6f;
                 continue;
             }
             u32 br, bc;
@@ -3338,6 +3340,7 @@ static void em_graph_node(const DNode *n) {
         if (n->shape == SH_ENTITY)
             em_box(P_TOP, x0 + t, y0 + t, n->w - t * 2, head - t, r, 0, DI_ACTIVATION, DI_NONE);
         f32 y = y0 + head;
+        if (n->shape == SH_CLASS && !n->body[0] && !n->body2[0]) break;
         for (u32 part = 0; part < 2; part++) {
             const char *b = part ? n->body2 : n->body;
             if (part == 1 && n->shape == SH_ENTITY) break;
@@ -3502,32 +3505,39 @@ static void dg_layout_seq(void) {
     }
 
     /* Rows. Activate/deactivate markers take no height; frame markers take
-     * their label band. */
-    f32 y = head_h + g_ch * 1.2f * g_gap;
-    for (u32 m = 0; m < g_nmsgs; m++) {
-        DMsg *ms = &g_msgs[m];
-        u32 rows, cells;
-        dg_text_metrics(ms->label, &rows, &cells);
-        ms->y = y;
-        ms->ly = y;
-        switch (ms->kind) {
-        case SQ_ACT: case SQ_DEACT: ms->h = 0; break;
-        case SQ_FRAME_OPEN: case SQ_FRAME_DIV:
-            ms->h = g_ch * 2.0f;
-            break;
-        case SQ_FRAME_CLOSE: ms->h = g_ch * 0.9f; break;
-        case SQ_NOTE_L: case SQ_NOTE_R: case SQ_NOTE_OVER:
-            ms->h = (f32)rows * g_ch * DG_ROW_H + g_ch * 1.4f;
-            break;
-        default:
-            /* The label band sits above the arrow and grows with its rows. */
-            ms->ly = y + (f32)rows * g_ch * DG_ROW_H + g_ch * 0.35f;
-            ms->h = (ms->ly - y) + ((ms->from == ms->to) ? g_ch * 1.7f : g_ch * (0.55f + 0.45f * g_gap));
-            break;
+     * their label band. A box named that the rows do not fit closes them up:
+     * a label stays a row over its arrow, the air between two is less. */
+    f32 total_h = 0;
+    for (u32 pass = 0; pass < 2; pass++) {
+        bool tight = pass == 1;
+        f32 y = head_h + g_ch * (tight ? 0.5f : 1.2f * g_gap);
+        for (u32 m = 0; m < g_nmsgs; m++) {
+            DMsg *ms = &g_msgs[m];
+            u32 rows, cells;
+            dg_text_metrics(ms->label, &rows, &cells);
+            ms->y = y;
+            ms->ly = y;
+            switch (ms->kind) {
+            case SQ_ACT: case SQ_DEACT: ms->h = 0; break;
+            case SQ_FRAME_OPEN: case SQ_FRAME_DIV:
+                ms->h = g_ch * (tight ? 1.7f : 2.0f);
+                break;
+            case SQ_FRAME_CLOSE: ms->h = g_ch * (tight ? 0.6f : 0.9f); break;
+            case SQ_NOTE_L: case SQ_NOTE_R: case SQ_NOTE_OVER:
+                ms->h = (f32)rows * g_ch * DG_ROW_H + g_ch * (tight ? 1.0f : 1.4f);
+                break;
+            default:
+                /* The label band sits above the arrow and grows with its rows. */
+                ms->ly = y + (f32)rows * g_ch * DG_ROW_H + g_ch * (tight ? 0.2f : 0.35f);
+                ms->h = (ms->ly - y) + ((ms->from == ms->to) ? g_ch * 1.7f
+                                        : g_ch * (tight ? 0.45f : 0.55f + 0.45f * g_gap));
+                break;
+            }
+            y += ms->h;
         }
-        y += ms->h;
+        total_h = y + g_ch * (tight ? 0.7f : 1.2f);
+        if (!(g_fit_h > 0.0f) || total_h <= g_fit_h) break;
     }
-    f32 total_h = y + g_ch * 1.2f;
 
     /* Activation bars, closed in message order; an unclosed one runs to the
      * bottom of the diagram. */
@@ -3588,7 +3598,7 @@ static void dg_layout_seq(void) {
             if (sp && g_ndivs < DG_MAX_DIVS) {
                 DDiv *d = &g_divs[g_ndivs++];
                 d->frame = st[sp - 1].frame;
-                memcpy(d->text, ms->label, sizeof d->text);
+                dg_strcpy(d->text, sizeof d->text, (const u8 *)ms->label, (u32)strlen(ms->label));
                 d->y = ms->y + g_ch * 0.2f;
             }
             continue;
@@ -3783,53 +3793,90 @@ static void em_seq(void) {
 /* =========================================================================
  * Pie
  * ========================================================================= */
+/* A share as it is read: whole when it is one, a tenth otherwise. */
+static void pie_share(f64 pct, char *out, usize cap) {
+    if (fabs(pct - floor(pct + 0.5)) < 0.05) snprintf(out, cap, "%.0f%%", floor(pct + 0.5));
+    else snprintf(out, cap, "%.1f%%", pct);
+}
+
 static void em_pie(void) {
     f64 total = 0;
     for (u32 i = 0; i < g_nslices; i++) total += g_slices[i].value;
     if (!(total > 0)) return;
-    f32 top = 0;
+    /* The legend's two columns: names flush left, shares flush right. */
+    char val[DG_MAX_SLICES][48];
+    f32 lab_w = 0, val_w = 0;
+    for (u32 i = 0; i < g_nslices; i++) {
+        char share[16];
+        pie_share(g_slices[i].value / total * 100.0, share, sizeof share);
+        if (g_show_data) snprintf(val[i], sizeof val[i], "%g  %s", g_slices[i].value, share);
+        else snprintf(val[i], sizeof val[i], "%s", share);
+        u32 rows, cells;
+        dg_text_metrics(g_slices[i].label, &rows, &cells);
+        lab_w = fmaxf(lab_w, (f32)cells * g_cw);
+        dg_text_metrics(val[i], &rows, &cells);
+        val_w = fmaxf(val_w, (f32)cells * g_cw);
+    }
+    f32 radius = g_ch * 5.0f;
+    f32 swatch = g_ch * 0.75f, pitch = g_ch * 1.5f;
+    f32 title_w = 0, title_h = 0, top = 0;
     if (g_title[0]) {
         u32 rows, cells;
         dg_text_metrics(g_title, &rows, &cells);
-        em_text_box(g_title, 0, 0, (f32)cells * g_cw + g_cw * 2, (f32)rows * g_ch * DG_ROW_H, DI_TEXT);
-        top = (f32)rows * g_ch * DG_ROW_H + g_ch * 0.8f;
+        title_w = (f32)cells * g_cw;
+        title_h = (f32)rows * g_ch * DG_ROW_H;
+        top = title_h + g_ch * (g_fit_h > 0.0f ? 0.5f : 0.9f);
     }
-    f32 radius = g_ch * 5.0f;
-    f32 cx = radius + g_cw, cy = top + radius;
+    if (g_fit_h > 0.0f) {
+        /* A box named: the legend's rows close up, and the pie is as tall as
+         * the box leaves it or as the legend, whichever is taller. */
+        pitch = g_ch * 1.2f;
+        f32 room = fmaxf(g_fit_h - top, (f32)g_nslices * pitch);
+        radius = fminf(radius, fmaxf(g_ch * 2.4f, room * 0.5f));
+    }
+    f32 lx = radius * 2.0f + g_cw * 4.0f;
+    f32 text_x = lx + swatch + g_cw * 1.1f;
+    f32 val_x1 = text_x + lab_w + g_cw * 3.0f + val_w;
+    if (g_title[0]) em_text_box(g_title, 0, 0, fmaxf(val_x1, title_w), title_h, DI_TEXT);
+    /* the legend is centred on the pie, and a legend taller than the pie
+     * still starts under the title */
+    f32 cx = radius + g_cw, cy = top + fmaxf(radius, (f32)g_nslices * pitch * 0.5f);
+    /* A ring, not a disc: each slice is one joined stroke along its arc, as
+     * wide as the ring. Wedges drawn from the centre meet there thinner than
+     * a pixel, and what is left of them is a blot. */
+    f32 inner = radius * 0.46f;
+    f32 mid = (radius + inner) * 0.5f, band = radius - inner;
     f32 a = -1.5707963f;
     for (u32 i = 0; i < g_nslices; i++) {
         f32 sweep = (f32)(g_slices[i].value / total) * 6.2831853f;
-        u32 steps = (u32)ceilf(sweep / 0.12f);
-        if (steps < 1) steps = 1;
-        /* Neighbouring wedges of one slice overlap, so their antialiased
-         * edges never meet half-covered: that would draw a seam. */
-        const f32 eps = 0.035f;
-        for (u32 k = 0; k < steps; k++) {
-            f32 a0 = a + sweep * (f32)k / (f32)steps, a1 = a + sweep * (f32)(k + 1) / (f32)steps;
-            if (k > 0) a0 -= eps;
-            if (k + 1 < steps) a1 += eps;
-            f32 x0 = cx + cosf(a0) * radius, y0 = cy + sinf(a0) * radius;
-            f32 x1 = cx + cosf(a1) * radius, y1 = cy + sinf(a1) * radius;
-            f32 hb = hypotf(x1 - x0, y1 - y0) * 0.5f;
-            em_wedge(P_EDGE, cx, cy, (x0 + x1) * 0.5f, (y0 + y1) * 0.5f, hb, (u8)(DI_SLICE0 + (i % 8)));
+        enum { ARC = 128 };
+        f32 px[ARC + 1], py[ARC + 1];
+        u32 n = (u32)ceilf(sweep / 0.05f) + 1;
+        if (n < 2) n = 2;
+        if (n > ARC + 1) n = ARC + 1;
+        bool whole = g_nslices == 1;
+        for (u32 k = 0; k < n; k++) {
+            f32 ang = a + sweep * (f32)k / (f32)(whole ? n : n - 1);
+            px[k] = cx + cosf(ang) * mid;
+            py[k] = cy + sinf(ang) * mid;
         }
-        if (g_nslices > 1)
-            em_seg(P_NODE, cx, cy, cx + cosf(a) * radius, cy + sinf(a) * radius,
+        em_poly(P_EDGE, px, py, n, whole, band, (u8)(DI_SLICE0 + (i % 8)));
+        if (!whole)
+            em_seg(P_NODE, cx + cosf(a) * (inner - 1.0f), cy + sinf(a) * (inner - 1.0f),
+                   cx + cosf(a) * (radius + 1.0f), cy + sinf(a) * (radius + 1.0f),
                    fmaxf(1.0f, g_ch * 0.09f), DI_SURFACE);
         a += sweep;
     }
-    /* legend */
-    f32 lx = cx + radius + g_cw * 3.0f;
-    f32 ly = cy - (f32)g_nslices * g_ch * 1.5f * 0.5f;
+    f32 ly = cy - (f32)g_nslices * pitch * 0.5f;
     for (u32 i = 0; i < g_nslices; i++) {
-        f32 y = ly + (f32)i * g_ch * 1.5f;
-        em_box(P_NODE, lx, y + g_ch * 0.15f, g_ch * 0.75f, g_ch * 0.75f, g_ch * 0.15f, 0,
+        f32 y = ly + (f32)i * pitch;
+        em_box(P_NODE, lx, y + (pitch - swatch) * 0.5f, swatch, swatch, g_ch * 0.15f, 0,
                (u8)(DI_SLICE0 + (i % 8)), DI_NONE);
-        char row[DG_ELABEL_CAP + 48];
-        f64 pct = g_slices[i].value / total * 100.0;
-        if (g_show_data) snprintf(row, sizeof row, "%s  %g (%.1f%%)", g_slices[i].label, g_slices[i].value, pct);
-        else snprintf(row, sizeof row, "%s  %.1f%%", g_slices[i].label, pct);
-        em_text(lx + g_ch * 1.2f, y + (g_ch * 1.05f - g_ch) * 0.5f, row, (u32)strlen(row), DI_TEXT);
+        f32 ty = y + (pitch - g_ch) * 0.5f;
+        em_text(text_x, ty, g_slices[i].label, (u32)strlen(g_slices[i].label), DI_TEXT);
+        u32 rows, cells;
+        dg_text_metrics(val[i], &rows, &cells);
+        em_text(val_x1 - (f32)cells * g_cw, ty, val[i], (u32)strlen(val[i]), DI_TEXT_DIM);
     }
 }
 
@@ -3925,12 +3972,17 @@ MdDiagram *md_diagram_create(const u8 *src, u32 len, f32 cw, f32 ch) {
     return md_diagram_create_ex(src, len, cw, ch, MD_DIAGRAM_READING);
 }
 
+/* A graph's ranks are laid across the direction its source names. */
+static bool g_turned;
+f32 g_fit_w, g_fit_h;
+
 MdDiagram *md_diagram_create_ex(const u8 *src, u32 len, f32 cw, f32 ch, MdDiagramSpacing spacing) {
     if (!src || !len || !dg_metrics_ok(cw, ch)) return NULL;
     g_cw = cw; g_ch = ch;
     g_gap = spacing == MD_DIAGRAM_COMPACT ? 0.55f : 1.0f;
     MdDiagramKind kind = dg_build(src, len);
     if (kind == MD_DIAGRAM_NONE) return NULL;
+    if (g_turned) g_dir ^= 1;               /* down <-> right, up <-> left */
     em_reset();
     switch (kind) {
     case MD_DIAGRAM_SEQUENCE: dg_layout_seq(); em_seq(); break;
@@ -3946,6 +3998,38 @@ MdDiagram *md_diagram_create_ex(const u8 *src, u32 len, f32 cw, f32 ch, MdDiagra
         break;
     }
     return dg_finish(kind);
+}
+
+/* How large a diagram of `w` x `h` is drawn in a box: never above its own size. */
+static f32 dg_box_scale(f32 w, f32 h, f32 box_w, f32 box_h) {
+    if (!(w > 0.0f) || !(h > 0.0f)) return 0.0f;
+    return fminf(1.0f, fminf(box_w / w, box_h / h));
+}
+
+MdDiagram *md_diagram_create_fit(const u8 *src, u32 len, f32 cw, f32 ch, MdDiagramSpacing spacing,
+                                 f32 box_w, f32 box_h) {
+    bool boxed = box_w > 0.0f && box_h > 0.0f && isfinite(box_w) && isfinite(box_h);
+    g_fit_w = boxed ? box_w : 0.0f;
+    g_fit_h = boxed ? box_h : 0.0f;
+    MdDiagram *d = md_diagram_create_ex(src, len, cw, ch, spacing);
+    g_fit_w = g_fit_h = 0.0f;
+    if (!d || !boxed) return d;
+    switch (d->kind) {
+    case MD_DIAGRAM_FLOWCHART: case MD_DIAGRAM_STATE: case MD_DIAGRAM_CLASS: case MD_DIAGRAM_ER: break;
+    default: return d;
+    }
+    f32 written = dg_box_scale(d->w, d->h, box_w, box_h);
+    if (written >= DG_FIT_KEEP) return d;
+    g_turned = true;
+    MdDiagram *t = md_diagram_create_ex(src, len, cw, ch, spacing);
+    g_turned = false;
+    if (!t) return d;
+    if (dg_box_scale(t->w, t->h, box_w, box_h) > written * DG_FIT_GAIN) {
+        md_diagram_destroy(d);
+        return t;
+    }
+    md_diagram_destroy(t);
+    return d;
 }
 
 void md_diagram_destroy(MdDiagram *d) { free(d); }
@@ -4077,6 +4161,7 @@ void md_diagram_inks(const Theme *theme, Color surface, Color accent, MdDiagramI
         c.a = 1.0f;
         out->slice[i] = dg_mix(c, surface, 0.12f);
         out->soft[i] = dg_mix(surface, c, 0.30f);
+        out->tint[i] = dg_mix(surface, c, 0.15f);
     }
 }
 
@@ -4101,6 +4186,7 @@ static Color dg_ink(const MdDiagramInks *k, u8 ink, f32 alpha) {
     default:
         if (ink >= DI_SLICE0 && ink < DI_SLICE0 + 8) { c = k->slice[ink - DI_SLICE0]; break; }
         if (ink >= DI_SOFT0 && ink < DI_SOFT0 + 8) { c = k->soft[ink - DI_SOFT0]; break; }
+        if (ink >= DI_TINT0 && ink < DI_TINT0 + 8) { c = k->tint[ink - DI_TINT0]; break; }
         c = (Color){ 0, 0, 0, 0 };
         break;
     }

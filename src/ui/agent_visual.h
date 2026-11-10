@@ -39,8 +39,11 @@ AgvType agv_type_of(const char *src, u32 len);
  * its own size (the viewer's twice that). */
 AgentVisual *agv_create(const char *src, u32 len, f32 cw, f32 ch, bool compact);
 /* The same, for a picture never drawn larger than `fit_edge` pixels on its
- * longer side (a card in a window that size): an SVG is rasterised no larger. */
-AgentVisual *agv_create_fit(const char *src, u32 len, f32 cw, f32 ch, bool compact, f32 fit_edge);
+ * longer side (a card in a window that size): an SVG is rasterised no larger.
+ * `box_w` x `box_h` is the room a card gives it (0: none named): a graph is
+ * laid out the way that draws it largest there (md_diagram_create_fit). */
+AgentVisual *agv_create_fit(const char *src, u32 len, f32 cw, f32 ch, bool compact, f32 fit_edge,
+                            f32 box_w, f32 box_h);
 void    agv_destroy(AgentVisual *v);
 AgvType agv_type(const AgentVisual *v);
 /* A formula set in text style (limits beside their operator: a sum stands two

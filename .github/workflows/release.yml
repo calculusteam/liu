@@ -113,7 +113,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for b in Liu liu-notify liu-history; do build/"${b}" --version; done
+          build/Liu --version
+          # The two helpers have no version flag: their usage, asked for, ends
+          # with status 0 once every library they link has loaded.
+          for b in liu-notify liu-history; do build/"${b}" --help > /dev/null; done
           home="$(mktemp -d)"
           Xvfb :91 -screen 0 1600x1000x24 -nolisten tcp >/dev/null 2>&1 &
           xvfb=$!

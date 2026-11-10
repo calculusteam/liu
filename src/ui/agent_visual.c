@@ -637,10 +637,11 @@ bool agv_svg_layout(const char *src, u32 len, f32 *doc_w, f32 *doc_h,
 /* ---- create / destroy ---- */
 
 AgentVisual *agv_create(const char *src, u32 len, f32 cw, f32 ch, bool compact) {
-    return agv_create_fit(src, len, cw, ch, compact, 0.0f);
+    return agv_create_fit(src, len, cw, ch, compact, 0.0f, 0.0f, 0.0f);
 }
 
-AgentVisual *agv_create_fit(const char *src, u32 len, f32 cw, f32 ch, bool compact, f32 fit_edge) {
+AgentVisual *agv_create_fit(const char *src, u32 len, f32 cw, f32 ch, bool compact, f32 fit_edge,
+                            f32 box_w, f32 box_h) {
     if (!src || !len || !(cw > 0) || !(ch > 0)) return NULL;
     AgentVisual *v = (AgentVisual *)calloc(1, sizeof *v);
     if (!v) return NULL;
@@ -648,7 +649,8 @@ AgentVisual *agv_create_fit(const char *src, u32 len, f32 cw, f32 ch, bool compa
     v->cw = cw; v->ch = ch;
     switch (v->type) {
     case AGV_DIAGRAM:
-        v->d = md_diagram_create_ex((const u8 *)src, len, cw, ch, compact ? MD_DIAGRAM_COMPACT : MD_DIAGRAM_READING);
+        v->d = md_diagram_create_fit((const u8 *)src, len, cw, ch, compact ? MD_DIAGRAM_COMPACT : MD_DIAGRAM_READING,
+                                     box_w, box_h);
         if (!v->d) break;
         md_diagram_extent(v->d, &v->w, &v->h);
         return v;
