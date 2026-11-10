@@ -189,7 +189,6 @@ static const char k_zsh_integration[] =
     "add-zsh-hook precmd _liu_first_prompt\n";
 
 const char *shell_integration_zshenv_text(void) { return k_zshenv; }
-const char *shell_integration_zsh_text(void)    { return k_zsh_integration; }
 
 /* Is `path` already exactly `text`? */
 static bool file_is(const char *path, const char *text) {

@@ -41,17 +41,12 @@ bool diag_notify_bin(char *out, usize cap) {
 #elif defined(__linux__)
     /* Same requirement as the bundle path above: an agent spawns the hook with
      * whatever PATH it inherited, which for a desktop-launched agent rarely
-     * includes a self-built or tarball-installed Liu. */
-    char exe[1024];
-    isize elen = readlink("/proc/self/exe", exe, sizeof exe - 1);
-    if (elen > 0) {
-        exe[elen] = '\0';
-        char *slash = strrchr(exe, '/');
-        if (slash) {
-            *slash = '\0';
-            int n = snprintf(out, cap, "%s/liu-notify", exe);
-            if (n > 0 && (usize)n < cap && access(out, X_OK) == 0) return true;
-        }
+     * includes a self-built or tarball-installed Liu. The folder is one that
+     * stays after Liu exits (liu_helper_exe_dir). */
+    const char *dir = liu_helper_exe_dir();
+    if (dir && dir[0]) {
+        int n = snprintf(out, cap, "%s/liu-notify", dir);
+        if (n > 0 && (usize)n < cap && access(out, X_OK) == 0) return true;
     }
 #endif
     int n = snprintf(out, cap, "liu-notify");
@@ -116,16 +111,6 @@ bool diag_needs_user(const DiagReport *r) {
             return true;
     }
     return false;
-}
-
-const char *diag_status_label(DiagStatus s) {
-    switch (s) {
-    case DIAG_OK:   return "OK";
-    case DIAG_INFO: return "Info";
-    case DIAG_WARN: return "Warning";
-    case DIAG_FAIL: return "Problem";
-    default:        return "?";
-    }
 }
 
 const char *diag_group_label(DiagGroup g) {
@@ -617,7 +602,6 @@ static void check_json_file(DiagReport *r, const char *id, const char *title,
  * spellings of the directory (`~/.terminfo/4C/` and `~/.terminfo/4c/`, which ncurses on macOS
  * writes). */
 
-
 /* =========================================================================
  * Entry points
  * ========================================================================= */
@@ -628,6 +612,7 @@ void diag_run(DiagReport *r, const char *notify_bin) {
     r->ran = true;
     {
         time_t now = time(NULL);
+
         struct tm tmv;
         localtime_r(&now, &tmv);
         strftime(r->ran_at, sizeof r->ran_at, "%H:%M:%S", &tmv);

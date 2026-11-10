@@ -28,9 +28,6 @@ void notify_server_stop(void);
  * No-op when the server isn't hosted by this process. */
 void notify_server_reload(void);
 
-/* True when this process is the one hosting the server. */
-bool notify_server_running(void);
-
 /* Publish whether this process is the frontmost app, so the server can drop
  * notifications whose target the user is already looking at. Called by the main
  * loop on every turn — sole writer; the serving thread only reads it. Also

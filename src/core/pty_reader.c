@@ -52,6 +52,7 @@ struct PtyReader {
     i32             spin_cap;
     u64             reply_wait_ns; /* PTY_REPLY_WAIT_NS, or what LIU_PTY_REPLY_WAIT_US says */
     bool            fast_reply;    /* LIU_PTY_FAST_REPLY (default on): answer a chunk of questions here */
+    u64             fg_stream_ns;  /* PTY_FG_STREAM_MS, or what LIU_PTY_FG_STREAM_MS says */
     /* What the main thread has parsed, and where a cursor report would put
      * the cursor after it (pty_reader_publish_reply): the consumer's `tail`
      * in the high half, then bit 31 "may be answered here", the row in bits
@@ -77,6 +78,7 @@ struct PtyReader {
     _Atomic i32     pw_mode;       /* last tcgetattr(): 0 never sampled, 1 echo off in line
                                     * mode (a password is being read), -1 anything else */
     _Atomic bool    fg_want;       /* a fresher sample was asked for */
+    _Atomic u32     fg_samples;    /* how many times it was sampled */
     _Atomic u32     fg_req;        /* fresh foreground probe generation */
     _Atomic u32     fg_ack;        /* ioctl begun after this generation */
     _Atomic u64     winsz;         /* (seq << 32) | rows << 16 | cols; seq 0 = never set */
@@ -94,7 +96,10 @@ struct PtyReader {
      * thread-local stack buffer and copy into the ring afterward so ring-page
      * faults occur outside the terminal lock. */
     usize           map_len;
-    bool            wired;
+    _Atomic bool    wired;
+    bool            wire_wanted;   /* it was wired at start: wired again when it wakes */
+    u64             rest_ns;       /* PTY_RING_REST_MS, or what LIU_PTY_RING_REST_MS says; 0 = never */
+    _Atomic u32     rests;         /* times the ring was rested (pty_reader_ring_rests) */
     _Atomic u32     bounced;       /* reads taken through the stack buffer */
     _Atomic u32     reply_waits;   /* quiet reads that asked the terminal something */
     _Atomic u32     reply_caught;  /* ... whose answer went out while the thread was still up */
@@ -131,6 +136,26 @@ static _Atomic(void (*)(void)) g_wake_now;
  * and the answer takes the pipe. At most this much of one core per question,
  * and only for questions. LIU_PTY_REPLY_WAIT_US sets it; 0 parks at once. */
 #define PTY_REPLY_WAIT_NS ((u64)250000)
+/* The foreground group and the tty's modes are sampled at a quiet moment:
+ * at once when the burst before it came after the pty had been empty for
+ * PTY_FG_QUIET_NS (a program's answer, a prompt — a password prompt among
+ * them), and inside a stream at most every PTY_FG_STREAM_MS. Inside a flood
+ * the queue empties tens of thousands of times a second and each sample takes
+ * the tty lock the writing program needs. A quiet that lasts is sampled when
+ * the bound runs out, so the answer is never older than it.
+ * LIU_PTY_FG_STREAM_MS sets the bound; 0 samples at every quiet moment. Only
+ * a wait for the pty counts as quiet: a wait for room in the ring is this
+ * thread's, and the program was writing all along. */
+#define PTY_FG_STREAM_MS 25
+#define PTY_FG_QUIET_NS ((u64)10000000)
+/* A pty quiet this long, with everything it gave already taken by the loop,
+ * RESTS its ring: unwired, and on macOS its pages handed back
+ * (MADV_FREE_REUSABLE: out of the footprint at once; MADV_DONTNEED on Linux).
+ * The next bytes wire it again BEFORE they are read, so a fault is still never
+ * taken under the tty lock. An idle pane — a shell at its prompt, an agent
+ * waiting for its user — keeps no 256 KiB wired for nothing.
+ * LIU_PTY_RING_REST_MS sets it; 0 never rests a ring. */
+#define PTY_RING_REST_MS 30000
 static _Atomic(void (*)(isize)) g_memory_adjust;
 
 static _Atomic bool g_backlog;
@@ -181,10 +206,17 @@ static void wake_loop_now(void) {
     if (w) w();
 }
 
+/* Only ever differences of a few milliseconds. On macOS CLOCK_MONOTONIC goes
+ * through the boot time (gettimeofday) on every call — ~1 % of a flooding
+ * reader — while CLOCK_UPTIME_RAW is the commpage's counter. */
 static u64 reader_clock_ns(void) {
+#if defined(__APPLE__)
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
+#endif
 }
 
 static void barrier_notify(PtyReader *r) {
@@ -270,9 +302,69 @@ static u8 *ring_map(u32 cap, usize *map_len, bool *wired) {
 
 static void ring_unmap(PtyReader *r) {
     if (!r->buf) return;
-    if (r->wired) atomic_fetch_sub_explicit(&g_wired_bytes, r->map_len, memory_order_acq_rel);
+    if (atomic_load_explicit(&r->wired, memory_order_acquire))
+        atomic_fetch_sub_explicit(&g_wired_bytes, r->map_len, memory_order_acq_rel);
     munmap(r->buf, r->map_len);        /* unwires what it covers */
     r->buf = NULL;
+}
+
+static u64 ring_rest_ns(void) {
+    static i64 v = -1;
+    if (v < 0) {
+        const char *e = getenv("LIU_PTY_RING_REST_MS");
+        long ms = e ? atol(e) : -1;
+        v = (ms >= 0 && ms <= 3600000) ? (i64)ms : PTY_RING_REST_MS;
+    }
+    return (u64)v * 1000000u;
+}
+
+/* Reader thread: nothing in the ring is unread (the caller checked), so its
+ * pages hold nothing anyone will read again. */
+static void ring_rest(PtyReader *r) {
+    if (atomic_load_explicit(&r->wired, memory_order_relaxed)) {
+        (void)munlock(r->buf, r->map_len);
+        atomic_store_explicit(&r->wired, false, memory_order_release);
+        atomic_fetch_sub_explicit(&g_wired_bytes, r->map_len, memory_order_acq_rel);
+    }
+#if defined(__APPLE__)
+    (void)madvise(r->buf, r->map_len, MADV_FREE_REUSABLE);
+#elif defined(MADV_DONTNEED)
+    (void)madvise(r->buf, r->map_len, MADV_DONTNEED);
+#endif
+    atomic_fetch_add_explicit(&r->rests, 1, memory_order_relaxed);
+}
+
+/* Reader thread, at a rest: an output queue with nothing in it is freed (a
+ * paste grows it to PTY_OUT_CAP and it stayed that size); the next write
+ * makes it again. The lock is the writer's; nothing waits on a system call
+ * under it. */
+static void out_rest(PtyReader *r) {
+    isize freed = 0;
+    pthread_mutex_lock(&r->omu);
+    if (r->olen == 0 && r->obuf) {
+        free(r->obuf);
+        freed = (isize)r->ocap;
+        r->obuf = NULL;
+        r->ocap = r->ooff = 0;
+    }
+    pthread_mutex_unlock(&r->omu);
+    if (freed) reader_account(-freed);
+}
+
+/* Reader thread, BEFORE the first read after a rest: the pages taken back and
+ * wired again, so the read lands in wired memory as before. A wire the budget
+ * or the system refuses leaves the bounce buffer standing in. */
+static void ring_wake(PtyReader *r) {
+#if defined(__APPLE__)
+    (void)madvise(r->buf, r->map_len, MADV_FREE_REUSE);
+#endif
+    if (!r->wire_wanted) return;
+    usize budget = ring_wire_budget();
+    if (budget && atomic_load_explicit(&g_wired_bytes, memory_order_acquire) + r->map_len <= budget &&
+        mlock(r->buf, r->map_len) == 0) {
+        atomic_fetch_add_explicit(&g_wired_bytes, r->map_len, memory_order_acq_rel);
+        atomic_store_explicit(&r->wired, true, memory_order_release);
+    }
 }
 
 static i32 spin_max(void) {
@@ -283,6 +375,15 @@ static i32 spin_max(void) {
         v = (n >= 0 && n <= 4096) ? n : 16;
     }
     return v;
+}
+static u64 fg_stream_ns(void) {
+    static i64 v = -1;
+    if (v < 0) {
+        const char *e = getenv("LIU_PTY_FG_STREAM_MS");
+        long ms = e ? atol(e) : -1;
+        v = (ms >= 0 && ms <= 10000) ? (i64)ms : PTY_FG_STREAM_MS;
+    }
+    return (u64)v * 1000000u;
 }
 /* LIU_PTY_FAST_REPLY=0 sends every question to the parser again. */
 static bool fast_reply_enabled(void) {
@@ -352,7 +453,13 @@ i32 pty_reader_pending(const PtyReader *r) {
 }
 
 u32 pty_reader_ring_bytes(const PtyReader *r) { return r ? r->cap : 0u; }
-bool pty_reader_ring_wired(const PtyReader *r) { return r && r->wired; }
+bool pty_reader_ring_wired(const PtyReader *r) {
+    return r && atomic_load_explicit(&r->wired, memory_order_acquire);
+}
+
+u32 pty_reader_ring_rests(const PtyReader *r) {
+    return r ? atomic_load_explicit(&r->rests, memory_order_relaxed) : 0;
+}
 u32 pty_reader_bounced_reads(const PtyReader *r) {
     return r ? atomic_load_explicit(&((PtyReader *)r)->bounced, memory_order_relaxed) : 0u;
 }
@@ -586,6 +693,7 @@ static void reader_sample_fg(PtyReader *r) {
     /* Snapshot BEFORE taking the tty lock. A request posted while this ioctl
      * is blocked must wait for the next sample, not accept this older one. */
     u32 requested = atomic_load_explicit(&r->fg_req, memory_order_acquire);
+    atomic_fetch_add_explicit(&r->fg_samples, 1, memory_order_relaxed);
     pid_t pg = tcgetpgrp(r->fd);
     i32 v = pg > 0 ? (i32)pg : -1;
     i32 prev = atomic_exchange_explicit(&r->fg_pgid, v, memory_order_acq_rel);
@@ -750,6 +858,12 @@ static void *reader_main(void *p) {
     const u64 reply_wait_ns = r->reply_wait_ns;   /* resolved on the main thread */
 
     reader_sample_fg(r);                /* an answer exists before anyone asks */
+    u64  fg_sampled_ns = reader_clock_ns(); /* the last sample (PTY_FG_STREAM_MS) */
+    bool fg_owed = false;               /* a quiet moment went unsampled */
+    bool burst_after_quiet = false;     /* this burst began after a quiet spell */
+    u64  parked_ns = 0;                 /* since when the pty has been empty (0 = it is not) */
+    bool data_since_sample = false;     /* bytes arrived after the last sample */
+    bool resting = false;               /* the ring is rested (ring_rest) */
 
     for (;;) {
         if (atomic_load_explicit(&r->quit, memory_order_acquire)) break;
@@ -757,8 +871,12 @@ static void *reader_main(void *p) {
          * (that output may be exactly what the key is meant to stop). */
         (void)atomic_exchange_explicit(&r->attn, false, memory_order_seq_cst);
         reader_apply_winsize(r);
-        if (atomic_exchange_explicit(&r->fg_want, false, memory_order_acq_rel))
+        if (atomic_exchange_explicit(&r->fg_want, false, memory_order_acq_rel)) {
             reader_sample_fg(r);
+            fg_sampled_ns = reader_clock_ns();
+            fg_owed = false;
+            data_since_sample = false;
+        }
         /* Tried on EVERY turn while bytes are queued, not only after POLLOUT:
          * under a flood the read below never comes back empty, so this thread
          * never reaches poll() — and a ^C typed at `yes` must still go out. */
@@ -791,12 +909,16 @@ static void *reader_main(void *p) {
          * bytes land on this thread's stack and the copy — which is where a
          * cold ring page faults — happens after the kernel has let go. */
         ssize_t n;
-        if (r->wired) {
+        bool wired = atomic_load_explicit(&r->wired, memory_order_relaxed);
+        if (wired) {
             n = read(r->fd, r->buf + off, span);
         } else {
             u32 want = span < PTY_READ_BOUNCE ? span : PTY_READ_BOUNCE;
             n = read(r->fd, bounce, want);
             if (n > 0) {
+                /* The first bytes after a rest: the pages back and wired
+                 * before anything is written into them. */
+                if (resting) { ring_wake(r); resting = false; }
                 memcpy(r->buf + off, bounce, (usize)n);
                 span = want;            /* "came back full" is about what was asked for */
                 atomic_fetch_add_explicit(&r->bounced, 1, memory_order_relaxed);
@@ -821,9 +943,12 @@ static void *reader_main(void *p) {
             u64 now = reader_clock_ns();
             bool after_quiet = last_data_ns == 0 || now - last_data_ns >= PTY_WAKE_QUIET_NS;
             last_data_ns = now;
+            data_since_sample = true;
+            if (parked_ns && now - parked_ns >= PTY_FG_QUIET_NS) burst_after_quiet = true;
+            parked_ns = 0;
             if (after_quiet) {
                 wake_loop_now();
-                if (reply_wait_ns && pty_bytes_ask_reply(r->wired ? r->buf + off : bounce, (usize)n)) {
+                if (reply_wait_ns && pty_bytes_ask_reply(wired ? r->buf + off : bounce, (usize)n)) {
                     reply_wait_until = now + reply_wait_ns;
                     atomic_fetch_add_explicit(&r->reply_waits, 1, memory_order_relaxed);
                 }
@@ -851,16 +976,63 @@ static void *reader_main(void *p) {
         if (saturated && spins < spin_cap) { spins++; continue; }
         spins = 0; saturated = false;
         /* The queue is empty: whatever the program was doing, it has done it.
-         * One ioctl per quiet moment keeps the foreground answer current
-         * without the main thread ever making the call. */
-        reader_sample_fg(r);
+         * A sample at the quiet moment keeps the foreground answer current
+         * without the main thread ever making the call — at once after a
+         * burst that followed quiet, and inside a stream once per
+         * PTY_FG_STREAM_MS (the poll below wakes for it if the quiet lasts). */
+        i32 fg_wait_ms = -1;
+        {
+            u64 qnow = reader_clock_ns();
+            bool every = r->fg_stream_ns == 0;
+            if (!data_since_sample && !every) {
+                /* nothing came since the last sample: it still stands */
+            } else if (burst_after_quiet || every || qnow - fg_sampled_ns >= r->fg_stream_ns) {
+                reader_sample_fg(r);
+                fg_sampled_ns = qnow;
+                fg_owed = false;
+                data_since_sample = false;
+            } else {
+                fg_owed = true;
+                u64 left = r->fg_stream_ns - (qnow - fg_sampled_ns);
+                fg_wait_ms = (i32)((left + 999999u) / 1000000u);
+            }
+            burst_after_quiet = false;
+            if (!parked_ns) parked_ns = qnow;
+        }
         bool out_wait = atomic_load_explicit(&r->out_pending, memory_order_acquire) != 0;
         bool ask_out  = out_wait && out_stuck < 4;
         pf[0].events = (short)(POLLIN | (ask_out ? POLLOUT : 0));
         pf[0].revents = pf[1].revents = 0;
-        int pr = poll(pf, 2, out_wait && !ask_out ? 20 : -1);
+        i32 wait_ms = out_wait && !ask_out ? 20 : -1;
+        if (fg_wait_ms >= 0 && (wait_ms < 0 || fg_wait_ms < wait_ms)) wait_ms = fg_wait_ms;
+        /* A quiet that lasts rests the ring — only with nothing in it unread
+         * (the loop has taken all of it: its `tail` is where we wrote to).
+         * Bytes still unread are looked at again a rest later: the loop takes
+         * them without telling this thread. */
+        bool rest_armed = !resting && r->rest_ns && parked_ns;
+        if (rest_armed) {
+            u64 qnow = reader_clock_ns(), due = parked_ns + r->rest_ns;
+            if (atomic_load_explicit(&r->tail, memory_order_acquire) != head) due = qnow + r->rest_ns;
+            i32 rest_ms = due > qnow ? (i32)((due - qnow + 999999u) / 1000000u) : 0;
+            if (wait_ms < 0 || rest_ms < wait_ms) wait_ms = rest_ms;
+        }
+        int pr = poll(pf, 2, wait_ms);
         if (pr < 0) { if (errno == EINTR) continue; break; }
-        if (pr == 0) continue;                       /* the 20 ms look-again */
+        if (pr == 0) {                               /* the 20 ms look-again, a sample owed, a rest due */
+            if (fg_owed) {
+                reader_sample_fg(r);
+                fg_sampled_ns = reader_clock_ns();
+                fg_owed = false;
+                data_since_sample = false;
+            }
+            if (rest_armed && reader_clock_ns() - parked_ns >= r->rest_ns &&
+                atomic_load_explicit(&r->tail, memory_order_acquire) == head) {
+                ring_rest(r);
+                out_rest(r);
+                resting = true;
+            }
+            continue;
+        }
         if (pf[0].revents & POLLOUT) said_writable = true;
         if (pf[1].revents) {
             /* The pipe carries two messages, so this is not an unconditional
@@ -939,7 +1111,12 @@ PtyReader *pty_reader_start(int fd, u32 ring_bytes) {
     r->spin_cap = spin_max();          /* main thread; never touched again */
     r->reply_wait_ns = reply_wait_max();
     r->fast_reply = fast_reply_enabled();
-    r->buf = ring_map(r->cap, &r->map_len, &r->wired);
+    r->fg_stream_ns = fg_stream_ns();
+    bool wired = false;
+    r->buf = ring_map(r->cap, &r->map_len, &wired);
+    atomic_store_explicit(&r->wired, wired, memory_order_relaxed);
+    r->wire_wanted = wired;
+    r->rest_ns = ring_rest_ns();
     r->ctl[0] = r->ctl[1] = -1;
     if (!r->buf) { free(r); return NULL; }
 
@@ -1088,6 +1265,10 @@ void pty_reader_fg_refresh(PtyReader *r) {
     if (!r) return;
     atomic_store_explicit(&r->fg_want, true, memory_order_release);
     reader_poke(r);
+}
+
+u32 pty_reader_fg_samples(const PtyReader *r) {
+    return r ? atomic_load_explicit(&r->fg_samples, memory_order_relaxed) : 0;
 }
 
 u32 pty_reader_fg_request(PtyReader *r) {

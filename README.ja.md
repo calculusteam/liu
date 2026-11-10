@@ -7,7 +7,7 @@
 <p align="center">
   <strong>すべての AI エージェントのための一つのターミナル。</strong><br>
   Liu はあなたとさまざまなコーディングエージェントのあいだに立ち、10 本の並列スレッドを一つの場所のように感じさせます。<br>
-  <strong>C</strong> で記述、macOS ネイティブ、GPU アクセラレーション。
+  <strong>C</strong> で記述、macOS / Linux ネイティブ、GPU アクセラレーション。
 </p>
 
 <p align="center">
@@ -143,12 +143,15 @@ Liu の内蔵ブラウザで要素ピッカーをオンにし、ライブペー�
 | :--- | :--- | :--- |
 | **macOS** | Apple Silicon (arm64) | `.dmg` |
 | **macOS** | Intel (x86_64) | `.dmg` |
+| **Linux** | x86_64 | `.deb` · `.rpm` · `.AppImage` · `.tar.gz` |
+| **Linux** | ARM64 (aarch64) | `.deb` · `.rpm` · `.AppImage` · `.tar.gz` |
 
-macOS が主要かつ現在唯一のサポート対象です。
+Linux では glibc 2.35 以降（Ubuntu 22.04、Debian 12、Fedora 36 以降）と X11 セッションが必要です。Wayland デスクトップでは XWayland 経由で動作します。ブラウザペインは WebKitGTK 4.1 がインストールされていればそれを使います。Linux のショートカットは macOS と同じで、⌘ を Ctrl+Shift、⌘⇧ を Ctrl+Alt+Shift に読み替えます（⌘K は Ctrl+Shift+K）。同じキーを Super と組み合わせても動作します。[Releases](https://github.com/calculusteam/liu/releases) ページから、または `curl -fsSL https://raw.githubusercontent.com/calculusteam/liu/main/scripts/install.sh | bash` でインストールできます。
 
 ## 目標
 
-- [ ] **Linux サポート**、ARM64 / x86_64 ビルド（`.tar.gz`）、apt (PPA)、dnf (COPR)、AUR。Linux は予定中で現在は未サポート。
+- [x] **Linux サポート**、ARM64 / x86_64 ビルド（`.deb`、`.rpm`、`.AppImage`、`.tar.gz`）。
+- [ ] **Linux パッケージリポジトリ**、apt (PPA)、dnf (COPR)、AUR。
 
 ---
 
@@ -157,6 +160,7 @@ macOS が主要かつ現在唯一のサポート対象です。
 **依存関係**
 
 - macOS、`brew install libssh2`
+- Linux (Debian, Ubuntu)、`sudo apt install build-essential cmake ninja-build pkg-config libx11-dev libxcursor-dev libxi-dev libxrandr-dev libfontconfig1-dev libfreetype-dev libharfbuzz-dev libdbus-1-dev libgl1-mesa-dev libssh2-1-dev libssl-dev`
 - SQLite3、stb_truetype、stb_image、cJSON は `third_party/` に同梱
 
 ```bash
@@ -169,6 +173,7 @@ git clone https://github.com/calculusteam/liu.git && cd liu
 # または CMake を直接:
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(sysctl -n hw.ncpu)
+# Linux: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DUSE_METAL=OFF && cmake --build build -j$(nproc)
 ./build/Liu
 ```
 

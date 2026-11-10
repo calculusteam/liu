@@ -64,14 +64,8 @@ void palette_close(void);
 void palette_set_scope(const void *owner);
 bool palette_is_open(void);
 void palette_set_query(const char *query);
-void palette_input_char(u32 codepoint);
-void palette_backspace(void);
-void palette_move_up(void);
-void palette_move_down(void);
-PaletteItem *palette_get_selected(void);
 PaletteItem *palette_get_item(i32 index);
 i32 palette_filtered_count(void);
-i32 palette_selected_index(void);
 const char *palette_query(void);
 
 /* With a `NULL` or empty `cwd_filter`, list all discovered sessions; otherwise

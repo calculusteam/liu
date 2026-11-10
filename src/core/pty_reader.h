@@ -57,6 +57,10 @@ u32 pty_reader_ring_bytes(const PtyReader *r);
  * taken under that lock. The second call is the total wired on behalf of all
  * live readers. */
 bool  pty_reader_ring_wired(const PtyReader *r);
+/* How many times this reader's ring has rested: unwired and its pages handed
+ * back after a quiet spell with nothing unread (LIU_PTY_RING_REST_MS, 30 s).
+ * The next bytes take it back, wired again before they are read. */
+u32   pty_reader_ring_rests(const PtyReader *r);
 /* The VM tag the rings are mapped under on macOS (an application-specific one:
  * VM_MEMORY_APPLICATION_SPECIFIC_1). core/vm_regions.c counts it as heap. */
 #define PTY_READER_VM_TAG 240
@@ -174,8 +178,11 @@ bool pty_reader_drain_barrier(PtyReader *r, PtyReaderConsumeFn consume,
  *                         there is room), or -1 once the other side is gone.
  * pty_reader_write_pending bytes taken and not yet written to the pty.
  * pty_reader_fg_pgid      the foreground process group as last sampled: > 0 a
- *                         group, -1 none, 0 not sampled yet. Sampled whenever
- *                         the pty goes quiet and on request; the loop is woken
+ *                         group, -1 none, 0 not sampled yet. Sampled when the
+ *                         pty goes quiet after output — at once after a burst
+ *                         that followed a quiet spell, inside a stream at most
+ *                         every 25 ms (LIU_PTY_FG_STREAM_MS) and once more when
+ *                         the stream stops — and on request; the loop is woken
  *                         when the answer changes.
  * pty_reader_fg_refresh   ask for a fresh sample (the answer arrives later).
  * pty_reader_set_winsize  the size the pty should have; the last call wins. */
@@ -192,6 +199,8 @@ bool  pty_reader_password_mode(const PtyReader *r);
  * poll result on subsequent turns, continuing to drain output. */
 u32   pty_reader_fg_request(PtyReader *r);
 bool  pty_reader_fg_result(const PtyReader *r, u32 token, i32 *pgid);
+/* How many times the foreground group has been sampled. */
+u32   pty_reader_fg_samples(const PtyReader *r);
 void  pty_reader_set_winsize(PtyReader *r, u16 cols, u16 rows);
 /* The cell in pixels, reported with the NEXT window size (ws_xpixel / ws_ypixel). */
 void  pty_reader_set_cell_pixels(PtyReader *r, u16 w, u16 h);

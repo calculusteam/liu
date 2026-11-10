@@ -252,10 +252,9 @@ static void tab_popup_hover_ex(AppState *app, i32 tab_index, f32 pill_x, f32 pil
          * user asking a question, and the preview answers it. */
         popup_open(app, POPUP_PREVIEW, tab_index);
     } else {
-        /* Keep the loop ticking so the dwell can elapse with the pointer at
-         * rest. Soft rate: nothing is animating yet, the loop only needs to
-         * wake once the timer is up. */
-        anim_register_soft_until(g->dwell_since + POPUP_DWELL_S + 0.05);
+        /* The dwell elapses with the pointer at rest and nothing moving:
+         * one wake when it is up, no frames before. */
+        anim_wake_at(g->dwell_since + POPUP_DWELL_S);
     }
 }
 

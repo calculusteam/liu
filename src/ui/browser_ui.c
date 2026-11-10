@@ -52,6 +52,8 @@ bool browser_any_metal_overlay(const AppState *app) {
      * under a full-tab page, and its typing went into the address bar), and
      * the sidebar's Customize popover (it opens over the content area). */
     if (app->lightbox.open || app->fb_prompt_active || app->sbc_open) return true;
+    /* The diagram viewer is modal over its window as the lightbox is. */
+    if (app->dgv.open || diagram_viewer_animating(&app->dgv)) return true;
     /* Pane layout drag: the drop-zone highlight and the ghost of the dragged
      * pane are Metal chrome drawn into the pane area. With the web view on
      * screen the browser pane is the one place that feedback would vanish —
@@ -1186,6 +1188,27 @@ void browser_apply_visibility_and_frame(AppState *app, PlatformWindow *window) {
         }
     }
     (void)window;
+}
+
+void app_browser_notice_holes(AppState *app) {
+    if (!app) return;
+    Tab *t = app_active_tab(app);
+    if (!t || !t->browser || !t->browser->native) return;
+    BrowserHole holes[BROWSER_HOLES_MAX];
+    i32 n = 0;
+    if (browser_should_show(app)) {
+        f32 dpi = app->dpi_scale > 0.0f ? app->dpi_scale : 1.0f;
+        f64 now = platform_time_sec();
+        const ToastStack *ts = &app->toasts;
+        /* A notice still faint (coming or going) leaves the page whole. */
+        for (i32 i = 0; i < ts->n && n < BROWSER_HOLES_MAX; i++) {
+            const ToastEntry *e = &ts->e[i];
+            if (!(e->hw > 0.0f) || !(e->hh > 0.0f) || toast_entry_alpha(e, now) < 0.5f) continue;
+            holes[n++] = (BrowserHole){ e->hx / dpi, ((f32)app->fb_height - e->hy - e->hh) / dpi,
+                                        e->hw / dpi, e->hh / dpi, NOTIFICATION_RADIUS_PT };
+        }
+    }
+    browser_native_set_holes(t->browser->native, holes, n);
 }
 
 void app_browser_pick_arrived(AppState *app, BrowserTab *browser,

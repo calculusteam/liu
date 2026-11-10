@@ -87,6 +87,17 @@ typedef struct {
 } BrowserScreenShape;
 void browser_native_set_screen_shape(BrowserNative *n, const BrowserScreenShape *shape);
 
+/* Liu's own drawing that stands over the page and is seen through it (the
+ * floating notices): rects in points like the frame, each with its corner
+ * radius. Where the page is a window above Liu's drawing and no native copy
+ * of a notice is made (X11), the page is cut away there; macOS draws its
+ * notices natively and ignores it. At most BROWSER_HOLES_MAX; 0 clears. */
+#define BROWSER_HOLES_MAX 4
+typedef struct {
+    f32 x, y, w, h, r;
+} BrowserHole;
+void browser_native_set_holes(BrowserNative *n, const BrowserHole *holes, i32 count);
+
 /* A device's status bar marks drawn the way its system draws them: rasterised
  * by the platform as a white premultiplied coverage mask, tinted at draw time.
  *   TEXT    `text` in the system UI font at `size_px`, `weight` (-1..1, the
@@ -147,12 +158,13 @@ bool browser_native_device_art(const BrowserDeviceLayout *d, f32 dpi, BrowserDev
 
 /* What the native view holds now, read back for the driver: the corner radius
  * the page is masked with and which corners carry it (bit 0 top-left, 1
- * top-right, 2 bottom-right, 3 bottom-left), and the page's rect in the window
- * (points, AppKit's bottom-left origin; `have_page` false before the first
- * placement). */
+ * top-right, 2 bottom-right, 3 bottom-left), how many holes are cut in it
+ * (browser_native_set_holes), and the page's rect in the window (points,
+ * AppKit's bottom-left origin; `have_page` false before the first placement). */
 typedef struct {
     f32  radius;
     u32  corners;
+    i32  holes;
     bool have_page;
     f32  page_x, page_y, page_w, page_h;
 } BrowserScreenProbe;

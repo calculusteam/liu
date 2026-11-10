@@ -72,6 +72,7 @@ static const IconRule ICON_EXACT[] = {
     { "Next Pane",              ICON_CHEVRON_RIGHT },
     { "Previous Pane",          ICON_CHEVRON_LEFT },
     { "Toggle Pane Zoom",       ICON_MAXIMIZE },
+    { "Restart Shell",          ICON_REFRESH },
     /* The sidebar, the explorer and what opens beside a terminal */
     { "Toggle Sidebar",         ICON_SIDEBAR },
     { "Customize Sidebar",      ICON_SLIDERS },

@@ -51,86 +51,6 @@ static bool fileops_grow(void **base, i32 count, i32 *cap, usize elem_size) {
     return true;
 }
 
-/* SFTP download: remote_path → local_dir/filename */
-bool fb_download_file(FileBrowser *fb, i32 index, const char *local_dir) {
-    if (!fb || !local_dir || index < 0 || index >= fb->entry_count) return false;
-    if (fb->source != FB_SOURCE_SFTP || !fb->sftp_handle) return false;
-    FileEntry *e = &fb->entries[index];
-    if (e->is_dir || !sftp_name_is_safe_component(e->name)) return false;
-    int parent = local_destination_dir(local_dir, false);
-    if (parent < 0) return false;
-    char remote_path[FB_MAX_PATH * 2];
-    fb_entry_path(fb, e, remote_path, sizeof remote_path);
-    Session *owner = (Session *)fb->session;
-    session_sftp_scope_begin(owner);
-    bool ok = sftp_download_at(fb->sftp_handle, remote_path, parent, e->name, true) == 0;
-    session_sftp_scope_end(owner);
-    close(parent);
-    return ok;
-}
-
-/* SFTP upload: local_path → remote cwd */
-bool fb_upload_file(FileBrowser *fb, const char *local_path) {
-    if (!fb || !local_path || fb->source != FB_SOURCE_SFTP || !fb->sftp_handle) return false;
-
-    const char *fname = strrchr(local_path, '/');
-    fname = fname ? fname + 1 : local_path;
-
-    char directory[FB_MAX_PATH];
-    fb_operation_dir(fb, directory, sizeof directory);
-    if (!directory[0]) return false;
-    char remote_path[2048];
-    if (!fileops_join(remote_path, sizeof(remote_path), directory, fname)) return false;
-
-    FILE *f = fopen(local_path, "rb");
-    if (!f) return false;
-    struct stat local_st;
-    bool local_known = fstat(fileno(f), &local_st) == 0;
-
-    Session *owner = (Session *)fb->session;
-    session_sftp_scope_begin(owner);
-    LIBSSH2_SFTP *sftp = (LIBSSH2_SFTP *)fb->sftp_handle;
-    LIBSSH2_SFTP_HANDLE *handle;
-    /* The local file's bits, as sftp_upload creates a file (ssh/transfer_mode.h). */
-    SFTP_CALL_PTR(handle, libssh2_sftp_open(sftp, remote_path,
-        LIBSSH2_FXF_WRITE | LIBSSH2_FXF_CREAT | LIBSSH2_FXF_TRUNC,
-        (long)transfer_create_mode(local_known, (u32)local_st.st_mode,
-                                   LIBSSH2_SFTP_S_IRUSR | LIBSSH2_SFTP_S_IWUSR |
-                                   LIBSSH2_SFTP_S_IRGRP | LIBSSH2_SFTP_S_IROTH)));
-    if (!handle) {
-        fclose(f);
-        session_sftp_scope_end(owner);
-        return false;
-    }
-
-    char buf[32768];
-    bool ok = true;
-    for (;;) {
-        size_t nread = fread(buf, 1, sizeof(buf), f);
-        bool read_error = ferror(f) != 0;
-        ssize_t total = 0;
-        while ((size_t)total < nread) {
-            ssize_t n;
-            SFTP_CALL(n, libssh2_sftp_write(handle, buf + total, nread - (size_t)total));
-            if (n <= 0) {
-                ok = false;
-                break;
-            }
-            total += n;
-        }
-        if (!ok) break;
-        if (read_error) { ok = false; break; }
-        if (nread < sizeof(buf)) break;
-    }
-    if (fclose(f) != 0) ok = false;
-    int crc;
-    SFTP_CALL(crc, libssh2_sftp_close(handle));
-    if (crc != 0) ok = false;
-    if (!ok) { int urc; SFTP_CALL(urc, libssh2_sftp_unlink(sftp, remote_path)); (void)urc; }
-    session_sftp_scope_end(owner);
-    return ok;
-}
-
 /* Delete file (local or SFTP) */
 bool fb_delete_file(FileBrowser *fb, i32 index) {
     if (index < 0 || index >= fb->entry_count) return false;
@@ -1318,17 +1238,3 @@ FbPasteOutcome fb_paste_item_report(FileBrowser *dst_fb, const FileClipboardItem
     return report->outcome;
 }
 
-bool fb_paste(FileBrowser *dst_fb, const FileClipboard *clip) {
-    if (!dst_fb || !clip || !clip->has || clip->count <= 0) return false;
-
-    bool all_ok = true;
-    for (i32 i = 0; i < clip->count; i++) {
-        if (!fb_paste_item(dst_fb, &clip->items[i], clip->is_cut)) {
-            all_ok = false;
-            /* Continue — partial success is the UX users expect with
-             * multi-select (skip conflict, copy the rest). */
-        }
-    }
-    fb_refresh(dst_fb);
-    return all_ok;
-}

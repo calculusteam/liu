@@ -13,71 +13,6 @@ Str str_from_cstr(const char *s) {
     return (Str){ .data = s, .len = strlen(s) };
 }
 
-char *str_to_cstr(Str s, Arena *a) {
-    if (!a || (s.len > 0 && !s.data)) return NULL;
-    usize allocation_size;
-    if (!checked_add_usize(s.len, 1u, &allocation_size)) return NULL;
-    char *buf = (char *)arena_alloc(a, allocation_size);
-    if (!buf) return NULL;
-    if (s.len) memcpy(buf, s.data, s.len);
-    buf[s.len] = '\0';
-    return buf;
-}
-
-bool str_eq(Str a, Str b) {
-    if (a.len != b.len) return false;
-    if (a.len == 0) return true;
-    if (!a.data || !b.data) return false;
-    return memcmp(a.data, b.data, a.len) == 0;
-}
-
-bool str_eq_nocase(Str a, Str b) {
-    if (a.len != b.len) return false;
-    if (a.len > 0 && (!a.data || !b.data)) return false;
-    for (usize i = 0; i < a.len; i++) {
-        if (tolower((unsigned char)a.data[i]) != tolower((unsigned char)b.data[i])) {
-            return false;
-        }
-    }
-    return true;
-}
-
-bool str_starts_with(Str s, Str prefix) {
-    if (prefix.len > s.len) return false;
-    if (prefix.len == 0) return true;
-    if (!s.data || !prefix.data) return false;
-    return memcmp(s.data, prefix.data, prefix.len) == 0;
-}
-
-bool str_ends_with(Str s, Str suffix) {
-    if (suffix.len > s.len) return false;
-    if (suffix.len == 0) return true;
-    if (!s.data || !suffix.data) return false;
-    return memcmp(s.data + s.len - suffix.len, suffix.data, suffix.len) == 0;
-}
-
-bool str_contains(Str haystack, Str needle) {
-    return str_find(haystack, needle) >= 0;
-}
-
-Str str_trim(Str s) {
-    if (!s.data) return STR_NULL;
-    while (s.len > 0 && isspace((unsigned char)s.data[0])) {
-        s.data++;
-        s.len--;
-    }
-    while (s.len > 0 && isspace((unsigned char)s.data[s.len - 1])) {
-        s.len--;
-    }
-    return s;
-}
-
-Str str_substr(Str s, usize start, usize len) {
-    if (!s.data || start > s.len) return STR_NULL;
-    if (len > s.len - start) len = s.len - start;
-    return (Str){ .data = s.data + start, .len = len };
-}
-
 i64 str_find(Str haystack, Str needle) {
     if (needle.len == 0) return 0;
     if (needle.len > haystack.len) return -1;
@@ -94,16 +29,6 @@ i64 str_find(Str haystack, Str needle) {
 /* =========================================================================
  * String builder
  * ========================================================================= */
-
-StringBuilder sb_create(Arena *a, usize initial_cap) {
-    StringBuilder sb = {0};
-    sb.arena = a;
-    sb.cap   = a ? initial_cap : 0;
-    sb.data  = a && initial_cap > 0 ? (char *)arena_alloc(a, initial_cap) : NULL;
-    if (initial_cap > 0 && !sb.data) sb.cap = 0;
-    sb.len   = 0;
-    return sb;
-}
 
 void sb_append(StringBuilder *sb, Str s) {
     if (!sb || !sb->arena || (s.len > 0 && !s.data) || sb->len > sb->cap) return;
@@ -122,27 +47,6 @@ void sb_append(StringBuilder *sb, Str s) {
     }
     if (s.len) memcpy(sb->data + sb->len, s.data, s.len);
     sb->len = required;
-}
-
-void sb_append_cstr(StringBuilder *sb, const char *s) {
-    if (!s) return;
-    sb_append(sb, str_from_cstr(s));
-}
-
-void sb_append_char(StringBuilder *sb, char c) {
-    sb_append(sb, (Str){ .data = &c, .len = 1 });
-}
-
-void sb_append_u32(StringBuilder *sb, u32 val) {
-    char buf[16];
-    int len = snprintf(buf, sizeof(buf), "%u", val);
-    if (len > 0 && (usize)len < sizeof buf)
-        sb_append(sb, (Str){ .data = buf, .len = (usize)len });
-}
-
-Str sb_to_str(const StringBuilder *sb) {
-    if (!sb) return STR_NULL;
-    return (Str){ .data = sb->data, .len = sb->len };
 }
 
 /* =========================================================================

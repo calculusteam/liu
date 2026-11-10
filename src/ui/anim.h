@@ -68,6 +68,22 @@ void anim_register_soft_until(f64 end_time);
 bool anim_active_for(const void *owner);
 bool anim_soft_active_for(const void *owner);
 
+/* A STILL picture that changes by itself at `t` (a hold running out, a dwell
+ * elapsing): nothing moves until then, so it asks for no frames — only for a
+ * wake at `t` and one paint of its window. Attributed like the deadlines
+ * above. anim_wake_in is the loop's: seconds to the earliest moment pending
+ * (-1: none). anim_wake_due_for answers once per moment that has come for
+ * `owner`'s window; anim_wake_settle, after every window was asked, forgets
+ * an unattributed one. */
+void anim_wake_at(f64 t);
+f64  anim_wake_in(f64 now);
+bool anim_wake_due_for(const void *owner, f64 now);
+void anim_wake_settle(f64 now);
+/* `owner`'s window is going away: what it registered is forgotten, so no
+ * deadline or pending moment of a window nobody asks about any more keeps the
+ * loop awake, and its slot is free for another window. */
+void anim_forget_owner(const void *owner);
+
 /* -------------------------------------------------------------------------
  * Universal hover easing.
  *

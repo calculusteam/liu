@@ -2,6 +2,7 @@
  * Liu — Settings geometry. See settings_layout.h.
  */
 #include "ui/settings_layout.h"
+#include "ui/settings_space.h"
 #include "core/config.h"   /* TEXT_WEIGHT_MIN/MAX/STEP */
 #include "ui/layout.h"     /* CTX_MENU_*: the model menu is one of the app's menus */
 
@@ -231,7 +232,7 @@ SettingsWeightBlock settings_weight_block(f32 y, f32 item_h, f32 dpi) {
      * spacing Size and Line Height already have between their boxes. */
     b.term_y = y + item_h + 4.0f * dpi;
     b.ui_y   = b.term_y + item_h + 6.0f * dpi;
-    b.end    = b.ui_y + item_h + 8.0f;    /* same trailing gap Line Height had */
+    b.end    = b.ui_y + item_h + SETTINGS_WEIGHT_TAIL_PT * dpi;   /* the trailing gap Line Height has */
     return b;
 }
 

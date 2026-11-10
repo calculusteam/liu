@@ -234,10 +234,6 @@ u8 font_smoothing_level(FontSmoothing mode, f32 dpi_scale);
 /* Coverage gamma the glyph shader must apply, given the current raster options. */
 f32 font_text_gamma(void);
 
-/* Load additional fallback fonts (user-configured paths). Call after font_atlas_create.
- * Fonts are added to the end of the fallback chain. Duplicate paths are ignored. */
-void font_atlas_load_user_fallbacks(const char **paths, i32 count);
-
 /* Set user-configured fallback font paths. These are loaded automatically by
  * font_atlas_create() after the default system fallbacks. Call before the first
  * font_atlas_create(), or before re-creating the atlas on config changes. */
@@ -295,11 +291,11 @@ i32 font_check_ligature_run(FontAtlas *atlas, FontLigatureRun *run, i32 at, i32 
 /* Total ligature-shaping attempts since startup. */
 u64 font_ligature_shapings(void);
 
-
 /* Get a glyph's atlas rectangle (with on-demand rasterization for Unicode).
  * Returns false when the caller got the SPACE placeholder for a glyph that
  * cannot be produced (atlas exhausted, no face coverage); true otherwise —
  * including a placeholder for a glyph still being rasterised or still on its
+
  * way to the GPU, which font_placeholder_seen() reports. */
 /* `font_glyph_is_wide` below is the one predicate both the rasterizer and the
  * quad ask for how many cells a glyph's bitmap spans. There is deliberately no
@@ -405,8 +401,6 @@ bool font_raster_frame_owed(const FontAtlas *atlas);
  * Must be cheap and thread-safe (the app passes platform_wake_render_loop /
  * platform_wake_event_loop). NULL unregisters. Process-wide, like the face. */
 void font_set_raster_wake(void (*wake)(void));
-/* Version counter bumped whenever new glyphs land — row cache invalidation. */
-u32  font_raster_completion_version(const FontAtlas *atlas);
 /* =========================================================================
  * Atlas synchronisation contract — what changed, and what it invalidates
  * =========================================================================
@@ -437,7 +431,6 @@ u32  font_raster_completion_version(const FontAtlas *atlas);
  * uploads were prepared is served as the placeholder and repaired by the next
  * frame, exactly like a glyph the async worker has not finished. */
 u32  font_atlas_content_version(const FontAtlas *atlas);
-u32  font_atlas_extent_version(const FontAtlas *atlas);
 u32  font_atlas_placement_generation(const FontAtlas *atlas);
 /* Another name for the placement generation. It does not move on a grow. */
 u32  font_atlas_layout_version(const FontAtlas *atlas);
@@ -548,7 +541,6 @@ bool font_atlas_reclaim_pending(const FontAtlas *atlas);
 FontReclaimState font_atlas_service_reclaim(FontAtlas *atlas, f64 now);
 u32  font_atlas_reclaim_abandons(const FontAtlas *atlas);
 
-
 /* Synchronously rasterize every non-ASCII codepoint in `utf8_text` that
  * isn't already cached. Use this from UI text rendering paths (file
  * browser, palette, settings) where the normal async fallback returns a
@@ -556,6 +548,7 @@ u32  font_atlas_reclaim_abandons(const FontAtlas *atlas);
  * the next render can be arbitrarily far away and the placeholder stays
  * visible. Main thread only; ASCII codepoints are skipped (the warm-on-
  * boot path in font_atlas_create already filled them). Cheap if the text
+
  * is fully cached. */
 void font_warm_text_glyphs(FontAtlas *atlas, const char *utf8_text);
 /* Length-aware variant for non-NUL-terminated slices (e.g. one line of a
@@ -837,7 +830,9 @@ typedef struct {
      * Metal backend makes from its completion counters, which is where these two
      * are unused. */
     void *gl_sync;
-    u64   gl_frames_done;
+    u64   gl_frames_done;      /* frames whose draws have finished */
+    u64   gl_frames_fenced;    /* frames that ended with a fence */
+    u64   gl_sync_frame;       /* the frame gl_sync was placed after */
     i32 glyph_u_cell_size;
     i32 glyph_u_text_gamma;
     i32 glyph_u_min_contrast;
@@ -1015,6 +1010,11 @@ typedef struct {
      * the frames before a theme is applied. */
     Color text_surface;
     f32   text_surface_l;
+    /* The last UI-glyph colours and the background glyph_assumed_bg gave each:
+     * a label's glyphs share one colour, and its luminance is three powf a
+     * glyph. Emptied whenever the surface changes. */
+    struct { f32 r, g, b; Color bg; } chrome_bg_memo[4];
+    u32   chrome_bg_memo_n, chrome_bg_memo_next;
     /* The manual weight (AppConfig.text_weight_*, TEXT_WEIGHT_MIN..MAX; the
      * shader erodes / dilates the glyph mask by it),
      * mirrored here by app_apply_config. Two values because one flush draws
@@ -1037,16 +1037,26 @@ static inline f32 renderer_text_weight(const Renderer *r) {
 static inline void renderer_note_text_surface(Renderer *r, f32 red, f32 green, f32 blue) {
     r->text_surface = (Color){red, green, blue, 1.0f};
     r->text_surface_l = glyph_lin_lum(r->text_surface);
+    r->chrome_bg_memo_n = 0;
 }
 
 /* The background a UI-text glyph in `fg` is emitted with: the assumed surface
  * (see glyph_assumed_bg), or none when blend correction is off — the shader
  * then applies its gamma to the raw mask exactly as it always did. */
-static inline void glyph_set_chrome_bg(GlyphInstance *gi, const Renderer *r, Color fg) {
-    if (r->text_blend_correct > 0.5f)
-        glyph_set_bg(gi, glyph_assumed_bg(fg, r->text_surface, r->text_surface_l));
-    else
-        glyph_set_no_bg(gi);
+static inline void glyph_set_chrome_bg(GlyphInstance *gi, Renderer *r, Color fg) {
+    if (!(r->text_blend_correct > 0.5f)) { glyph_set_no_bg(gi); return; }
+    for (u32 i = 0; i < r->chrome_bg_memo_n; i++)
+        if (r->chrome_bg_memo[i].r == fg.r && r->chrome_bg_memo[i].g == fg.g && r->chrome_bg_memo[i].b == fg.b) {
+            glyph_set_bg(gi, r->chrome_bg_memo[i].bg);
+            return;
+        }
+    Color bg = glyph_assumed_bg(fg, r->text_surface, r->text_surface_l);
+    u32 slot = r->chrome_bg_memo_n < 4 ? r->chrome_bg_memo_n++ : (r->chrome_bg_memo_next++ & 3u);
+    r->chrome_bg_memo[slot].r = fg.r;
+    r->chrome_bg_memo[slot].g = fg.g;
+    r->chrome_bg_memo[slot].b = fg.b;
+    r->chrome_bg_memo[slot].bg = bg;
+    glyph_set_bg(gi, bg);
 }
 
 static inline usize renderer_batch_cpu_bytes(const Renderer *r) {
@@ -1068,12 +1078,12 @@ static inline usize renderer_batch_cpu_bytes(const Renderer *r) {
  * font mirrors, which have their own ledger classes). */
 usize renderer_cpu_bytes(const Renderer *r);
 
-
 /* UI layout reserves a nominal 1:2 text box and passes its top as the draw y.
  * The glyph quad uses the selected font's actual atlas aspect and can be
  * taller than that box. Top-aligning both therefore places text low inside
  * controls. This helper centers chrome glyphs within the allocated box. */
 static inline f32 renderer_ui_glyph_dy(const Renderer *r) {
+
     if (!r || r->ui_cell_w <= 0.0f || r->ui_cell_h <= 0.0f) return 0.0f;
     if (r->font.cell_width <= 0.0f || r->font.cell_height <= 0.0f) return 0.0f;
     /* Same rounding the draw path applies, or the centring offset would be
@@ -1127,6 +1137,33 @@ bool renderer_set_terminal_rects(Renderer *r, const RendererTerminalRect *rects,
 bool renderer_native_chrome_wanted(const char *env);
 /* Memory-pressure trim. Preserves shown, GPU-leased and compositor-used images. */
 usize renderer_reclaim_presenter(Renderer *r);
+
+/* A picture that changes on key frames and flows from one to the next (a
+ * working job tab's haze) can hand the flow to the compositor. The frame
+ * draws the NEXT key's picture in full, and says so with `until` > 0: the
+ * compositor then shows what the screen had in that rect over it, fading out
+ * until `until` (platform clock), a linear cross-fade made without another
+ * frame. A rect drawn as it should look at this instant says `until` 0.
+ *
+ * The renderer decides from the last PRESENTED frame: the same `owner` at the
+ * same rect with the same `picture` and a hand-off goes on fading; the same
+ * owner at the same rect with anything else starts a fade from that frame's
+ * pixels (copied on the GPU); an owner it did not see there gets no fade, and
+ * an owner left out ends its fade. Main thread, between begin and end frame;
+ * the IOSurface presenter only. */
+#define RENDERER_FADE_CAP 24
+typedef struct {
+    i32 x, y, w, h;      /* framebuffer pixels */
+    u64 owner, picture;
+    f64 until;           /* platform clock; 0 = drawn as it is now */
+} RendererFade;
+/* Whether this frame may hand anything off: an opaque window, the IOSurface
+ * presenter, no frame dump (a dump shows what the GPU drew), and not turned
+ * off with LIU_HANDOFF_FADE=0. */
+bool renderer_fade_available(Renderer *r);
+void renderer_fade_note(Renderer *r, f32 x, f32 y, f32 w, f32 h, u64 owner, u64 picture, f64 until);
+/* Fades the presenter has started and kept going, since the window opened. */
+void renderer_fade_counts(Renderer *r, u64 *started, u64 *kept);
 #endif
 /* Release renderer-owned idle caches whose rebuild cost is small compared to
  * their resident memory. Does not change visible output; call from the main

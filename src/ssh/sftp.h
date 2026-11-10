@@ -84,9 +84,6 @@ u64  sftp_io_last_status(void *sftp);     /* this thread's completed operation s
 /* List directory contents. Returns number of entries, -1 on error. */
 i32 sftp_list_dir(void *sftp, const char *path, SftpEntry *entries, i32 max_entries);
 
-/* Create directory. Returns 0 on success. */
-i32 sftp_mkdir(void *sftp, const char *path);
-
 /* =========================================================================
  * Basic file operations
  * ========================================================================= */
@@ -125,12 +122,6 @@ const char *sftp_last_error_str(void *sftp);
  * remote directory entry must gate on this before building a path from it. */
 bool sftp_name_is_safe_component(const char *name);
 
-/* Remove file or symlink. */
-i32 sftp_remove(void *sftp, const char *path);
-
-/* Rename file. */
-i32 sftp_rename(void *sftp, const char *old_path, const char *new_path);
-
 /* =========================================================================
  * Resume (partial file transfer)
  * ========================================================================= */
@@ -166,17 +157,6 @@ SFTPSyncResult sftp_sync_upload(void *sftp, const char *local_dir, const char *r
 /* =========================================================================
  * Symlink operations
  * ========================================================================= */
-
-/* Create a symbolic link. Returns true on success. */
-bool sftp_create_symlink(void *sftp, const char *target, const char *link_path);
-
-/* Read the target of a symbolic link. Returns true on success.
- * target buffer receives the null-terminated path. */
-bool sftp_read_symlink(void *sftp, const char *link_path, char *target, i32 target_size);
-
-/* Remove a symbolic link. Returns true on success.
- * (Uses sftp_remove/unlink internally, which works on symlinks.) */
-bool sftp_remove_symlink(void *sftp, const char *link_path);
 
 /* =========================================================================
  * Transfer progress (global state for UI)

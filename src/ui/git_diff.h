@@ -36,7 +36,6 @@
  * every open re-runs the job from scratch anyway. */
 void git_diff_toggle(AppState *app);
 void git_diff_close(AppState *app);
-bool git_diff_is_open(const AppState *app);
 
 /* Per-frame: collect finished worker output, and close the dock when the
  * active tab is no longer the repo it was bound to. Returns true when

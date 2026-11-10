@@ -28,9 +28,14 @@
  * integrity check noticing) works on ChaCha20-Poly1305 and on CBC with EtM,
  * and not on GCM.
  *
- * libssh2 strips a name it does not implement and keeps the strict-KEX marker
- * in front of whatever key-exchange list it is given, so these are plain
- * strings. Pure.
+ * libssh2 strips a name it does not implement, so these are plain strings.
+ * From 1.11.1 it also puts the strict-KEX and ext-info markers in front of
+ * whatever key-exchange list it is given; an older one (the 1.11.0 a Linux
+ * distribution ships, its strict KEX patched in) sends only the list, so the
+ * markers are Liu's to add there (ssh_algs_kex_markers): without them strict
+ * KEX is off, the server names no signature algorithms for an RSA key, and a
+ * strict server that applies its rule anyway ends the session at the first
+ * encrypted message. Pure.
  */
 #ifndef SSH_SSH_ALGS_H
 #define SSH_SSH_ALGS_H
@@ -79,6 +84,15 @@ static inline const char *ssh_hostkey_kind_algs(SshHostKeyKind kind, bool legacy
                                               : "rsa-sha2-512,rsa-sha2-256";
     default:                    return "";
     }
+}
+
+/* What goes in front of the key-exchange list for a libssh2 of this version
+ * (LIBSSH2_VERSION_NUM's 0xMMmmpp): the strict-KEX and ext-info markers, which
+ * 1.11.1 and later add themselves. A library that does not know a marker
+ * strips it. */
+#define SSH_ALGS_KEX_MARKERS "ext-info-c,kex-strict-c-v00@openssh.com"
+static inline const char *ssh_algs_kex_markers(unsigned long libssh2_version) {
+    return libssh2_version < 0x010b01ul ? SSH_ALGS_KEX_MARKERS : "";
 }
 
 static inline bool ssh_algs_append(char *out, usize cap, const char *names) {

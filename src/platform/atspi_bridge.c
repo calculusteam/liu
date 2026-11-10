@@ -41,6 +41,9 @@
 
 #include "platform/atspi_bridge.h"
 #include "platform/platform.h"
+#include "platform/sfnt_family.h"
+#include "core/config.h"
+#include "core/string_utils.h"
 
 #include <dbus/dbus.h>
 #include <locale.h>
@@ -200,7 +203,8 @@ static void atspi_wants_update(void) {
     g_atspi.want_text = atspi_listened("object", "text-changed", "insert") ||
                         atspi_listened("object", "text-changed", "delete") ||
                         atspi_listened("object", "text-caret-moved", "") ||
-                        atspi_listened("object", "text-selection-changed", "");
+                        atspi_listened("object", "text-selection-changed", "") ||
+                        atspi_listened("object", "text-attributes-changed", "");
 }
 
 static void atspi_listener_add(const char *bus, const char *event) {
@@ -349,6 +353,28 @@ static void atspi_gens(AtspiWindow *aw, PlatformA11yText *g) {
     if (aw->fn) aw->fn(aw->pw, aw->user, g, true);
 }
 
+/* The family name of the configured face, read from the font file's name
+ * table once per configured file (a failed read is remembered too, so a
+ * missing file is not opened on every snapshot). A bare file name names a
+ * bundled face and is looked for in the bundled fonts folder, as the font
+ * loader looks for it. Main thread only. */
+static char g_family_file[512];
+static char g_family_name[96];
+static bool g_family_known;
+
+static const char *atspi_face_family(const char *file) {
+    if (!file || !file[0]) return NULL;
+    if (!g_family_known || strcmp(g_family_file, file) != 0) {
+        char full[1024];
+        const char *path = file;
+        if (!strchr(file, '/') && liu_path_join(full, sizeof(full), font_user_dir(), file)) path = full;
+        snprintf(g_family_file, sizeof(g_family_file), "%s", file);
+        sfnt_family_file(path, g_family_name, sizeof(g_family_name));
+        g_family_known = true;
+    }
+    return g_family_name[0] ? g_family_name : NULL;
+}
+
 /* The terminal's text for answering queries: the cached snapshot while it is
  * young and the provider's generations have not moved, a fresh one otherwise.
  * A rebuild never overwrites the text the last events described. */
@@ -367,6 +393,7 @@ static AtspiText *atspi_term_text(AtspiWindow *aw, bool force) {
     memset(&s, 0, sizeof(s));
     if (aw->fn) aw->fn(aw->pw, aw->user, &s, false);
     AtspiText *t = &aw->snap[target];
+    s.font_family = atspi_face_family(s.font_file);
     atspi_text_load(t, &s);
     t->built_at = now;
     aw->cur = target;
@@ -519,6 +546,11 @@ static void atspi_window_check(AtspiWindow *aw, f64 now) {
                        ANY_STR, p, bytes, NULL);
         text_moved = true;
     }
+    /* The same text in other colours or weights: the text events say nothing
+     * of it. */
+    if (!text_moved && pieces <= 1 && atspi_listened("object", "text-attributes-changed", "") &&
+        atspi_attrs_differ(&o->attrs, &t->attrs))
+        atspi_emit(&term, IF_EV_OBJECT, "TextAttributesChanged", "", 0, 0, ANY_STR, "", 0, NULL);
     i32 caret_o = o->s.has_cursor ? (i32)o->s.cursor16 : -1;
     i32 caret_t = t->s.has_cursor ? (i32)t->s.cursor16 : -1;
     if (pieces > 1) caret_o = caret_t;   /* each piece moved it already */
@@ -887,17 +919,50 @@ static DBusMessage *atspi_reply_ref(DBusMessage *m, const AtspiObj *o) {
     return r;
 }
 
-static DBusMessage *atspi_reply_empty_dict(DBusMessage *m, bool with_range, i32 a, i32 b) {
+/* a{ss} of `n` attributes. */
+static void atspi_append_attrs(DBusMessageIter *it, const AtspiAttrKV *kv, u32 n) {
+    DBusMessageIter dict, ent;
+    if (!dbus_message_iter_open_container(it, DBUS_TYPE_ARRAY, "{ss}", &dict)) return;
+    for (u32 i = 0; i < n; i++) {
+        if (!dbus_message_iter_open_container(&dict, DBUS_TYPE_DICT_ENTRY, NULL, &ent)) break;
+        atspi_append_cstr(&ent, kv[i].key);
+        atspi_append_cstr(&ent, kv[i].val);
+        dbus_message_iter_close_container(&dict, &ent);
+    }
+    dbus_message_iter_close_container(it, &dict);
+}
+
+/* GetAttributes / GetAttributeRun: the attributes of the run around `off` and
+ * the characters [start, end) it covers. A snapshot with no cell styles (the
+ * provider gave none) answers as before: no attributes, the whole text. */
+static DBusMessage *atspi_reply_attr_run(DBusMessage *m, const AtspiText *t, i32 off,
+                                         bool include_defaults) {
+    AtspiAttrKV kv[ATSPI_ATTR_MAX];
+    u32 n = 0, s = 0, e = t->n;
+    if (t->attrs.valid) {
+        s = e = off < 0 ? 0 : (u32)off > t->n ? t->n : (u32)off;
+        if (off >= 0 && atspi_attrs_run(&t->attrs, (u32)off, &s, &e))
+            n = atspi_attrs_at(&t->attrs, (u32)off, include_defaults, kv);
+    }
     DBusMessage *r = dbus_message_new_method_return(m);
     if (!r) return NULL;
-    DBusMessageIter it, dict;
+    DBusMessageIter it;
     dbus_message_iter_init_append(r, &it);
-    if (dbus_message_iter_open_container(&it, DBUS_TYPE_ARRAY, "{ss}", &dict))
-        dbus_message_iter_close_container(&it, &dict);
-    if (with_range) {
-        dbus_message_iter_append_basic(&it, DBUS_TYPE_INT32, &a);
-        dbus_message_iter_append_basic(&it, DBUS_TYPE_INT32, &b);
-    }
+    atspi_append_attrs(&it, kv, n);
+    i32 range[2] = { (i32)s, (i32)e };
+    dbus_message_iter_append_basic(&it, DBUS_TYPE_INT32, &range[0]);
+    dbus_message_iter_append_basic(&it, DBUS_TYPE_INT32, &range[1]);
+    return r;
+}
+
+static DBusMessage *atspi_reply_attr_defaults(DBusMessage *m, const AtspiText *t) {
+    AtspiAttrKV kv[ATSPI_ATTR_MAX];
+    u32 n = atspi_attrs_defaults(&t->attrs, kv);
+    DBusMessage *r = dbus_message_new_method_return(m);
+    if (!r) return NULL;
+    DBusMessageIter it;
+    dbus_message_iter_init_append(r, &it);
+    atspi_append_attrs(&it, kv, n);
     return r;
 }
 
@@ -1468,17 +1533,26 @@ static DBusMessage *atspi_text_call(const AtspiObj *o, DBusMessage *m, const cha
     if (strcmp(member, "GetAttributes") == 0) {
         ARGS(DBUS_TYPE_INT32, &a);
         AtspiText *t = atspi_term_text(aw, false);
-        return atspi_reply_empty_dict(m, true, 0, (i32)t->n);
+        return atspi_reply_attr_run(m, t, a, false);
     }
     if (strcmp(member, "GetAttributeRun") == 0) {
         dbus_bool_t inc = FALSE;
         ARGS(DBUS_TYPE_INT32, &a, DBUS_TYPE_BOOLEAN, &inc);
         AtspiText *t = atspi_term_text(aw, false);
-        return atspi_reply_empty_dict(m, true, 0, (i32)t->n);
+        return atspi_reply_attr_run(m, t, a, inc != FALSE);
     }
-    if (strcmp(member, "GetDefaultAttributes") == 0 || strcmp(member, "GetDefaultAttributeSet") == 0)
-        return atspi_reply_empty_dict(m, false, 0, 0);
-    if (strcmp(member, "GetAttributeValue") == 0) return atspi_reply_s(m, "", 0);
+    if (strcmp(member, "GetDefaultAttributes") == 0 || strcmp(member, "GetDefaultAttributeSet") == 0) {
+        AtspiText *t = atspi_term_text(aw, false);
+        return atspi_reply_attr_defaults(m, t);
+    }
+    if (strcmp(member, "GetAttributeValue") == 0) {
+        const char *name = "";
+        ARGS(DBUS_TYPE_INT32, &a, DBUS_TYPE_STRING, &name);
+        AtspiText *t = atspi_term_text(aw, false);
+        char v[96] = "";
+        if (a >= 0) atspi_attrs_value(&t->attrs, (u32)a, name, v, sizeof(v));
+        return atspi_reply_s(m, v, (u32)strlen(v));
+    }
     if (strcmp(member, "GetBoundedRanges") == 0) return atspi_reply_empty_array(m, "(iisv)");
     /* The text is what the program drew: no assistive app moves the caret or
      * the selection behind the terminal's back. */

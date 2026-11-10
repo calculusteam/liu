@@ -34,11 +34,14 @@ static u32 g_hover_scope = 0;
 static struct {
     u32 scope;                /* 0 = free */
     f64 until, soft_until;
+    f64 wake_at;              /* a still picture changes then (0 = nothing pending) */
 } g_anim_scopes[ANIM_SCOPE_SLOTS];
 /* Registrations that could not be attributed: no scope was ever set, or every
  * slot was taken by a window still animating. Answering true for every window
  * is the DEGRADED case on purpose — an extra repaint, never a missed one. */
 static f64 g_anim_unscoped_until = 0.0, g_anim_unscoped_soft = 0.0;
+/* anim_wake_at's unattributed moment, and the earliest of all (the loop's). */
+static f64 g_anim_unscoped_wake = 0.0, g_anim_wake_at = 0.0;
 
 /* The slot for the current scope, reusing one whose window has finished. NULL
  * means "could not attribute", and the caller then widens to unscoped. */
@@ -49,13 +52,15 @@ static i32 anim_scope_slot(f64 now) {
         if (g_anim_scopes[i].scope == g_hover_scope) return i;
         if (free_slot >= 0) continue;
         if (g_anim_scopes[i].scope == 0 ||
-            (now >= g_anim_scopes[i].until && now >= g_anim_scopes[i].soft_until))
+            (now >= g_anim_scopes[i].until && now >= g_anim_scopes[i].soft_until &&
+             g_anim_scopes[i].wake_at == 0.0))
             free_slot = i;
     }
     if (free_slot >= 0) {
         g_anim_scopes[free_slot].scope = g_hover_scope;
         g_anim_scopes[free_slot].until = 0.0;
         g_anim_scopes[free_slot].soft_until = 0.0;
+        g_anim_scopes[free_slot].wake_at = 0.0;
     }
     return free_slot;
 }
@@ -80,6 +85,31 @@ void anim_register_soft_until(f64 end_time) {
     } else if (end_time > g_anim_scopes[i].soft_until) {
         g_anim_scopes[i].soft_until = end_time;
     }
+}
+
+/* The earlier of a pending moment and a new one; 0 is "none". */
+static f64 anim_earlier(f64 pending, f64 t) {
+    return (pending == 0.0 || t < pending) ? t : pending;
+}
+
+void anim_wake_at(f64 t) {
+    if (!isfinite(t) || t <= 0.0) return;
+    g_anim_wake_at = anim_earlier(g_anim_wake_at, t);
+    i32 i = anim_scope_slot(platform_time_sec());
+    if (i < 0) g_anim_unscoped_wake = anim_earlier(g_anim_unscoped_wake, t);
+    else       g_anim_scopes[i].wake_at = anim_earlier(g_anim_scopes[i].wake_at, t);
+}
+
+f64 anim_wake_in(f64 now) {
+    if (g_anim_wake_at == 0.0) return -1.0;
+    /* The earliest may have been taken by its window already: look again. */
+    f64 next = g_anim_unscoped_wake;
+    for (i32 i = 0; i < ANIM_SCOPE_SLOTS; i++)
+        if (g_anim_scopes[i].wake_at != 0.0) next = anim_earlier(next, g_anim_scopes[i].wake_at);
+    g_anim_wake_at = next;
+    if (next == 0.0) return -1.0;
+    f64 in = next - now;
+    return in < 0.001 ? 0.001 : in;
 }
 
 void anim_start(Anim *a, f64 duration_sec) {
@@ -125,6 +155,39 @@ static bool anim_for(const void *owner, bool soft) {
 bool anim_active_for(const void *owner)      { return anim_for(owner, false); }
 bool anim_soft_active_for(const void *owner) { return anim_for(owner, true);  }
 
+bool anim_wake_due_for(const void *owner, f64 now) {
+    bool due = false;
+    if (g_anim_unscoped_wake != 0.0 && now >= g_anim_unscoped_wake) {
+        /* Unattributed: every window paints once; the moment stays until the
+         * loop has asked them all (anim_wake_in's sweep forgets it next). */
+        due = true;
+    }
+    u32 sc = anim_scope_of(owner);
+    for (i32 i = 0; sc && i < ANIM_SCOPE_SLOTS; i++) {
+        if (g_anim_scopes[i].scope != sc) continue;
+        if (g_anim_scopes[i].wake_at != 0.0 && now >= g_anim_scopes[i].wake_at) {
+            g_anim_scopes[i].wake_at = 0.0;
+            due = true;
+        }
+        break;
+    }
+    return due;
+}
+
+void anim_wake_settle(f64 now) {
+    if (g_anim_unscoped_wake != 0.0 && now >= g_anim_unscoped_wake) g_anim_unscoped_wake = 0.0;
+}
+
+void anim_forget_owner(const void *owner) {
+    u32 sc = anim_scope_of(owner);
+    for (i32 i = 0; sc && i < ANIM_SCOPE_SLOTS; i++) {
+        if (g_anim_scopes[i].scope != sc) continue;
+        g_anim_scopes[i].scope = 0;
+        g_anim_scopes[i].until = g_anim_scopes[i].soft_until = g_anim_scopes[i].wake_at = 0.0;
+    }
+    if (g_hover_scope == sc) g_hover_scope = 0;
+}
+
 /* Auto-hiding overlay scrollbars — see the header note in anim.h. */
 f32 ui_autohide_alpha(f64 last_active, bool active_now) {
     if (active_now) return 1.0f;
@@ -133,7 +196,8 @@ f32 ui_autohide_alpha(f64 last_active, bool active_now) {
     f64 since = now - last_active;
     if (since < 0.0) since = 0.0;
     if (since < UI_AUTOHIDE_HOLD_S) {
-        anim_register_soft_until(last_active + UI_AUTOHIDE_HOLD_S + 0.05);
+        /* Held, the bar is a still picture: one wake when the fade begins. */
+        anim_wake_at(last_active + UI_AUTOHIDE_HOLD_S);
         return 1.0f;
     }
     f64 t = (since - UI_AUTOHIDE_HOLD_S) / UI_AUTOHIDE_FADE_S;

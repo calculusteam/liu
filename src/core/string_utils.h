@@ -18,14 +18,6 @@ typedef struct {
 #define STR_NULL    ((Str){ .data = NULL, .len = 0 })
 
 Str    str_from_cstr(const char *s);
-char  *str_to_cstr(Str s, Arena *a);
-bool   str_eq(Str a, Str b);
-bool   str_eq_nocase(Str a, Str b);
-bool   str_starts_with(Str s, Str prefix);
-bool   str_ends_with(Str s, Str suffix);
-bool   str_contains(Str haystack, Str needle);
-Str    str_trim(Str s);
-Str    str_substr(Str s, usize start, usize len);
 i64    str_find(Str haystack, Str needle);
 
 /* String builder (arena-backed) */
@@ -36,12 +28,7 @@ typedef struct {
     usize  cap;
 } StringBuilder;
 
-StringBuilder sb_create(Arena *a, usize initial_cap);
 void          sb_append(StringBuilder *sb, Str s);
-void          sb_append_cstr(StringBuilder *sb, const char *s);
-void          sb_append_char(StringBuilder *sb, char c);
-void          sb_append_u32(StringBuilder *sb, u32 val);
-Str           sb_to_str(const StringBuilder *sb);
 
 /* Base64 encode/decode */
 i32  base64_decode(const char *input, i32 input_len, u8 *output, i32 output_max);

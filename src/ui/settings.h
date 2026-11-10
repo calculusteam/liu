@@ -331,6 +331,15 @@ typedef struct {
      * exactly the cards carrying the delete button. */
     struct { f32 x, y, w, h; } hover_areas[192];
     i32          hover_area_count;
+    /* The text fields the last frame drew, where their text begins, so the
+     * state dump can name a field ("the New field") rather than a
+     * coordinate. `kind` is a SettingsFieldKind. */
+    struct { i32 kind; f32 x, y, w, h; } field_probe[8];
+    i32          field_probe_n;
+    /* ... and the Appearance steppers (Size, Line Height, Text Weight x2), the
+     * boxes of their - / + halves, in pixels. */
+    struct { f32 x, y, w, h; } stepper_probe[6];
+    i32          stepper_probe_n;
 
     /* The scrolling content's clip band, published by settings_render while it
      * walks the scrolled body (see the scissor it pushes). A hover rect is only

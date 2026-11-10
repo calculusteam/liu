@@ -96,11 +96,6 @@ void arena_reset(Arena *a) {
     if (a) { a->used = 0; a->refused = 0; }
 }
 
-usize arena_remaining(const Arena *a) {
-    if (!a || a->used >= a->size) return 0;
-    return a->size - a->used;
-}
-
 /* =========================================================================
  * Temp arena
  * ========================================================================= */

@@ -48,6 +48,7 @@ typedef enum {
     ACT_SCROLL_TO_TOP,
     ACT_SCROLL_TO_BOTTOM,
     ACT_CLEAR_SCREEN,
+    ACT_RESTART_SHELL,         /* the focused pane's shell, ended and started afresh */
     ACT_BROADCAST_TOGGLE,
 
     /* Split */
@@ -122,11 +123,13 @@ typedef struct {
     Action   action;
 } KeyBinding;
 
-#define MAX_KEYBINDINGS 64
+#define MAX_KEYBINDINGS 192
 /* keybindings.json's "keybindings_version". 2: the split moved off Cmd+T.
  * 3: written by a build with the Linux table — a Super chord in it is the
- * user's, never a leftover of the macOS table (keybind_load). */
-#define KEYBIND_FILE_VERSION 3
+ * user's, never a leftover of the macOS table (keybind_load). 4: the Linux
+ * reopen-tab and stacked split left Ctrl+Alt+T / D, which desktops take.
+ * 5: the Linux table became macOS's with Cmd read as Ctrl+Shift. */
+#define KEYBIND_FILE_VERSION 5
 
 typedef struct {
     KeyBinding bindings[MAX_KEYBINDINGS];
@@ -159,9 +162,10 @@ void keybind_remove(KeyBindTable *kb, Action action);
 /* The modifier of the app's own fixed chords outside a terminal pane — the
  * file browser, the editor and its Find bar, dialog fields, the image viewer —
  * and of a click on a link: Cmd on macOS; Ctrl on X11, where Super belongs to
- * the desktop shell (GNOME moves a window on Super+drag) and these keys are no
- * shell's. Inside a pane a bare Ctrl chord IS the shell's, which is why the
- * binding table uses Ctrl+Shift there. UI_MOD_APP is its word in a hint. */
+ * the desktop shell (a window manager moves a window on Super+drag) and
+ * these keys are no shell's. Inside a pane a bare Ctrl chord IS the shell's,
+ * which is why the binding table uses Ctrl+Shift there. UI_MOD_APP is its
+ * word in a hint. */
 #ifdef PLATFORM_MACOS
 #define MOD_APP    MOD_SUPER
 #define UI_MOD_APP "Cmd"
@@ -170,14 +174,33 @@ void keybind_remove(KeyBindTable *kb, Action action);
 #define UI_MOD_APP "Ctrl"
 #endif
 
+/* The app's own chord inside a terminal pane, spelled as the binding table
+ * spells Cmd there: Cmd on macOS; Ctrl+Shift, or Super, on X11 (a bare Ctrl
+ * chord is the shell's). True when the modifiers are exactly that. */
+static inline bool keybind_pane_cmd(u32 mods) {
+    u32 m = mods & (MOD_CTRL | MOD_SHIFT | MOD_ALT | MOD_SUPER);
+#ifdef PLATFORM_MACOS
+    return m == MOD_SUPER;
+#else
+    return m == MOD_SUPER || m == (MOD_CTRL | MOD_SHIFT);
+#endif
+}
+
 /* Fixed text that names a default chord (a seeded note, a Settings hint):
  * the platform's default, as the binding table has it. */
 #ifdef PLATFORM_MACOS
 #define UI_CHORD_PALETTE "Cmd+K"
 #define UI_CHORD_COPY    "Cmd+C"
 #else
-#define UI_CHORD_PALETTE "Ctrl+Shift+P"
+#define UI_CHORD_PALETTE "Ctrl+Shift+K"
 #define UI_CHORD_COPY    "Ctrl+Shift+C"
+#endif
+
+/* keybind_pane_cmd's first spelling in a hint: the word for Cmd in a pane. */
+#ifdef PLATFORM_MACOS
+#define UI_MOD_PANE "Cmd"
+#else
+#define UI_MOD_PANE "Ctrl+Shift"
 #endif
 
 /* Format binding as human-readable string: "Cmd+Shift+T" (macOS) /

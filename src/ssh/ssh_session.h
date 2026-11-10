@@ -87,6 +87,11 @@ typedef struct SSHConfig_tag {
                               * A protected key that is loaded there then needs
                               * no passphrase from us. Set by the SSH form's
                               * key login; never for a key from the vault. */
+    bool  ask_password;      /* no password was given and no key was named for
+                              * the host (the form's default identity or agent):
+                              * when that fails, ask as ssh does — the server's
+                              * prompt, else a password in Liu's dialog
+                              * (ssh/auth_second_factor.h ssh_auth_ask_for) */
 
     /* GSSAPI/Kerberos */
     bool  gssapi_auth;              /* try GSSAPI auth methods */
@@ -113,6 +118,11 @@ typedef struct SSHConfig_tag {
     PortForwardSpec *remote_forwards;
     i32  remote_forward_count;
     i32  remote_forward_cap;
+    /* SOCKS5 proxies the Port Forwarding dialog added (`bind_port` only), kept
+     * so a reconnect starts them again. */
+    PortForwardSpec *socks_forwards;
+    i32  socks_forward_count;
+    i32  socks_forward_cap;
 
     /* Smart Vault — secret references. When non-empty, the UI layer
      * reveals the secret from the vault just-in-time and populates the
@@ -174,6 +184,7 @@ StreamLocalForward *ssh_config_push_stream_forward(SSHConfig *cfg);
 ProxyHop           *ssh_config_push_proxy_hop(SSHConfig *cfg);
 PortForwardSpec    *ssh_config_push_local_forward(SSHConfig *cfg);
 PortForwardSpec    *ssh_config_push_remote_forward(SSHConfig *cfg);
+PortForwardSpec    *ssh_config_push_socks_forward(SSHConfig *cfg);
 SSHEnvVar          *ssh_config_push_env(SSHConfig *cfg);
 
 typedef struct Session Session;
@@ -415,6 +426,10 @@ bool session_local_sleep_is_safe(Session *s);
 /* Read process arguments through KERN_PROCARGS2 on macOS and return
  * timing and allocation counters. */
 bool session_argv_probe_for_bench(i32 pid, char *out, usize out_cap);
+/* What the foreground-group rung answers for process group `pgid`, whose
+ * leader is named `leader`; *found_agent says whether it was an agent. */
+bool session_pgrp_probe_for_bench(i32 pgid, const char *leader,
+                                  char *out, usize out_cap, bool *found_agent);
 void session_argv_probe_stats(u64 *probe_count, u64 *probe_ns,
                               u64 *probe_max_ns, u64 *argmax_count,
                               u64 *procargs_count, u64 *malloc_bytes);
@@ -575,12 +590,20 @@ bool session_is_sftp_only(const Session *s);
 /* Get foreground process name (local PTY only). Returns empty string on error. */
 const char *session_fg_process(Session *s);
 /* Keystroke-safe lookup: never scans processes or argv. Empty when the cached
- * answer is expired or no longer belongs to the current foreground group. */
+ * answer is expired or no longer belongs to the current foreground group. On
+ * Linux, where the lookup reads a few /proc files of the pane's own process
+ * tree, it is session_fg_process(). */
 const char *session_fg_process_cached(Session *s);
 
 /* Foreground process-group leader pid on the tab's PTY (local PTY only).
  * -1 when not applicable. One tcgetpgrp ioctl — cheap. */
 i32 session_fg_pid(Session *s);
+/* The same, as the pane's reader last sampled it, without asking it for a
+ * fresher one (session_fg_pid's lookups do, at most every 0.1 s). For a
+ * caller that can live with an answer the reader keeps current on its own —
+ * at every quiet spell after output — and that other probes refresh: one that
+ * asked every second woke every pane's reader every second. */
+i32 session_fg_pid_cached(Session *s);
 
 /* Is the pane's program reading a password — the tty has echo off and is in
  * line mode (getpass, sudo, ssh, `read -s`)? Local PTYs only; false for a
@@ -689,7 +712,15 @@ const char *session_kbi_instruction(Session *s);
 const char *session_kbi_peer(Session *s);
 const char *session_kbi_prompt(Session *s, i32 index);
 bool session_kbi_echo(Session *s, i32 index);
+/* The pending question is Liu's own (a password it asks for when the server
+ * takes passwords but asks nothing itself), not words the server sent. */
+bool session_kbi_is_liu(Session *s);
 void session_kbi_submit(Session *s, const char **responses, i32 count);
+
+/* How the destination let this connection in when no credential Liu had did
+ * it: "password" once a password asked for in the dialog (or the server's own
+ * prompt) logged in, "" otherwise. Read after the status says connected. */
+const char *session_auth_asked(Session *s);
 
 /* =========================================================================
  * Port forwarding
@@ -717,6 +748,11 @@ i32  session_local_forward_count(Session *s);
 bool session_local_forward_get(Session *s, i32 index, PortForwardInfo *info);
 void session_local_forward_remove(Session *s, i32 index);
 void session_remote_forward_poll(Session *s);
+/* The forwards' clocks, once a second: a channel open the server has not
+ * answered gives up its client at its deadline. The polls that move a forward
+ * run only when something announced work, and a server that does not answer
+ * announces nothing. */
+void session_forward_tick(Session *s);
 void session_keepalive_check(Session *s, f64 now_sec);
 
 /* =========================================================================

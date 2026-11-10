@@ -116,6 +116,10 @@ bool             platform_draws_own_window_controls(void);
 void             platform_window_minimize(PlatformWindow *w);
 void             platform_window_toggle_maximize(PlatformWindow *w);
 bool             platform_window_is_maximized(PlatformWindow *w);
+/* At quit: give what Liu copied to the desktop's clipboard manager, if one is
+ * listening (the X11 CLIPBOARD_MANAGER / SAVE_TARGETS protocol), so the copy
+ * outlives the process. Bounded, silent when there is no manager, once. */
+void             platform_clipboard_hand_off(void);
 /* What the window manager's close does: EVENT_CLOSE for that window. */
 void             platform_window_request_close(PlatformWindow *w);
 #endif
@@ -692,6 +696,12 @@ void platform_window_display_link_sync(PlatformWindow *w, bool visible,
                                        bool focused, bool wants_frames);
 bool platform_window_display_link_running(PlatformWindow *w);
 u64  platform_window_vsync_ticks(PlatformWindow *w);
+/* Whether this window's next ticks wake the loop. A running link always
+ * counts its ticks; it wakes the loop only while the window owes a frame or
+ * something on it is drawn from the clock — otherwise a pane that streams at
+ * 15 frames a second would turn the loop over at the panel's 60. Set by the
+ * loop before every wait; a window never told wakes on every tick. */
+void platform_window_set_link_wake(PlatformWindow *w, bool wake);
 /* Seconds between the most recent two display-link callbacks. Zero until
  * enough ticks arrive; this is a cadence observation, not scanout latency. */
 f64  platform_window_display_link_period_sec(PlatformWindow *w);
@@ -964,6 +974,13 @@ void platform_set_ime_cursor_pos(f32 x, f32 y, f32 cell_w, f32 cell_h);
  * for it arrives as CHAR_INPUT marked ime_reset. No-op where the platform
  * keeps no input context of its own (macOS). */
 void platform_ime_reset(PlatformWindow *w);
+
+/* Whether window `w`'s input method may take part while a text field has the
+ * keyboard: false for a field that is ASCII by construction (ui_ime_field_off),
+ * where the input context stands down — nothing is composed, no candidate list
+ * opens, and the letters go in as typed. True again when the keyboard leaves
+ * it. No-op where the platform keeps no input context of its own (macOS). */
+void platform_ime_allow(PlatformWindow *w, bool allowed);
 
 /* =========================================================================
  * Cursor

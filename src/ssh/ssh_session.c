@@ -3,7 +3,7 @@
  */
 #include "ssh/ssh_session.h"
 #include "ssh/ssh_env_bootstrap.h"
-#include "core/config.h"       /* liu_executable_dir() */
+#include "core/config.h"       /* liu_executable_dir(), liu_helper_exe_dir() */
 #include "core/memory.h"       /* secure_zero() */
 #include "core/checked.h"
 #include "core/path_escape.h"   /* liu_path_has_control_bytes() */
@@ -82,7 +82,11 @@ static f64 session_mono_now(void) {
     return (f64)ts.tv_sec + (f64)ts.tv_nsec / 1e9;
 }
 
-#ifdef PLATFORM_MACOS
+/* Which agent runs in a pane's foreground, from what the kernel says of its
+ * processes. The rungs are the same on both systems; what differs is where a
+ * process's name, argument vector, executable and group are read
+ * (libproc and sysctl on macOS, /proc on Linux). */
+#if defined(PLATFORM_MACOS) || defined(PLATFORM_LINUX)
 
 static bool session_proc_name_is_agent(const char *name) {
     return agent_names_id(name, false)[0] != '\0';
@@ -192,14 +196,16 @@ static bool session_proc_title_agent(const char *arg, char *out, usize out_cap) 
 }
 
 /* A node/bun/python wrapper hides the real CLI behind the interpreter's
- * process name ("node"). Read the process arguments (KERN_PROCARGS2) and
- * return the basename of the first non-flag argv entry that names a known
- * agent — that's the script path, e.g. ".../commandcode" → "commandcode".
+ * process name ("node"). Read the process arguments (KERN_PROCARGS2 on macOS,
+ * /proc/<pid>/cmdline on Linux) and return the basename of the first non-flag
+ * argv entry that names a known agent — that's the script path, e.g.
+ * ".../commandcode" → "commandcode".
  * This is what lets script-based CLIs (codex, commandcode, grok …)
  * be recognized the same way native binaries (claude, opencode) already are. */
 /* All callers are on the main thread (session_fg_process). A single process-wide
  * buffer therefore removes allocator churn without a lock or per-pane
- * duplication. KERN_ARGMAX is invariant for the process lifetime. */
+ * duplication. KERN_ARGMAX is invariant for the process lifetime; on Linux a
+ * vector longer than the buffer is read up to its last whole argument. */
 static char  *g_procargs_scratch;
 static usize  g_procargs_scratch_cap;
 static bool   g_procargs_cleanup_registered;
@@ -215,6 +221,7 @@ static void session_procargs_cleanup(void) {
 static char *session_procargs_buffer(usize *cap_out) {
     if (!g_procargs_scratch) {
         int argmax = 0;
+#ifdef PLATFORM_MACOS
         size_t am_sz = sizeof argmax;
         int mib_am[2] = { CTL_KERN, KERN_ARGMAX };
 #ifdef LIU_AGENT_ARGV_PROBE
@@ -222,6 +229,9 @@ static char *session_procargs_buffer(usize *cap_out) {
 #endif
         if (sysctl(mib_am, 2, &argmax, &am_sz, NULL, 0) != 0 || argmax <= 0)
             argmax = 256 * 1024;
+#else
+        argmax = 256 * 1024;
+#endif
         char *buf = (char *)malloc((size_t)argmax);
 #ifdef LIU_AGENT_ARGV_PROBE
         g_argv_malloc_bytes += (u64)argmax;
@@ -247,6 +257,7 @@ static bool session_proc_argv_agent(pid_t pid, char *out, usize out_cap) {
     char *buf = session_procargs_buffer(&scratch_cap);
     if (!buf) goto done_false;
 
+#ifdef PLATFORM_MACOS
     size_t bsz = scratch_cap;
     int mib[3] = { CTL_KERN, KERN_PROCARGS2, (int)pid };
 #ifdef LIU_AGENT_ARGV_PROBE
@@ -264,6 +275,29 @@ static bool session_proc_argv_agent(pid_t pid, char *out, usize out_cap) {
     /* Layout: argc | exec_path\0 | \0-padding | argv[0]\0 argv[1]\0 … */
     while (p < end && *p != '\0') p++;   /* skip exec_path        */
     while (p < end && *p == '\0') p++;   /* skip padding to argv0 */
+#else
+    /* Layout: argv[0]\0 argv[1]\0 … and nothing before it. A process that
+     * retitled itself reads as its title followed by NULs. */
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/cmdline", (int)pid);
+#ifdef LIU_AGENT_ARGV_PROBE
+    g_argv_procargs_count++;
+#endif
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) goto done_false;
+    usize bsz = 0;
+    while (bsz < scratch_cap) {
+        ssize_t n = read(fd, buf + bsz, scratch_cap - bsz);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        bsz += (usize)n;
+    }
+    close(fd);
+    int argc = 0;
+    for (usize i = 0; i < bsz; i++) if (buf[i] == '\0') argc++;
+    char *p   = buf;
+    char *end = buf + bsz;
+#endif
 
     bool found = false;
     bool py0 = false;       /* argv[0] is a Python interpreter */
@@ -306,6 +340,10 @@ static bool session_proc_argv_agent(pid_t pid, char *out, usize out_cap) {
                 found = true;
                 break;
             }
+            /* The rest of the vector names a script only behind an
+             * interpreter; any other program's arguments are what the user
+             * gave it (`vim codex` edits a file called codex). */
+            if (!session_proc_name_is_wrapper(bn0)) break;
             py0 = strncasecmp(bn0, "python", 6) == 0;
             continue;                    /* argv[0] = interpreter */
         }
@@ -364,8 +402,16 @@ bool session_argv_probe_for_bench(i32 pid, char *out, usize out_cap) {
  * The >=5-char guard keeps short, ambiguous ids (amp, cmd, gpt) from matching
  * an incidental directory name. */
 static bool session_proc_path_agent(pid_t pid, char *out, usize out_cap) {
+#ifdef PLATFORM_MACOS
     char path[PROC_PIDPATHINFO_MAXSIZE];
     if (proc_pidpath(pid, path, sizeof path) <= 0) return false;
+#else
+    char link[64], path[4096];
+    snprintf(link, sizeof link, "/proc/%d/exe", (int)pid);
+    ssize_t n = readlink(link, path, sizeof path - 1);
+    if (n <= 0) return false;
+    path[n] = '\0';
+#endif
     char *save = NULL;
     for (char *tok = strtok_r(path, "/", &save); tok;
          tok = strtok_r(NULL, "/", &save)) {
@@ -412,87 +458,199 @@ static bool session_proc_name_versioned_agent(const char *name,
  * how long to trust the answer: "some process named zsh" is the steady state of
  * an idle pane and is worth caching for much longer than an agent name is. */
 /* ---------------------------------------------------------------------------
- * One process snapshot per scheduler interval
+ * The members of one process group
  *
- * The group sweep behind session_find_interesting_pgrp_process() is
- * proc_listpids(PROC_ALL_PIDS) followed by a proc_pidinfo per pid — one full
- * sweep of every process on the machine. It is the fallback, but it is the
- * fallback for the ordinary case: an idle shell leader is not an agent, not a
- * versioned agent, not a wrapper and has no agent in its argv, so the group
- * sweep runs. Run PER PANE, a sweep that costs far more than the leader fast
- * path next to it is multiplied by the number of panes in a single frame.
- *
- * The pid->(pgid,name) table is the same for every pane asked in the same
- * instant, so it is taken ONCE and shared. The snapshot's own TTL is well under
- * the per-session TTL that gates these calls, so the worst extra staleness is a
- * fraction of an answer that was already 0.6 s old. */
-#define SESSION_PROC_SNAP_TTL 0.25
+ * An idle shell leader is not an agent, not a versioned agent, not a wrapper
+ * and has no agent in its argv, so the group is looked at whenever its answer
+ * is asked again. The macOS kernel lists a group's members itself
+ * (PROC_PGRP_ONLY): a proc_pidinfo for each member, not one for every
+ * process on the machine and a filter on its pgid. Both walk the kernel's
+ * process list in the same order, so the first member that answers is the
+ * same one. Linux has no such list: every /proc/<pid>/stat is read for its
+ * group. A group is rarely more than a pipeline; past the stack buffer the
+ * list is taken again on the heap. */
+#define SESSION_PGRP_STACK 64
 
-typedef struct {
-    pid_t pid;
-    pid_t pgid;
-    char  name[MAXCOMLEN + 1];
-} SessionProcRow;
+#ifdef PLATFORM_LINUX
+/* A process's accounting name and group, from /proc/<pid>/stat:
+ * `pid (comm) S ppid pgrp …`. comm can hold ") ", so the fixed fields start
+ * after the LAST ')'. False for a process that is gone or a zombie. */
+static bool session_proc_stat(pid_t pid, char *name, usize name_cap, pid_t *pgrp) {
+    char path[64], line[512];
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)pid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    ssize_t n;
+    do { n = read(fd, line, sizeof line - 1); } while (n < 0 && errno == EINTR);
+    close(fd);
+    if (n <= 0) return false;
+    line[n] = '\0';
+    char *lp = strchr(line, '(');
+    char *rp = strrchr(line, ')');
+    if (!lp || !rp || rp < lp || !rp[1]) return false;
+    char st = 0;
+    int ppid = 0, pg = 0;
+    if (sscanf(rp + 1, " %c %d %d", &st, &ppid, &pg) != 3) return false;
+    if (st == 'Z' || st == 'X' || st == 'x') return false;
+    if (name && name_cap) {
+        usize len = (usize)(rp - lp - 1);
+        if (len >= name_cap) len = name_cap - 1;
+        memcpy(name, lp + 1, len);
+        name[len] = '\0';
+    }
+    if (pgrp) *pgrp = (pid_t)pg;
+    return true;
+}
+#endif
 
-static SessionProcRow *g_proc_snap      = NULL;
-static i32             g_proc_snap_n    = 0;
-static i32             g_proc_snap_cap  = 0;
-static f64             g_proc_snap_at   = 0.0;
-/* Diagnostics: how many sweeps actually happened, and how much they cost.
+/* Diagnostics: how many group lookups ran, and how much they cost.
  * Main-thread only, like every caller of session_fg_process(). */
-static u64             g_proc_snap_sweeps = 0;
-static f64             g_proc_snap_secs   = 0.0;
+static u64 g_proc_scan_count = 0;
+static f64 g_proc_scan_secs  = 0.0;
 
 void session_proc_scan_stats(u64 *out_sweeps, f64 *out_seconds);
 void session_proc_scan_stats(u64 *out_sweeps, f64 *out_seconds) {
-    if (out_sweeps)  *out_sweeps  = g_proc_snap_sweeps;
-    if (out_seconds) *out_seconds = g_proc_snap_secs;
+    if (out_sweeps)  *out_sweeps  = g_proc_scan_count;
+    if (out_seconds) *out_seconds = g_proc_scan_secs;
 }
 
-/* Refresh the snapshot if it is older than its TTL. Returns false only when
- * there is nothing usable to read. */
-static bool session_proc_snapshot(void) {
-    f64 now = session_mono_now();
-    if (g_proc_snap && g_proc_snap_n > 0 &&
-        now - g_proc_snap_at < SESSION_PROC_SNAP_TTL) return true;
+/* The pids of process group `pgid`, in the kernel's list order. Returns the
+ * count; *out is `stack` or a heap block the caller frees. `root` is the
+ * pane's shell when known (0: not known). */
+#ifdef PLATFORM_LINUX
+/* Processes a walk below a shell looks at, at most: a pane's tree is a few;
+ * a build that forks hundreds is cut short, its agent (if any) found first. */
+#define SESSION_TREE_MAX 512
 
-    i32 bytes = proc_listpids(PROC_ALL_PIDS, 0, NULL, 0);
-    if (bytes <= 0) return g_proc_snap_n > 0;    /* keep the last good one */
-    pid_t *pids = (pid_t *)malloc((usize)bytes);
-    if (!pids) return g_proc_snap_n > 0;
-
-    i32 got = proc_listpids(PROC_ALL_PIDS, 0, pids, bytes);
-    i32 count = got > 0 ? got / (i32)sizeof(pid_t) : 0;
-    if (count > g_proc_snap_cap) {
-        i32 cap = count + count / 4 + 64;
-        SessionProcRow *rows = (SessionProcRow *)realloc(g_proc_snap,
-                                   (usize)cap * sizeof *rows);
-        if (!rows) { free(pids); return g_proc_snap_n > 0; }
-        g_proc_snap = rows;
-        g_proc_snap_cap = cap;
+/* Appends the pids a thread's children list names to `q` (up to `cap`). A
+ * list longer than the buffer ends inside a number: that one is left out. */
+static void session_tree_children(const char *path, pid_t *q, i32 *n, i32 cap) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    char buf[4096];
+    ssize_t r;
+    do { r = read(fd, buf, sizeof buf - 1); } while (r < 0 && errno == EINTR);
+    close(fd);
+    if (r <= 0) return;
+    buf[r] = '\0';
+    char *end = buf + r;
+    if ((usize)r == sizeof buf - 1)
+        while (end > buf && end[-1] >= '0' && end[-1] <= '9') end--;
+    for (char *p = buf; p < end; ) {
+        char *e = NULL;
+        long v = strtol(p, &e, 10);
+        if (e == p) { p++; continue; }
+        if (e > end) break;
+        if (v > 0 && *n < cap) q[(*n)++] = (pid_t)v;
+        p = e;
     }
-
-    i32 n = 0;
-    for (i32 i = 0; i < count && n < g_proc_snap_cap; i++) {
-        if (pids[i] <= 0) continue;
-        struct proc_bsdinfo bi;
-        if (proc_pidinfo(pids[i], PROC_PIDTBSDINFO, 0, &bi, sizeof bi)
-            != (i32)sizeof bi) continue;
-        if (!bi.pbi_name[0]) continue;
-        g_proc_snap[n].pid  = pids[i];
-        g_proc_snap[n].pgid = (pid_t)bi.pbi_pgid;
-        snprintf(g_proc_snap[n].name, sizeof g_proc_snap[n].name, "%s", bi.pbi_name);
-        n++;
-    }
-    free(pids);
-    g_proc_snap_n  = n;
-    g_proc_snap_at = now;
-    g_proc_snap_sweeps++;
-    g_proc_snap_secs += session_mono_now() - now;
-    return n > 0;
 }
 
-static bool session_find_interesting_pgrp_process(pid_t pgid,
+/* The members of `pgid` among `root` and the processes below it. The shell
+ * puts a job's processes in a group of its own session, as its children and
+ * theirs, so the group is found without reading every process on the
+ * machine. Read from the kernel's per-thread children lists, breadth first.
+ * False when the kernel keeps no such list (then every process is read). A
+ * member whose parent exited and was adopted elsewhere is not seen. */
+static bool session_pgrp_members_below(pid_t root, pid_t pgid, pid_t *stack, i32 stack_n,
+                                       pid_t **out, i32 *count) {
+    char path[96];
+    snprintf(path, sizeof path, "/proc/%d/task/%d/children", (int)root, (int)root);
+    if (access(path, R_OK) != 0) return false;
+    pid_t q[SESSION_TREE_MAX];
+    i32 qn = 1, n = 0;
+    q[0] = root;
+    pid_t *list = stack;
+    i32 cap = stack_n;
+    for (i32 h = 0; h < qn; h++) {
+        pid_t pid = q[h];
+        pid_t pg = 0;
+        if (session_proc_stat(pid, NULL, 0, &pg) && pg == pgid) {
+            if (n == cap) {
+                pid_t *grown = (pid_t *)malloc((usize)cap * 2 * sizeof *grown);
+                if (!grown) break;
+                memcpy(grown, list, (usize)n * sizeof *list);
+                if (list != stack) free(list);
+                list = grown;
+                cap *= 2;
+            }
+            list[n++] = pid;
+        }
+        if (qn >= SESSION_TREE_MAX) continue;
+        snprintf(path, sizeof path, "/proc/%d/task", (int)pid);
+        DIR *d = opendir(path);
+        if (!d) continue;
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL && qn < SESSION_TREE_MAX) {
+            if (e->d_name[0] < '1' || e->d_name[0] > '9') continue;
+            snprintf(path, sizeof path, "/proc/%d/task/%.16s/children", (int)pid, e->d_name);
+            session_tree_children(path, q, &qn, SESSION_TREE_MAX);
+        }
+        closedir(d);
+    }
+    *out = list;
+    *count = n;
+    return true;
+}
+
+static i32 session_pgrp_members(pid_t pgid, pid_t root, pid_t *stack, i32 stack_n, pid_t **out) {
+    *out = stack;
+    /* A group with no member below the shell has them elsewhere (a member
+     * whose parent exited is adopted outside the tree): every process is read. */
+    i32 below = 0;
+    if (root > 0 && session_pgrp_members_below(root, pgid, stack, stack_n, out, &below) && below > 0)
+        return below;
+    *out = stack;
+    DIR *d = opendir("/proc");
+    if (!d) return 0;
+    pid_t *list = stack;
+    i32 cap = stack_n, n = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] < '1' || e->d_name[0] > '9') continue;
+        char *endp = NULL;
+        long pid = strtol(e->d_name, &endp, 10);
+        if (!endp || *endp || pid <= 0) continue;
+        pid_t pg = 0;
+        if (!session_proc_stat((pid_t)pid, NULL, 0, &pg) || pg != pgid) continue;
+        if (n == cap) {
+            pid_t *grown = (pid_t *)malloc((usize)cap * 2 * sizeof *grown);
+            if (!grown) break;
+            memcpy(grown, list, (usize)n * sizeof *list);
+            if (list != stack) free(list);
+            list = grown;
+            cap *= 2;
+        }
+        list[n++] = (pid_t)pid;
+    }
+    closedir(d);
+    *out = list;
+    return n;
+}
+#else
+static i32 session_pgrp_members(pid_t pgid, pid_t root, pid_t *stack, i32 stack_n, pid_t **out) {
+    (void)root;                         /* the kernel lists a group's members itself */
+    *out = stack;
+    i32 got = proc_listpids(PROC_PGRP_ONLY, (uint32_t)pgid, stack,
+                            stack_n * (i32)sizeof(pid_t));
+    if (got <= 0) return 0;
+    i32 n = got / (i32)sizeof(pid_t);
+    if (n < stack_n) return n;
+    /* The buffer filled: the group may be larger. Ask for its size and take
+     * it whole, with room for members that appear in between. */
+    i32 bytes = proc_listpids(PROC_PGRP_ONLY, (uint32_t)pgid, NULL, 0);
+    if (bytes <= 0) return n;
+    bytes += 16 * (i32)sizeof(pid_t);
+    pid_t *heap = (pid_t *)malloc((usize)bytes);
+    if (!heap) return n;
+    got = proc_listpids(PROC_PGRP_ONLY, (uint32_t)pgid, heap, bytes);
+    if (got <= 0) { free(heap); return n; }
+    *out = heap;
+    return got / (i32)sizeof(pid_t);
+}
+#endif
+
+static bool session_find_interesting_pgrp_process(pid_t pgid, pid_t root,
                                                   const char *leader,
                                                   char *out, usize out_cap,
                                                   bool *out_found_agent) {
@@ -501,48 +659,63 @@ static bool session_find_interesting_pgrp_process(pid_t pgid,
     out[0] = '\0';
     if (pgid <= 0) return false;
 
-    if (!session_proc_snapshot()) return false;
-    i32 count = g_proc_snap_n;
+    f64 t0 = session_mono_now();
+    pid_t stack[SESSION_PGRP_STACK];
+    pid_t *members = NULL;
+    i32 count = session_pgrp_members(pgid, root, stack, SESSION_PGRP_STACK, &members);
     char fallback[256] = {0};
+    bool hit = false;
 
-    for (i32 i = 0; i < count; i++) {
-        const SessionProcRow *row = &g_proc_snap[i];
-        if (row->pgid != pgid) continue;
-        /* The snapshot row under the names of proc_pidinfo's fields
-         * (`bi.pbi_name`), which the body below reads. */
-        struct { const char *pbi_name; } bi = { row->name };
-        pid_t pids_i = row->pid;
+    for (i32 i = 0; i < count && !hit; i++) {
+        pid_t pids_i = members[i];
+        if (pids_i <= 0) continue;
+        char name[64];
+#ifdef PLATFORM_MACOS
+        struct proc_bsdinfo bi;
+        if (proc_pidinfo(pids_i, PROC_PIDTBSDINFO, 0, &bi, sizeof bi)
+            != (i32)sizeof bi) continue;
+        /* A member that changed group since the list was taken. */
+        if ((pid_t)bi.pbi_pgid != pgid || !bi.pbi_name[0]) continue;
+        snprintf(name, sizeof name, "%s", bi.pbi_name);
+#else
+        pid_t member_pgid = 0;
+        if (!session_proc_stat(pids_i, name, sizeof name, &member_pgid)) continue;
+        if (member_pgid != pgid || !name[0]) continue;
+#endif
 
-        if (session_proc_name_is_agent(bi.pbi_name)) {
-            snprintf(out, out_cap, "%s", bi.pbi_name);
-            if (out_found_agent) *out_found_agent = true;
-            return true;
-        }
-        /* Versioned native binary (e.g. grok's "grok-0.2.22-macos-aarch64").
-         * Recover the leading agent id before falling through to wrapper/argv. */
-        if (session_proc_name_versioned_agent(bi.pbi_name, out, out_cap)) {
-            if (out_found_agent) *out_found_agent = true;
-            return true;
-        }
-        if (session_proc_name_is_wrapper(bi.pbi_name)) {
+        if (session_proc_name_is_agent(name)) {
+            snprintf(out, out_cap, "%s", name);
+            hit = true;
+        } else if (session_proc_name_versioned_agent(name, out, out_cap)) {
+            /* Versioned native binary (e.g. grok's "grok-0.2.22-macos-aarch64"):
+             * the leading agent id, before wrapper/argv. */
+            hit = true;
+        } else if (session_proc_name_is_wrapper(name)) {
             /* node/bun/python interpreter → inspect its argv for the script. */
-            if (session_proc_argv_agent(pids_i, out, out_cap)) {
-                if (out_found_agent) *out_found_agent = true;
-                return true;
-            }
+            hit = session_proc_argv_agent(pids_i, out, out_cap);
         } else {
             /* Opaque name (e.g. a Bun-compiled CLI re-exec'd as its bare
              * version string, like Claude Code's "2.1.150") → recover the
-             * agent from the executable path before treating it as fallback. */
-            if (session_proc_path_agent(pids_i, out, out_cap)) {
-                if (out_found_agent) *out_found_agent = true;
-                return true;
-            }
-            if (!fallback[0])
-                snprintf(fallback, sizeof fallback, "%s", bi.pbi_name);
+             * agent from the executable path before treating it as fallback.
+             * A retitled process's accounting name is its title, which only
+             * argv carries whole ("Kimi Code"). */
+            hit = session_proc_path_agent(pids_i, out, out_cap);
+#ifdef PLATFORM_LINUX
+            if (!hit) hit = session_proc_argv_agent(pids_i, out, out_cap);
+#endif
+            if (!hit && !fallback[0])
+                snprintf(fallback, sizeof fallback, "%s", name);
         }
     }
+    if (members != stack) free(members);
+    g_proc_scan_count++;
+    g_proc_scan_secs += session_mono_now() - t0;
 
+    if (hit) {
+        if (out_found_agent) *out_found_agent = true;
+        return true;
+    }
+    out[0] = '\0';
     if (fallback[0]) {
         snprintf(out, out_cap, "%s", fallback);
         return true;
@@ -553,9 +726,29 @@ static bool session_find_interesting_pgrp_process(pid_t pgid,
     }
     return false;
 }
-#else  /* !PLATFORM_MACOS */
 
-/* The snapshot only exists on the macOS process-probing path. */
+#ifdef LIU_AGENT_ARGV_PROBE
+bool session_pgrp_probe_for_bench(i32 pgid, const char *leader,
+                                  char *out, usize out_cap, bool *found_agent) {
+    return session_find_interesting_pgrp_process((pid_t)pgid, 0, leader, out, out_cap,
+                                                 found_agent);
+}
+#endif
+
+#ifdef PLATFORM_LINUX
+/* An interactive shell's accounting name. A pane whose own shell leads the
+ * foreground group is at its prompt: with job control every command it runs
+ * gets a group of its own, so there is nobody else in this one to look for. */
+static bool session_proc_name_is_shell(const char *name) {
+    static const char *const shells[] = { "zsh", "bash", "fish", "sh", "dash", "ksh", "tcsh" };
+    for (usize i = 0; i < sizeof shells / sizeof shells[0]; i++)
+        if (strcmp(name, shells[i]) == 0) return true;
+    return false;
+}
+#endif
+#else  /* neither macOS nor Linux */
+
+/* Group lookups exist only where processes are probed. */
 void session_proc_scan_stats(u64 *out_sweeps, f64 *out_seconds);
 void session_proc_scan_stats(u64 *out_sweeps, f64 *out_seconds) {
     if (out_sweeps)  *out_sweeps  = 0;
@@ -586,6 +779,9 @@ void session_proc_scan_stats(u64 *out_sweeps, f64 *out_seconds) {
 #include "ssh/port_forward.h"
 #include "ssh/sftp.h"          /* sftp_io_yield / sftp_io_breathe live here */
 #include "ssh/streamlocal_open.h" /* a Unix-socket forward's channel open */
+#include "ssh/streamlocal_sched.h" /* whose open is next, and how many connections a rule holds */
+#include "ssh/socket_owner.h"    /* which socket file a forward bound, and the exit sweep */
+#include "ssh/forward_keep.h"    /* the dialog's rules, kept for the next connection */
 #include "ssh/auth_second_factor.h" /* a key plus a code: the second step */
 #include "ssh/relay_watch.h"     /* when a relay's socket wakes the loop */
 #include "ssh/link_sees.h"       /* a server prompt waiting on the user is not a failure */
@@ -840,12 +1036,22 @@ typedef struct {
 typedef SocketChannelRelay RemoteForwardConn;
 
 typedef struct {
-    int                listen_fd;
-    int                pending_fd;   /* accepted; its channel is still opening */
-    char               local_socket[512];
-    char               remote_socket[512];
-    SocketChannelRelay relay;
+    int                 listen_fd;
+    bool                listen_watched;               /* the loop is woken for it (only while it has room) */
+    int                 pending_fd[SLS_PENDING_CAP];  /* accepted, their channel still to open; oldest first */
+    f64                 pending_at[SLS_PENDING_CAP];  /* when each was accepted */
+    i32                 pending_n;
+    char                local_socket[512];
+    char                remote_socket[512];
+    SockIdent           local_ident;                  /* the socket file this forward bound (ssh/socket_owner.h) */
+    SocketChannelRelay *relay[SLS_RELAY_CAP];         /* an open connection each; heap, NULL = free */
 } StreamLocalRuntime;
+
+/* A session's Unix-socket rules and the order they take channel opens in. */
+typedef struct {
+    StreamLocalRuntime rule[SLS_RULES];
+    StreamSched        sched;
+} StreamLocalSet;
 
 #define MAX_REMOTE_LISTENERS  MAX_PORT_FORWARDS
 #define MAX_REMOTE_FWD_CONNS  64
@@ -971,7 +1177,7 @@ struct Session {
     atomic_bool     agent_active;
 
     /* StreamLocal forwarding */
-    StreamLocalRuntime *stream_fwds;     /* heap [4], main-thread polled */
+    StreamLocalSet *stream_fwds;         /* heap, main-thread polled */
     i32             stream_fwd_count;
     bool            stream_fwd_active;
     /* The config's LocalForward lines were started on this connection
@@ -1009,6 +1215,10 @@ struct Session {
     LinkState       link;
     char            link_reason[256];   /* why the link last went down, kept across the reconnect */
     char            auth_refused[256];  /* the server's refusal of the last credential offered (connect worker) */
+    const char     *auth_asked;         /* session_auth_asked(): a literal, under status_lock */
+    bool            auth_dismissed;     /* the person dismissed Liu's password dialog (connect worker) */
+    char            asked_password[256]; /* typed into Liu's password dialog and taken: the connect
+                                          * worker's alone (a reconnect offers it again); scrubbed on destroy */
 
     /* Workers keep cached SFTP handles alive via the suspend count. Each
      * libssh2 call owns io_lock; SFTP operation state additionally remains
@@ -1070,6 +1280,7 @@ struct Session {
     bool            auth_peer_is_target;    /* false while a jump host is being authenticated to */
     char            kbi_name[256];
     char            kbi_instruction[512];
+    bool            kbi_liu;                /* the question is Liu's own (a password it asks for), not the server's */
     i32             kbi_num_prompts;
     char          (*kbi_prompts)[256];     /* heap [KBI_MAX_PROMPTS][256] */
     bool            kbi_echo[KBI_MAX_PROMPTS];
@@ -1278,6 +1489,24 @@ static void connect_fd_forget(Session *s, int fd) {
     pthread_mutex_unlock(&s->status_lock);
 }
 
+/* The moment a connect worker is about to publish a question (a host key, the
+ * server's prompts, a password) and wait for the answer: past its last look at
+ * the cancel flag, before the lock. A build may name a function to run there
+ * (SSH_PROMPT_SEAM_FN); nothing runs by default. */
+#ifdef SSH_PROMPT_SEAM_FN
+void SSH_PROMPT_SEAM_FN(void *session);
+#define SSH_PROMPT_SEAM(s) SSH_PROMPT_SEAM_FN(s)
+#else
+#define SSH_PROMPT_SEAM(s) ((void)(s))
+#endif
+
+/* A question the worker waits on ends when it is answered or when the connect
+ * is being stopped. ssh_connect_worker_stop sets the flag before it wakes the
+ * waits, so a wait that begins after that wake finds the flag instead. */
+static bool ssh_connect_cancelled(Session *s) {
+    return atomic_load_explicit(&s->connect_cancel, memory_order_acquire);
+}
+
 static void connect_fds_clear(Session *s) {
     pthread_mutex_lock(&s->status_lock);
     s->connect_fd_count = 0;
@@ -1416,6 +1645,7 @@ static LIBSSH2_USERAUTH_KBDINT_RESPONSE_FUNC(ssh_kbdint_callback) {
 
     /* Multi-prompt / OTP / 2FA path: store prompts in Session, set
      * SESSION_KBI_PENDING, and block until the UI fills in responses. */
+    SSH_PROMPT_SEAM(s);
     pthread_mutex_lock(&s->kbi_lock);
 
     /* Name, instruction and prompts are the SERVER's words, drawn in a Liu
@@ -1424,6 +1654,7 @@ static LIBSSH2_USERAUTH_KBDINT_RESPONSE_FUNC(ssh_kbdint_callback) {
     kbi_text_copy(s->kbi_name, sizeof s->kbi_name, name, name_len);
     kbi_text_copy(s->kbi_instruction, sizeof s->kbi_instruction, instruction, instruction_len);
     snprintf(s->kbi_peer, sizeof s->kbi_peer, "%s", s->auth_peer);
+    s->kbi_liu = false;
 
     i32 count = (num_prompts > KBI_MAX_PROMPTS) ? KBI_MAX_PROMPTS : num_prompts;
     s->kbi_num_prompts = count;
@@ -1465,7 +1696,7 @@ static LIBSSH2_USERAUTH_KBDINT_RESPONSE_FUNC(ssh_kbdint_callback) {
     session_notify_main();
 
     /* Block until UI thread calls session_kbi_submit() */
-    while (!s->kbi_ready) {
+    while (!s->kbi_ready && !ssh_connect_cancelled(s)) {
         pthread_cond_wait(&s->kbi_cond, &s->kbi_lock);
     }
 
@@ -1487,14 +1718,131 @@ static LIBSSH2_USERAUTH_KBDINT_RESPONSE_FUNC(ssh_kbdint_callback) {
             responses[i].length = 0;
         }
     }
+    /* The answers (a password, a one-time code) live on only in libssh2's
+     * copies, for as long as it takes to send them. */
+    secure_zero(s->kbi_responses, (usize)KBI_MAX_PROMPTS * sizeof(*s->kbi_responses));
 
     pthread_mutex_unlock(&s->kbi_lock);
 }
 
+static void ssh_auth_asked_set(Session *s, const char *how) {
+    pthread_mutex_lock(&s->status_lock);
+    s->auth_asked = how;
+    pthread_mutex_unlock(&s->status_lock);
+}
+
+const char *session_auth_asked(Session *s) {
+    if (!s || s->type != SESSION_SSH) return "";
+    pthread_mutex_lock(&s->status_lock);
+    const char *how = s->auth_asked ? s->auth_asked : "";
+    pthread_mutex_unlock(&s->status_lock);
+    return how;
+}
+
+/* One password asked of the person through the prompt dialog the server's
+ * questions use, marked as Liu's own so the dialog names it so. `note` is the
+ * line above the field. False when it was dismissed or left empty, or the
+ * connect is being stopped. Blocks the connect worker until answered. */
+static bool ssh_ask_password_dialog(Session *s, const char *note, char *out, usize cap) {
+    out[0] = '\0';
+    SSH_PROMPT_SEAM(s);
+    pthread_mutex_lock(&s->kbi_lock);
+    if (!s->kbi_prompts) s->kbi_prompts = calloc(KBI_MAX_PROMPTS, sizeof(*s->kbi_prompts));
+    if (!s->kbi_responses) s->kbi_responses = calloc(KBI_MAX_PROMPTS, sizeof(*s->kbi_responses));
+    if (!s->kbi_prompts || !s->kbi_responses) {
+        pthread_mutex_unlock(&s->kbi_lock);
+        return false;
+    }
+    s->kbi_name[0] = '\0';
+    snprintf(s->kbi_instruction, sizeof s->kbi_instruction, "%s", note ? note : "");
+    snprintf(s->kbi_peer, sizeof s->kbi_peer, "%s", s->auth_peer);
+    s->kbi_liu = true;
+    snprintf(s->kbi_prompts[0], sizeof s->kbi_prompts[0], "Password:");
+    s->kbi_echo[0] = false;
+    s->kbi_responses[0][0] = '\0';
+    s->kbi_num_prompts = 1;
+    s->kbi_ready = false;
+
+    pthread_mutex_lock(&s->status_lock);
+    s->status = SESSION_KBI_PENDING;
+    pthread_mutex_unlock(&s->status_lock);
+    session_notify_main();
+    while (!s->kbi_ready && !ssh_connect_cancelled(s))
+        pthread_cond_wait(&s->kbi_cond, &s->kbi_lock);
+    pthread_mutex_lock(&s->status_lock);
+    s->status = SESSION_AUTHENTICATING;
+    pthread_mutex_unlock(&s->status_lock);
+
+    snprintf(out, cap, "%s", s->kbi_responses[0]);
+    secure_zero(s->kbi_responses[0], sizeof s->kbi_responses[0]);
+    s->kbi_liu = false;
+    pthread_mutex_unlock(&s->kbi_lock);
+    if (ssh_connect_cancelled(s)) {
+        secure_zero(out, cap);
+        return false;
+    }
+    return out[0] != '\0';
+}
+
+/* The password method with what the person types, up to three times as ssh
+ * allows. `refused`: a password was already turned down, and the dialog says
+ * so. What got in is kept for this session's reconnects. */
+static int ssh_auth_ask_password(Session *s, const SSHConfig *config, bool refused) {
+    int rc = -1;
+    for (int tries = 0; tries < 3; tries++) {
+        char pw[256];
+        const char *note = (refused || tries) ? "That password was not accepted." : "";
+        if (!ssh_ask_password_dialog(s, note, pw, sizeof pw)) {
+            s->auth_dismissed = true;
+            return -1;
+        }
+        rc = libssh2_userauth_password(s->ssh_session, config->username, pw);
+        if (rc == 0) {
+            snprintf(s->asked_password, sizeof s->asked_password, "%s", pw);
+            ssh_auth_asked_set(s, "password");
+        }
+        secure_zero(pw, sizeof pw);
+        if (rc != LIBSSH2_ERROR_AUTHENTICATION_FAILED) break;
+    }
+    return rc;
+}
+
+/* Nothing Liu offered got in and it was given no password
+ * (SSHConfig.ask_password): ask the person what the server takes
+ * (ssh/auth_second_factor.h ssh_auth_ask_for). A password asked for on an
+ * earlier connect of this session is offered first. `offered`: the server's
+ * list of methods. */
+static int ssh_auth_ask(Session *s, const SSHConfig *config, const char *offered, int auth_rc) {
+    switch (ssh_auth_ask_for(offered)) {
+    case SSH_ASK_SERVER_PROMPT: {
+        ssh_wait_unbounded(s->ssh_session);    /* a person is answering */
+        int rc = libssh2_userauth_keyboard_interactive(s->ssh_session, config->username,
+                                                       &ssh_kbdint_callback);
+        if (rc == 0) ssh_auth_asked_set(s, "password");
+        return rc;
+    }
+    case SSH_ASK_PASSWORD:
+        if (s->asked_password[0]) {
+            if (libssh2_userauth_password(s->ssh_session, config->username, s->asked_password) == 0) {
+                ssh_auth_asked_set(s, "password");
+                return 0;
+            }
+            secure_zero(s->asked_password, sizeof s->asked_password);
+            return ssh_auth_ask_password(s, config, true);
+        }
+        return ssh_auth_ask_password(s, config, false);
+    case SSH_ASK_NOTHING:
+        break;
+    }
+    return auth_rc;
+}
+
 /* The key was taken but the server wants a second step (ssh/auth_second_factor.h):
  * ask what it still accepts and give it that — its own prompt through the
- * keyboard-interactive dialog, or the stored password. Returns libssh2's
- * answer, or the failure it was called with when nothing is left to try. */
+ * keyboard-interactive dialog, or the stored password. When the key was not
+ * one named for the host and no password was given, the person is asked
+ * (ssh_auth_ask). Returns libssh2's answer, or the failure it was called with
+ * when nothing is left to try. */
 static int ssh_auth_second_step(Session *s, const SSHConfig *config, int auth_rc) {
     s->auth_refused[0] = '\0';
     if (auth_rc == 0 || libssh2_userauth_authenticated(s->ssh_session)) return 0;
@@ -1515,6 +1863,8 @@ static int ssh_auth_second_step(Session *s, const SSHConfig *config, int auth_rc
     case SSH_SECOND_FACTOR_NONE:
         break;
     }
+    if (config->ask_password && !config->password[0] && !libssh2_userauth_authenticated(s->ssh_session))
+        return ssh_auth_ask(s, config, rest, auth_rc);
     return auth_rc;
 }
 
@@ -1578,6 +1928,7 @@ static int ssh_verify_hostkey_for(Session *s, LIBSSH2_SESSION *ssh,
     if (hk == HOST_KEY_CHANGED) {
         /* Host key has changed — present dialog to user.
          * The worker thread blocks on hostkey_cond until the UI responds. */
+        SSH_PROMPT_SEAM(s);
         pthread_mutex_lock(&s->hostkey_lock);
         s->hostkey_is_change = true;
         snprintf(s->hostkey_new_fp, sizeof(s->hostkey_new_fp), "%s", fp);
@@ -1589,9 +1940,10 @@ static int ssh_verify_hostkey_for(Session *s, LIBSSH2_SESSION *ssh,
         session_notify_main();     /* the dialog is raised by the loop's scan */
 
         /* Wait for UI thread to signal a decision */
-        while (s->hostkey_pending) {
+        while (s->hostkey_pending && !ssh_connect_cancelled(s)) {
             pthread_cond_wait(&s->hostkey_cond, &s->hostkey_lock);
         }
+        s->hostkey_pending = false;
         bool accepted = s->hostkey_accepted;
         pthread_mutex_unlock(&s->hostkey_lock);
 
@@ -1616,6 +1968,7 @@ static int ssh_verify_hostkey_for(Session *s, LIBSSH2_SESSION *ssh,
     }
 
     /* HOST_KEY_NEW — ask user to trust via GUI dialog */
+    SSH_PROMPT_SEAM(s);
     pthread_mutex_lock(&s->hostkey_lock);
     s->hostkey_is_change = false;
     snprintf(s->hostkey_new_fp, sizeof(s->hostkey_new_fp), "%s", fp);
@@ -1626,9 +1979,10 @@ static int ssh_verify_hostkey_for(Session *s, LIBSSH2_SESSION *ssh,
     s->hostkey_accepted = false;
     session_notify_main();
 
-    while (s->hostkey_pending) {
+    while (s->hostkey_pending && !ssh_connect_cancelled(s)) {
         pthread_cond_wait(&s->hostkey_cond, &s->hostkey_lock);
     }
+    s->hostkey_pending = false;
     bool accepted = s->hostkey_accepted;
     pthread_mutex_unlock(&s->hostkey_lock);
 
@@ -1669,7 +2023,20 @@ static void ssh_offer_algorithms(LIBSSH2_SESSION *ssh, const char *host, i32 por
     known_hosts_stored_kinds(ssh, host, port, stored);
     if (ssh_algs_hostkey_list(stored, legacy, list, sizeof list))
         (void)libssh2_session_method_pref(ssh, LIBSSH2_METHOD_HOSTKEY, list);
-    if (ssh_algs_list(SSH_ALGS_KEX, SSH_ALGS_KEX_LEGACY, legacy, list, sizeof list))
+    /* The markers first, where the running library does not add them
+     * itself: the library is the system's on Linux, not the one built
+     * against. */
+    unsigned long have = 0;
+    const char *vs = libssh2_version(0);
+    if (vs) {
+        unsigned long maj = 0, min = 0, pat = 0;
+        if (sscanf(vs, "%lu.%lu.%lu", &maj, &min, &pat) >= 2) have = (maj << 16) | (min << 8) | pat;
+    }
+    list[0] = '\0';
+    char kex[sizeof list];
+    if (ssh_algs_list(SSH_ALGS_KEX, SSH_ALGS_KEX_LEGACY, legacy, kex, sizeof kex) &&
+        ssh_algs_append(list, sizeof list, ssh_algs_kex_markers(have)) &&
+        ssh_algs_append(list, sizeof list, kex))
         (void)libssh2_session_method_pref(ssh, LIBSSH2_METHOD_KEX, list);
     if (ssh_algs_list(SSH_ALGS_CIPHER, SSH_ALGS_CIPHER_LEGACY, legacy, list, sizeof list)) {
         (void)libssh2_session_method_pref(ssh, LIBSSH2_METHOD_CRYPT_CS, list);
@@ -1813,7 +2180,7 @@ static const char *liu_helper_bin_dir(void) {
                 (st.st_mode & (S_IWGRP | S_IWOTH)) != 0) return NULL;
     }
 
-    const char *exe_dir = liu_executable_dir();
+    const char *exe_dir = liu_helper_exe_dir();
     if (!exe_dir || !exe_dir[0]) return NULL;
 
     /* Every helper Liu ships. Missing ones are skipped rather than failing the
@@ -3098,6 +3465,7 @@ static int ssh_do_connect(Session *s) {
 
     int auth_rc = -1;
     s->auth_refused[0] = '\0';
+    s->auth_dismissed = false;
 
     /* GSSAPI: when gssapi_auth flag is set OR auth_method is AUTH_GSSAPI,
      * try methods in order: agent -> keyboard-interactive (GSSAPI fallback)
@@ -3164,24 +3532,36 @@ static int ssh_do_connect(Session *s) {
     } else {
         /* Standard auth paths */
         switch (config->auth_method) {
-        case AUTH_PASSWORD:
-            /* Attempt password auth if a password is set; then always fall
-             * back to keyboard-interactive on failure. The fallback is
-             * unconditional so that a Recent-row reconnect with an empty
-             * password field still gets a KBI prompt callback fired, which
-             * the UI layer maps to the kbi_dialog overlay. */
-            if (config->password[0]) {
+        case AUTH_PASSWORD: {
+            /* The password given (the form, a vault secret) or, on a
+             * reconnect, the one the person was asked for; then the server's
+             * own prompt (keyboard-interactive), tried even with no password
+             * so a host that asks its own question gets the dialog; then,
+             * where the server takes passwords but asks nothing itself (no
+             * keyboard-interactive on its list), Liu's password dialog. */
+            const char *pw = config->password[0] ? config->password : s->asked_password;
+            bool refused = false;
+            if (pw[0]) {
                 auth_rc = libssh2_userauth_password(s->ssh_session,
-                                                    config->username,
-                                                    config->password);
+                                                    config->username, pw);
+                refused = auth_rc != 0;
+                if (auth_rc == 0 && pw == s->asked_password) ssh_auth_asked_set(s, "password");
             } else {
                 auth_rc = -1;  /* force KBI path */
             }
             if (auth_rc != 0) {
                 auth_rc = libssh2_userauth_keyboard_interactive(
                     s->ssh_session, config->username, &ssh_kbdint_callback);
+                if (auth_rc == 0 && !config->password[0]) ssh_auth_asked_set(s, "password");
+            }
+            if (auth_rc != 0 && !libssh2_userauth_authenticated(s->ssh_session) &&
+                ssh_auth_ask_for(auth_list) == SSH_ASK_PASSWORD) {
+                if (refused && pw == s->asked_password)
+                    secure_zero(s->asked_password, sizeof s->asked_password);
+                auth_rc = ssh_auth_ask_password(s, config, refused);
             }
             break;
+        }
         case AUTH_PUBLICKEY: {
             char pub_path[520];
             snprintf(pub_path, sizeof(pub_path), "%s.pub", config->key_path);
@@ -3330,7 +3710,10 @@ static int ssh_do_connect(Session *s) {
     if (auth_rc != 0) {
         char *errmsg = NULL;
         libssh2_session_last_error(s->ssh_session, &errmsg, NULL, 0);
-        set_error(s, errmsg && errmsg[0] ? errmsg :
+        /* A password dialog the person dismissed is why, whatever libssh2
+         * said of the attempt before it. */
+        set_error(s, s->auth_dismissed ? "No password was given" :
+                     errmsg && errmsg[0] ? errmsg :
                      s->auth_refused[0] ? s->auth_refused : "Authentication failed");
         return -1;
     }
@@ -3548,6 +3931,15 @@ static void *ssh_connect_worker(void *arg) {
  * allows each call. */
 #define SSH_SHARED_CALL_TIMEOUT_MS 8000
 
+/* libssh2 carries one channel open per session and continues it whatever the
+ * next call asks for. A pane joining a shared connection reserves it and waits
+ * this long for an open already in flight on it (a forward's) to end before it
+ * opens its channels; past that it connects on its own. */
+#define SSH_SHARED_OPEN_WAIT_MS 4000
+/* The longest a pane that leaves a shared connection waits for its forwards' open
+ * in flight to answer. */
+#define SSH_SETTLE_OPEN_MS 2000
+
 typedef struct { LIBSSH2_SESSION *ssh; long timeout; } SharedBlocking;
 
 /* Blocking mode and a short bound for the next calls on a shared connection.
@@ -3629,6 +4021,29 @@ static int ssh_do_reuse_connect(Session *s) {
         pthread_mutex_unlock(&owner->io_lock);
         return -1;
     }
+    /* A forward's channel open may be in flight on this connection (a connection
+     * to a slow target): the channel opened below would be handed ITS channel,
+     * and the forward's connection would lose it. Reserved first, so nothing new
+     * starts, and the lock is let go while the open that is there ends. */
+    forward_open_reserve(ssh, true);
+    for (f64 give_up = platform_time_sec() + SSH_SHARED_OPEN_WAIT_MS / 1000.0;
+         !forward_open_idle(ssh);) {
+        if (atomic_load_explicit(&s->connect_cancel, memory_order_acquire) ||
+            platform_time_sec() > give_up) {
+            forward_open_reserve(ssh, false);
+            pthread_mutex_unlock(&owner->io_lock);
+            return -1;
+        }
+        pthread_mutex_unlock(&owner->io_lock);
+        struct timespec nap = { 0, 10 * 1000 * 1000 };
+        nanosleep(&nap, NULL);
+        pthread_mutex_lock(&owner->io_lock);
+        if (owner->ssh_session != ssh) {
+            forward_open_reserve(ssh, false);
+            pthread_mutex_unlock(&owner->io_lock);
+            return -1;
+        }
+    }
     SharedBlocking blk;
     shared_blocking_begin(&blk, ssh);
 
@@ -3687,6 +4102,7 @@ done:
         s->sock = -1;
     }
     shared_blocking_end(&blk);
+    forward_open_reserve(ssh, false);
     pthread_mutex_unlock(&owner->io_lock);
     if (rc == 0) {
         pthread_mutex_lock(&s->status_lock);
@@ -4063,6 +4479,7 @@ static void session_destroy_final(Session *s) {
         free(s->kbi_responses);
         s->kbi_responses = NULL;
     }
+    secure_zero(s->asked_password, sizeof s->asked_password);
     free(s->kbi_prompts);
     s->kbi_prompts = NULL;
     free(s->initial_cwd);
@@ -4123,6 +4540,10 @@ void session_release(Session *s) {
     }
 }
 
+#ifndef PLATFORM_WIN32
+static bool session_streamlocal_settle(Session *s);
+#endif
+
 /* The owner's pane is leaving, but other sessions still use its connection
  * (ControlMaster): end what belongs to the pane — its forwards, X11, shell
  * channel and SFTP handle — and keep the libssh2 session, the socket and the io
@@ -4136,6 +4557,12 @@ static void session_retire_pane(Session *s) {
     if (ssh) {
         SharedBlocking blk;
         shared_blocking_begin(&blk, ssh);
+        /* What the forwards have in flight on the connection is finished before
+         * they are dropped: the connection stays, and so would the open. */
+#ifndef PLATFORM_WIN32
+        bool stream_open_left = session_streamlocal_settle(s);
+#endif
+        forward_open_settle(ssh);
         session_stop_stream_forwards(s);
         if (s->x11_relays) {
             for (i32 i = 0; i < s->x11_relay_count; i++)
@@ -4143,7 +4570,10 @@ static void session_retire_pane(Session *s) {
         }
         x11_pending_cleanup(s);
         remote_forward_cleanup_all(s);
-        forward_cleanup(ssh);
+        forward_cleanup_pane(ssh);
+#ifndef PLATFORM_WIN32
+        if (stream_open_left) forward_open_carry(ssh);
+#endif
         shared_blocking_end(&blk);
     }
     pthread_mutex_unlock(&s->io_lock);
@@ -5541,6 +5971,15 @@ i32 session_fg_pid(Session *s) {
     return fg > 0 ? (i32)fg : -1;
 }
 
+i32 session_fg_pid_cached(Session *s) {
+    if (!s || s->type != SESSION_LOCAL || s->status != SESSION_CONNECTED) return -1;
+    if (s->pty_master < 0) return -1;
+    if (!local_reader_requests(s)) return session_fg_pid(s);
+    i32 pg = pty_reader_fg_pgid(s->reader);
+    if (pg == 0) return session_fg_pid(s);      /* never sampled yet: ask, this once */
+    return pg > 0 ? pg : -1;
+}
+
 /* ---- background jobs behind the prompt ----------------------------------
  *
  * session_fg_pid() vs session_shell_pgid() answers "does a job own the
@@ -5669,6 +6108,15 @@ void session_invalidate_fg_cache(Session *s) {
 }
 
 const char *session_fg_process_cached(Session *s) {
+#ifdef PLATFORM_LINUX
+    /* At a shell prompt Linux's lookup is two small /proc reads (the shell's
+     * own group is not swept), and session_fg_process keeps its answer for the
+     * TTL: as cheap as the cache, and never stale. The cache is refreshed only
+     * by the agent probes, which on a slow or busy machine come less often
+     * than its 0.6 s lifetime: a shell read as nothing switched the suggestion
+     * off in the middle of a word. */
+    return session_fg_process(s);
+#else
     if (!s || s->type != SESSION_LOCAL || s->status != SESSION_CONNECTED ||
         s->fg_cache_at <= 0 || !s->fg_cache[0]) return "";
     pid_t fg = local_fg_pgrp(s);
@@ -5678,6 +6126,7 @@ const char *session_fg_process_cached(Session *s) {
     f64 now = (f64)ts.tv_sec + (f64)ts.tv_nsec / 1e9;
     f64 ttl = s->fg_cache_ttl > 0 ? s->fg_cache_ttl : SESSION_FG_TTL_BASE;
     return now - s->fg_cache_at < ttl ? s->fg_cache : "";
+#endif
 }
 
 const char *session_fg_process(Session *s) {
@@ -5751,28 +6200,48 @@ const char *session_fg_process(Session *s) {
              * get a title. */
             char leader[256] = {0};
             proc_name(fg, leader, sizeof leader);
-            (void)session_find_interesting_pgrp_process(fg, leader,
+            (void)session_find_interesting_pgrp_process(fg, (pid_t)s->child_pid, leader,
                                                         s->fg_cache, sizeof s->fg_cache,
                                                         &found_agent);
         }
     }
 #elif defined(PLATFORM_LINUX)
     if (fg > 0) {
-        char path[64];
-        snprintf(path, sizeof(path), "/proc/%d/comm", fg);
-        FILE *f = fopen(path, "r");
-        if (f) {
-            if (fgets(s->fg_cache, sizeof s->fg_cache, f)) {
-                char *nl = strchr(s->fg_cache, '\n');
-                if (nl) *nl = '\0';
+        /* The same rungs as macOS, read from /proc. The leader's name is its
+         * comm: a script's own name until it execs its interpreter, then the
+         * interpreter's ("node", "python3") or the title it set itself. */
+        char leader[64] = {0};
+        pid_t leader_pgid = 0;
+        if (session_proc_stat(fg, leader, sizeof leader, &leader_pgid) && leader[0]) {
+            char picked[64] = {0};
+            if (session_proc_name_is_agent(leader)) {
+                snprintf(s->fg_cache, sizeof s->fg_cache, "%s", leader);
+                found_agent = true;
+            } else if (session_proc_name_versioned_agent(leader, picked, sizeof picked)) {
+                snprintf(s->fg_cache, sizeof s->fg_cache, "%s", picked);
+                found_agent = true;
+            } else if (!session_proc_name_is_wrapper(leader) &&
+                       session_proc_path_agent(fg, picked, sizeof picked)) {
+                snprintf(s->fg_cache, sizeof s->fg_cache, "%s", picked);
+                found_agent = true;
+            } else if (session_proc_argv_agent(fg, picked, sizeof picked)) {
+                snprintf(s->fg_cache, sizeof s->fg_cache, "%s", picked);
+                found_agent = true;
             }
-            fclose(f);
+        }
+        if (s->fg_cache[0] == '\0') {
+            if (fg == s->child_pid && session_proc_name_is_shell(leader))
+                snprintf(s->fg_cache, sizeof s->fg_cache, "%s", leader);
+            else
+                (void)session_find_interesting_pgrp_process(fg, (pid_t)s->child_pid, leader,
+                                                            s->fg_cache, sizeof s->fg_cache,
+                                                            &found_agent);
         }
     }
 #endif
-#ifdef PLATFORM_MACOS
-    /* Backoff is a macOS concern: only that path can fall into the full-system
-     * pid sweep. Linux reads one /proc/<pid>/comm — nothing worth deferring.
+#if defined(PLATFORM_MACOS) || defined(PLATFORM_LINUX)
+    /* Backoff: a lookup that finds no agent can fall into the group sweep
+     * (every pid on macOS, every /proc/<pid>/stat on Linux).
      *
      * An agent answer is worth re-checking often: it can exit within its own
      * process group (the pgid alone would not show it). A no-agent answer for a
@@ -6449,6 +6918,14 @@ bool session_kbi_echo(Session *s, i32 index) {
     return s->kbi_echo[index];
 }
 
+bool session_kbi_is_liu(Session *s) {
+    if (!s || s->type != SESSION_SSH) return false;
+    pthread_mutex_lock(&s->kbi_lock);
+    bool liu = s->kbi_liu;
+    pthread_mutex_unlock(&s->kbi_lock);
+    return liu;
+}
+
 void session_kbi_submit(Session *s, const char **responses, i32 count) {
     if (!s || s->type != SESSION_SSH || count < 0 ||
         (count > 0 && !responses)) return;
@@ -6473,6 +6950,13 @@ void session_kbi_submit(Session *s, const char **responses, i32 count) {
         }
     }
     s->kbi_ready = true;
+    /* Answered: the question is no longer pending, said under the lock the
+     * loop reads it through. Left to the connect worker, the loop could see it
+     * still pending before the worker woke and open the dialog again, empty,
+     * over a session that then logged in. */
+    pthread_mutex_lock(&s->status_lock);
+    if (s->status == SESSION_KBI_PENDING) s->status = SESSION_AUTHENTICATING;
+    pthread_mutex_unlock(&s->status_lock);
     pthread_cond_signal(&s->kbi_cond);
     pthread_mutex_unlock(&s->kbi_lock);
 }
@@ -6523,6 +7007,13 @@ bool session_dynamic_forward_start(Session *s, i32 local_port) {
     if (!s->ssh_session) return false;
     if (pthread_mutex_trylock(&ssh_connection_owner(s)->io_lock) != 0) return false;
     bool ok = forward_add_socks5(s->ssh_session, local_port) >= 0;
+    /* Kept like the dialog's local forwards (session_local_forward_start):
+     * a reconnect puts the proxy back. */
+    if (ok && s->config &&
+        forward_keep_may_add(s->config->socks_forwards, s->config->socks_forward_count, local_port)) {
+        PortForwardSpec *p = ssh_config_push_socks_forward(s->config);
+        if (p) p->bind_port = local_port;
+    }
     pthread_mutex_unlock(&ssh_connection_owner(s)->io_lock);
     return ok;
 }
@@ -6579,19 +7070,32 @@ bool session_local_forward_get(Session *s, i32 index, PortForwardInfo *info) {
     return true;
 }
 
-void session_local_forward_remove(Session *s, i32 index) {
-    if (!s || s->type != SESSION_SSH || !s->ssh_session) return;
-    if (pthread_mutex_trylock(&ssh_connection_owner(s)->io_lock) != 0) return;
-    /* A removed forward is not started again by the next reconnect. */
-    ForwardRule rule;
-    if (forward_get(s->ssh_session, index, &rule) && rule.type == FWD_LOCAL && s->config) {
-        i32 at = config_local_forward_index(s->config, rule.local_port);
+/* The rule is no longer one a reconnect puts back. */
+static void config_forward_forget(SSHConfig *c, const ForwardRule *rule) {
+    if (!c) return;
+    if (rule->type == FWD_LOCAL) {
+        i32 at = config_local_forward_index(c, rule->local_port);
         if (at >= 0) {
-            SSHConfig *c = s->config;
             memmove(&c->local_forwards[at], &c->local_forwards[at + 1],
                     (usize)(c->local_forward_count - at - 1) * sizeof c->local_forwards[0]);
             c->local_forward_count--;
         }
+    } else if (rule->type == FWD_DYNAMIC) {
+        (void)forward_keep_drop(c->socks_forwards, &c->socks_forward_count, rule->local_port);
+    }
+}
+
+void session_local_forward_remove(Session *s, i32 index) {
+    if (!s || s->type != SESSION_SSH || !s->ssh_session) return;
+    if (pthread_mutex_trylock(&ssh_connection_owner(s)->io_lock) != 0) return;
+    /* A removed forward is not started again by the next reconnect. The rules
+     * belong to the connection, so the pane that started it may be another one
+     * than the pane the dialog is open on: both forget it. */
+    ForwardRule rule;
+    if (forward_get(s->ssh_session, index, &rule)) {
+        config_forward_forget(s->config, &rule);
+        Session *o = ssh_connection_owner(s);
+        if (o != s) config_forward_forget(o->config, &rule);
     }
     forward_remove(s->ssh_session, index);
     pthread_mutex_unlock(&ssh_connection_owner(s)->io_lock);
@@ -6750,6 +7254,11 @@ static void session_start_config_forwards_locked(Session *s) {
             fprintf(stderr, "liu: LocalForward %d %s:%d not started (is the port taken?)\n",
                     p->bind_port, p->dest_host, p->dest_port);
     }
+    for (i32 i = 0; i < c->socks_forward_count; i++) {
+        if (forward_add_socks5(s->ssh_session, c->socks_forwards[i].bind_port) < 0)
+            fprintf(stderr, "liu: SOCKS proxy on %d not started (is the port taken?)\n",
+                    c->socks_forwards[i].bind_port);
+    }
 #ifndef PLATFORM_WIN32
     if (c->stream_forward_count > 0) session_start_stream_forwards(s);
 #endif
@@ -6863,6 +7372,13 @@ void session_remote_forward_poll(Session *s) {
     if (!session_io_trylock(s)) return;
     session_remote_forward_poll_locked(s);
     session_io_unlock(s);
+}
+
+void session_forward_tick(Session *s) {
+    if (!s || s->type != SESSION_SSH ||
+        session_status(s) != SESSION_CONNECTED || !s->ssh_session) return;
+    (void)session_local_forward_poll(s);
+    session_remote_forward_poll(s);
 }
 
 /* =========================================================================
@@ -7033,6 +7549,11 @@ static bool ssh_config_strings_valid(const SSHConfig *c) {
         if (!memchr(p->bind_host, '\0', sizeof p->bind_host) ||
             !memchr(p->dest_host, '\0', sizeof p->dest_host)) return false;
     }
+    for (i32 i = 0; i < c->socks_forward_count; i++) {
+        const PortForwardSpec *p = &c->socks_forwards[i];
+        if (!memchr(p->bind_host, '\0', sizeof p->bind_host) ||
+            !memchr(p->dest_host, '\0', sizeof p->dest_host)) return false;
+    }
     for (i32 i = 0; i < c->env_count; i++) {
         if (!memchr(c->env[i].name, '\0', sizeof(c->env[i].name)) ||
             !memchr(c->env[i].value, '\0', sizeof(c->env[i].value)))
@@ -7084,6 +7605,16 @@ PortForwardSpec *ssh_config_push_remote_forward(SSHConfig *cfg) {
     return slot;
 }
 
+PortForwardSpec *ssh_config_push_socks_forward(SSHConfig *cfg) {
+    if (!cfg || cfg->socks_forward_count < 0 ||
+        cfg->socks_forward_count == INT32_MAX) return NULL;
+    if (!grow_array((void **)&cfg->socks_forwards, &cfg->socks_forward_cap,
+                    cfg->socks_forward_count + 1, sizeof(PortForwardSpec))) return NULL;
+    PortForwardSpec *slot = &cfg->socks_forwards[cfg->socks_forward_count++];
+    memset(slot, 0, sizeof *slot);
+    return slot;
+}
+
 SSHEnvVar *ssh_config_push_env(SSHConfig *cfg) {
     if (!cfg || cfg->env_count < 0 || cfg->env_count == INT32_MAX) return NULL;
     if (!grow_array((void **)&cfg->env, &cfg->env_cap,
@@ -7105,6 +7636,7 @@ bool ssh_config_clone(SSHConfig *dst, const SSHConfig *src) {
         src->local_forward_count < 0 || src->remote_forward_count < 0 ||
         src->local_forward_count > MAX_PORT_FORWARDS ||
         src->remote_forward_count > MAX_PORT_FORWARDS ||
+        src->socks_forward_count < 0 || src->socks_forward_count > MAX_PORT_FORWARDS ||
         src->env_count < 0 || src->env_count > SSH_CONFIG_MAX_ENV_VARS ||
         src->key_pem_len > SSH_CONFIG_MAX_KEY_PEM ||
         src->auth_method < AUTH_PASSWORD || src->auth_method > AUTH_GSSAPI ||
@@ -7112,6 +7644,7 @@ bool ssh_config_clone(SSHConfig *dst, const SSHConfig *src) {
         (src->proxy_chain_len > 0 && !src->proxy_chain) ||
         (src->local_forward_count > 0 && !src->local_forwards) ||
         (src->remote_forward_count > 0 && !src->remote_forwards) ||
+        (src->socks_forward_count > 0 && !src->socks_forwards) ||
         (src->env_count > 0 && !src->env) ||
         (src->key_pem_len > 0 && !src->key_pem)) {
         return false;
@@ -7126,6 +7659,7 @@ bool ssh_config_clone(SSHConfig *dst, const SSHConfig *src) {
     dst->proxy_chain     = NULL; dst->proxy_chain_cap = 0;
     dst->local_forwards  = NULL; dst->local_forward_cap = 0;
     dst->remote_forwards = NULL; dst->remote_forward_cap = 0;
+    dst->socks_forwards  = NULL; dst->socks_forward_cap = 0;
     dst->env             = NULL; dst->env_cap = 0;
     dst->key_pem         = NULL; dst->key_pem_len = 0;
 
@@ -7152,6 +7686,12 @@ bool ssh_config_clone(SSHConfig *dst, const SSHConfig *src) {
                          src->remote_forward_count,
                          sizeof(*dst->remote_forwards))) goto fail;
         dst->remote_forward_cap = src->remote_forward_count;
+    }
+    if (src->socks_forward_count > 0) {
+        if (!clone_array((void **)&dst->socks_forwards, src->socks_forwards,
+                         src->socks_forward_count,
+                         sizeof(*dst->socks_forwards))) goto fail;
+        dst->socks_forward_cap = src->socks_forward_count;
     }
     if (src->env_count > 0) {
         if (!clone_array((void **)&dst->env, src->env, src->env_count,
@@ -7191,6 +7731,7 @@ void ssh_config_dispose(SSHConfig *cfg) {
     free(cfg->proxy_chain);
     free(cfg->local_forwards);
     free(cfg->remote_forwards);
+    free(cfg->socks_forwards);
     memset(cfg, 0, sizeof *cfg);
 }
 
@@ -7539,9 +8080,50 @@ void session_pool_unregister(Session *s) {
 
 #ifndef PLATFORM_WIN32
 
-/* Create a listening Unix domain socket at the given path.
- * Refuses to unlink anything except a socket owned by this uid. */
-static int create_unix_listener(const char *path) {
+/* The Unix sockets the forwards of this process have bound. Quitting runs
+ * exit(), which does not destroy the panes, so the stop that removes a
+ * forward's socket does not run for the forwards still up at a quit; the sweep
+ * below runs from atexit and removes their files. The lock is because a pane
+ * is destroyed on the tab-trash worker as well as the main thread. */
+static SockRegistry    g_stream_socks;
+static pthread_mutex_t g_stream_socks_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t  g_stream_socks_once = PTHREAD_ONCE_INIT;
+static pid_t           g_stream_socks_pid;
+
+static void stream_socks_sweep_at_exit(void) {
+    /* A forked child that exits without exec (a pane's shell that failed to
+     * start) shares this table: the sockets are the parent's. */
+    if (getpid() != g_stream_socks_pid) return;
+    if (pthread_mutex_trylock(&g_stream_socks_mu) != 0) return;   /* never wait at exit */
+    (void)sock_reg_sweep(&g_stream_socks);
+    pthread_mutex_unlock(&g_stream_socks_mu);
+}
+
+static void stream_socks_register_atexit(void) {
+    g_stream_socks_pid = getpid();
+    atexit(stream_socks_sweep_at_exit);
+}
+
+static void stream_socks_note_bound(const char *path, SockIdent id) {
+    (void)pthread_once(&g_stream_socks_once, stream_socks_register_atexit);
+    pthread_mutex_lock(&g_stream_socks_mu);
+    (void)sock_reg_add(&g_stream_socks, path, id);
+    pthread_mutex_unlock(&g_stream_socks_mu);
+}
+
+/* The forward at `path` ends: its socket goes — when the path is still the
+ * file it bound — and the exit sweep forgets it. */
+static void stream_socks_release(const char *path, const SockIdent *id) {
+    pthread_mutex_lock(&g_stream_socks_mu);
+    sock_reg_forget(&g_stream_socks, path, id);
+    pthread_mutex_unlock(&g_stream_socks_mu);
+    (void)sock_unlink_if_ours(path, id);
+}
+
+/* Create a listening Unix domain socket at the given path, and say which file
+ * it is in `*ident`. Refuses to unlink anything except a socket owned by this
+ * uid. */
+static int create_unix_listener(const char *path, SockIdent *ident) {
     struct sockaddr_un addr;
     if (!path || !path[0] || strlen(path) >= sizeof(addr.sun_path)) return -1;
 
@@ -7565,9 +8147,15 @@ static int create_unix_listener(const char *path) {
         return -1;
     }
 
-    if (chmod(path, 0600) != 0 || listen(fd, 4) < 0) {
+    if (chmod(path, 0600) != 0 || listen(fd, 32) < 0) {
         close(fd);
         unlink(path);
+        return -1;
+    }
+    /* The file as it now is: what the stop and the exit sweep may remove. */
+    SockIdent bound = sock_ident_at(path);
+    if (!bound.valid) {
+        close(fd);
         return -1;
     }
 
@@ -7585,6 +8173,7 @@ static int create_unix_listener(const char *path) {
         return -1;
     }
 
+    if (ident) *ident = bound;
     return fd;
 }
 
@@ -7608,70 +8197,183 @@ static LIBSSH2_CHANNEL *streamlocal_channel_open(LIBSSH2_SESSION *session,
     return ch;
 }
 
+/* The pane that owns the Unix-socket forwards is leaving a connection that goes
+ * on being used: an open of theirs that is in flight is carried to its end here
+ * (the session is in blocking mode, for a short bound) and its channel closed.
+ * libssh2 cannot cancel it, and the next open on the connection — a forward's,
+ * a pane's shell — would be handed it. True when the bound cut it short and it
+ * is still in flight (the caller leaves it to forward_open_carry). */
+static bool session_streamlocal_settle(Session *s) {
+    if (!s || !s->stream_fwds || !s->ssh_session) return false;
+    const StreamSched *sc = &s->stream_fwds->sched;
+    if (sc->inflight < 0 || sc->inflight >= SLS_RULES) return false;
+    long timeout = libssh2_session_get_timeout(s->ssh_session);
+    libssh2_session_set_timeout(s->ssh_session, SSH_SETTLE_OPEN_MS);
+    bool would_block = false;
+    LIBSSH2_CHANNEL *ch = streamlocal_channel_open(
+        s->ssh_session, s->stream_fwds->rule[sc->inflight].remote_socket, &would_block);
+    bool left = !ch && libssh2_session_last_errno(s->ssh_session) == LIBSSH2_ERROR_TIMEOUT;
+    libssh2_session_set_timeout(s->ssh_session, timeout);
+    if (ch) {
+        libssh2_channel_close(ch);
+        libssh2_channel_free(ch);
+    }
+    return left;
+}
+
+/* A connection's end of a Unix-socket forward is a heap relay (32 KB of
+ * buffers): a rule holds several, and most are never needed. */
+static void streamlocal_relay_free(StreamLocalRuntime *rt, i32 j) {
+    socket_channel_relay_close(rt->relay[j]);
+    free(rt->relay[j]);
+    rt->relay[j] = NULL;
+}
+
+/* Takes what waits on a rule's listener, as far as the rule has room. */
+static void streamlocal_accept(StreamLocalSet *set, i32 rule, f64 now) {
+    StreamLocalRuntime *rt = &set->rule[rule];
+    while (rt->listen_fd >= 0 && sls_may_accept(&set->sched, rule)) {
+        int client = accept(rt->listen_fd, NULL, NULL);
+        if (client < 0) break;
+        int flags = fcntl(client, F_GETFL, 0);
+        if (flags < 0 || fcntl(client, F_SETFL, flags | O_NONBLOCK) != 0) {
+            close(client);
+            continue;
+        }
+        flags = fcntl(client, F_GETFD, 0);
+        if (flags < 0 || fcntl(client, F_SETFD, flags | FD_CLOEXEC) != 0) {
+            close(client);
+            continue;
+        }
+#ifdef SO_NOSIGPIPE
+        int one = 1;
+        (void)setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#endif
+        rt->pending_at[rt->pending_n] = now;
+        rt->pending_fd[rt->pending_n++] = client;
+        sls_accepted(&set->sched, rule);
+    }
+}
+
+/* The oldest client of a rule that is waiting for its channel. */
+static int streamlocal_pending_take(StreamLocalRuntime *rt) {
+    if (rt->pending_n <= 0) return -1;
+    int fd = rt->pending_fd[0];
+    rt->pending_n--;
+    for (i32 i = 0; i < rt->pending_n; i++) {
+        rt->pending_fd[i] = rt->pending_fd[i + 1];
+        rt->pending_at[i] = rt->pending_at[i + 1];
+    }
+    rt->pending_fd[rt->pending_n] = -1;
+    return fd;
+}
+
 static void session_streamlocal_poll(Session *s) {
     if (!s || !s->stream_fwd_active || !s->stream_fwds || !s->ssh_session)
         return;
-    /* libssh2 keeps ONE channel open in progress per session, and the next
-     * libssh2_channel_open_ex continues it whatever it is asked for: while one
-     * rule's connection waits for its channel, no other rule takes one. */
-    StreamLocalRuntime *opening = NULL;
-    for (i32 i = 0; i < 4; i++)
-        if (s->stream_fwds[i].pending_fd >= 0) { opening = &s->stream_fwds[i]; break; }
+    StreamLocalSet *set = s->stream_fwds;
+    StreamSched *sc = &set->sched;
+    f64 now = platform_time_sec();
 
-    for (i32 i = 0; i < 4; i++) {
-        StreamLocalRuntime *rt = &s->stream_fwds[i];
-        if (rt->listen_fd < 0) continue;
-        if (rt->relay.active && !socket_channel_relay_poll(&rt->relay))
-            socket_channel_relay_close(&rt->relay);
-        if (rt->relay.active) {                /* one connection per rule at a time */
-            socket_channel_relay_note_more(&rt->relay);
-            continue;
-        }
-
-        if (rt->pending_fd < 0) {
-            if (opening) continue;
-            int client = accept(rt->listen_fd, NULL, NULL);
-            if (client < 0) continue;
-            int flags = fcntl(client, F_GETFL, 0);
-            if (flags < 0 || fcntl(client, F_SETFL, flags | O_NONBLOCK) != 0) {
-                close(client);
-                continue;
+    /* The open connections: each is its own channel and moves on its own. */
+    for (i32 i = 0; i < SLS_RULES; i++) {
+        StreamLocalRuntime *rt = &set->rule[i];
+        for (i32 j = 0; j < SLS_RELAY_CAP; j++) {
+            if (!rt->relay[j]) continue;
+            if (!socket_channel_relay_poll(rt->relay[j])) {
+                streamlocal_relay_free(rt, j);
+                sls_relay_closed(sc, i);
+            } else {
+                socket_channel_relay_note_more(rt->relay[j]);
             }
-            flags = fcntl(client, F_GETFD, 0);
-            if (flags < 0 || fcntl(client, F_SETFD, flags | FD_CLOEXEC) != 0) {
-                close(client);
-                continue;
-            }
-#ifdef SO_NOSIGPIPE
-            int one = 1;
-            (void)setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
-#endif
-            rt->pending_fd = client;
-            opening = rt;
         }
+    }
 
+    /* No client waits longer than SLS_OPEN_SEC for its channel, whichever rule's open is in
+     * the way: behind one the server does not answer the others would hang for ever. */
+    for (i32 i = 0; i < SLS_RULES; i++) {
+        StreamLocalRuntime *rt = &set->rule[i];
+        while (rt->pending_n > 0 && sls_wait_over(rt->pending_at[0], now)) {
+            close(streamlocal_pending_take(rt));
+            sls_gave_up_waiting(sc, i);
+        }
+    }
+
+    for (i32 i = 0; i < SLS_RULES; i++) streamlocal_accept(set, i, now);
+
+    /* The channel opens go ONE AT A TIME, in turn (ssh/streamlocal_sched.h):
+     * libssh2 carries one per session and continues it whatever the next
+     * call asks for, so an open in flight is asked for again with its own
+     * rule's path and nothing else starts until it has answered. */
+    for (i32 turn = 0; turn < SLS_OPENS_PER_POLL; turn++) {
+        /* ...and the TCP / SOCKS forwards (ssh/port_forward.c) share that one
+         * open: while theirs is in flight no Unix-socket open starts, or it
+         * would be handed their channel. */
+        if (sc->inflight < 0 && forward_open_busy(s->ssh_session, set)) break;
+        i32 rule = sls_pick(sc, now);
+        if (rule < 0) break;
+        StreamLocalRuntime *rt = &set->rule[rule];
         bool would_block = false;
         LIBSSH2_CHANNEL *ch = streamlocal_channel_open(s->ssh_session, rt->remote_socket,
                                                        &would_block);
-        StreamlocalOpenStep step = streamlocal_open_step(ch != NULL, would_block);
-        if (step == STREAMLOCAL_OPEN_WAIT) continue;
-        int client = rt->pending_fd;
-        rt->pending_fd = -1;
-        opening = NULL;
-        if (step == STREAMLOCAL_OPEN_FAILED) { close(client); continue; }
+        SlsAction act = sls_step(sc, rule, streamlocal_open_step(ch != NULL, would_block), now);
+        if (act == SLS_WAIT) break;
+        if (act == SLS_ABANDON || act == SLS_DROP_CLIENT) {
+            int client = streamlocal_pending_take(rt);
+            if (client >= 0) close(client);
+            if (act == SLS_ABANDON) break;        /* libssh2 still carries the open */
+            continue;
+        }
+        if (act == SLS_DISCARD) {
+            libssh2_channel_close(ch);
+            libssh2_channel_free(ch);
+            continue;
+        }
+        if (act != SLS_RELAY) continue;
+
+        int client = streamlocal_pending_take(rt);
+        i32 slot = 0;
+        while (slot < SLS_RELAY_CAP && rt->relay[slot]) slot++;
+        SocketChannelRelay *rel = slot < SLS_RELAY_CAP ? calloc(1, sizeof *rel) : NULL;
+        if (!rel || client < 0) {
+            free(rel);
+            if (client >= 0) close(client);
+            libssh2_channel_close(ch);
+            libssh2_channel_free(ch);
+            sls_relay_closed(sc, rule);
+            continue;
+        }
         libssh2_channel_set_blocking(ch, 0);
-        memset(&rt->relay, 0, sizeof rt->relay);
-        rt->relay.channel = ch;
-        rt->relay.fd = client;
-        rt->relay.active = true;
+        rel->channel = ch;
+        rel->fd = client;
+        rel->active = true;
+        rt->relay[slot] = rel;
         /* Moved along at once. The server answers an open with the confirmation,
          * the service's first bytes and often its EOF back to back, and the pass
          * that sees the confirmation may be the one that has already read the
          * rest off the socket (the pane's read comes first): no descriptor
          * announces what libssh2 now holds, so a connection left for the next
          * pass would wait until something else woke the loop. */
-        if (!socket_channel_relay_poll(&rt->relay)) socket_channel_relay_close(&rt->relay);
-        else socket_channel_relay_note_more(&rt->relay);
+        if (!socket_channel_relay_poll(rel)) {
+            streamlocal_relay_free(rt, slot);
+            sls_relay_closed(sc, rule);
+        } else {
+            socket_channel_relay_note_more(rel);
+        }
+    }
+
+    forward_open_hold(s->ssh_session, set, sc->inflight >= 0);
+
+    /* A rule's listener wakes the loop only while the rule would take what is
+     * waiting on it: this pass may have filled it or emptied it. */
+    for (i32 i = 0; i < SLS_RULES; i++) {
+        StreamLocalRuntime *rt = &set->rule[i];
+        if (rt->listen_fd < 0) continue;
+        bool want = sls_wants_listen_watch(sc, i);
+        if (want == rt->listen_watched) continue;
+        if (want) platform_watch_socket(rt->listen_fd);
+        else      platform_unwatch_socket(rt->listen_fd);
+        rt->listen_watched = want;
     }
 }
 
@@ -7685,15 +8387,15 @@ void session_start_stream_forwards(Session *s) {
     if (s->stream_fwd_active) return;
 
 #ifndef PLATFORM_WIN32
-    StreamLocalRuntime *runtimes = calloc(4, sizeof(*runtimes));
+    StreamLocalSet *runtimes = calloc(1, sizeof(*runtimes));
     if (!runtimes) return;
-    for (i32 i = 0; i < 4; i++) {
-        runtimes[i].listen_fd = -1;
-        runtimes[i].pending_fd = -1;
-        runtimes[i].relay.fd = -1;
+    sls_init(&runtimes->sched);
+    for (i32 i = 0; i < SLS_RULES; i++) {
+        runtimes->rule[i].listen_fd = -1;
+        for (i32 j = 0; j < SLS_PENDING_CAP; j++) runtimes->rule[i].pending_fd[j] = -1;
     }
 
-    for (i32 i = 0; i < s->config->stream_forward_count && i < 4; i++) {
+    for (i32 i = 0; i < s->config->stream_forward_count && i < SLS_RULES; i++) {
         const StreamLocalForward *fwd = &s->config->stream_forwards[i];
         usize local_len = strnlen(fwd->local_socket, sizeof(fwd->local_socket));
         usize remote_len = strnlen(fwd->remote_socket, sizeof(fwd->remote_socket));
@@ -7702,16 +8404,19 @@ void session_start_stream_forwards(Session *s) {
 
         if (fwd->is_local_to_remote) {
             /* Listen on local Unix socket, forward to remote */
-            StreamLocalRuntime *rt = &runtimes[i];
+            StreamLocalRuntime *rt = &runtimes->rule[i];
             if (local_len >= sizeof(rt->local_socket) ||
                 remote_len >= sizeof(rt->remote_socket)) continue;
             memcpy(rt->local_socket, fwd->local_socket, local_len + 1);
             memcpy(rt->remote_socket, fwd->remote_socket, remote_len + 1);
 
-            int fd = create_unix_listener(rt->local_socket);
+            int fd = create_unix_listener(rt->local_socket, &rt->local_ident);
             if (fd < 0) continue;
             rt->listen_fd = fd;
+            stream_socks_note_bound(rt->local_socket, rt->local_ident);
             platform_watch_socket(fd);    /* a connection wakes the loop */
+            rt->listen_watched = true;
+            sls_set_listening(&runtimes->sched, i, true);
             s->stream_fwd_count++;
         }
         /* Remote->local forwarding requires libssh2_channel_forward_listen
@@ -7734,25 +8439,29 @@ void session_stop_stream_forwards(Session *s) {
 
 #ifndef PLATFORM_WIN32
     if (s->stream_fwds) {
-        for (i32 i = 0; i < 4; i++) {
-            StreamLocalRuntime *rt = &s->stream_fwds[i];
-            socket_channel_relay_close(&rt->relay);
-            if (rt->pending_fd >= 0) {
-                close(rt->pending_fd);
-                rt->pending_fd = -1;
+        for (i32 i = 0; i < SLS_RULES; i++) {
+            StreamLocalRuntime *rt = &s->stream_fwds->rule[i];
+            for (i32 j = 0; j < SLS_RELAY_CAP; j++)
+                if (rt->relay[j]) streamlocal_relay_free(rt, j);
+            for (i32 j = 0; j < rt->pending_n; j++) {
+                close(rt->pending_fd[j]);
+                rt->pending_fd[j] = -1;
             }
+            rt->pending_n = 0;
             if (rt->listen_fd >= 0) {
                 platform_unwatch_socket(rt->listen_fd);
                 close(rt->listen_fd);
                 rt->listen_fd = -1;
             }
-            if (rt->local_socket[0]) {
-                struct stat st;
-                if (lstat(rt->local_socket, &st) == 0 && S_ISSOCK(st.st_mode) &&
-                    st.st_uid == geteuid())
-                    (void)unlink(rt->local_socket);
+            /* Only the file this forward bound: the path may name another
+             * program's socket by now (another window's forward, one the
+             * user made), which a stop must leave alone. */
+            if (rt->local_socket[0] && rt->local_ident.valid) {
+                stream_socks_release(rt->local_socket, &rt->local_ident);
+                rt->local_ident.valid = false;
             }
         }
+        if (s->ssh_session) forward_open_hold(s->ssh_session, s->stream_fwds, false);
         free(s->stream_fwds);
         s->stream_fwds = NULL;
     }

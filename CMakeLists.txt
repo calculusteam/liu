@@ -313,6 +313,7 @@ elseif(UNIX)
         OpenSSL::SSL
         OpenSSL::Crypto
         m
+        ${CMAKE_DL_LIBS}   # dlopen of libXcursor / libXinerama on a glibc that keeps it in libdl
     )
     # XRandR is how a client learns the panel's real refresh rate; without it
     # the vsync-off present pace is stuck at the 60 Hz floor even on a 144 Hz
@@ -384,9 +385,8 @@ elseif(UNIX)
         message(STATUS "FreeType not found: falling back to unhinted stb_truetype raster")
     endif()
     # The taskbar count badge (macOS: the dock badge) is a session-bus signal,
-    # com.canonical.Unity.LauncherEntry — understood by Plasma's task manager
-    # and by GNOME with Dash-to-Dock. Optional: without it the badge is simply
-    # never shown, exactly as before. The same library carries the AT-SPI2
+    # com.canonical.Unity.LauncherEntry — understood by the task managers and
+    # docks that support it. Optional: without it the badge is never shown. The same library carries the AT-SPI2
     # bridge (src/platform/atspi_bridge.c), which lets a screen reader read the
     # focused pane; without D-Bus there is no accessibility bus to join.
     if(PkgConfig_FOUND)
@@ -415,7 +415,7 @@ if(LIU_E2E_PROBE AND NOT USE_METAL)
 endif()
 
 # In-app browser (WKWebView) — macOS default ON
-option(LIU_BROWSER "Enable in-app WKWebView browser (macOS)" ON)
+option(LIU_BROWSER "Enable the in-app browser (WKWebView on macOS, WebKitGTK on Linux)" ON)
 
 # Animation pacing probe — a diagnostic build that drives a modal open/closed on
 # a timer with no user input and prints every present-to-present interval while
@@ -623,7 +623,6 @@ if(USE_ASM)
             src/asm/memops_arm64.S
             src/asm/utf8_arm64.S
             src/asm/terminal_arm64.S
-            src/asm/render_arm64.S
         )
     elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
         set(ASM_SOURCES
@@ -998,12 +997,9 @@ set(CORE_SOURCES
     src/ui/sleep_io.c
     src/ui/anim.c
     src/ui/textedit.c
-    src/ui/tabs.c
     src/ui/tab_trash.c
     src/ui/app_soak.c
     src/ui/tab_popup.c
-    src/ui/split.c
-    src/ui/sidebar.c
     src/ui/lucide.c
     src/ui/nanosvg_impl.c
     src/ui/svg_raster.c
@@ -1018,6 +1014,9 @@ set(CORE_SOURCES
     src/ui/sidebar_customize.c
     src/ui/sidebar_reorder.c
     src/ui/lightbox.c
+    src/ui/agent_diagram.c
+    src/ui/agent_visual.c
+    src/ui/mermaid_scan.c
     src/ui/sketch.c
     src/ui/sketch_layout.c
     src/ui/sketch_job.c
@@ -1057,6 +1056,8 @@ set(CORE_SOURCES
     src/ui/markdown/md_graph.c
     src/ui/markdown/md_math.c
     src/ui/markdown/md_diagram.c
+    src/ui/markdown/md_diagram_more.c
+    src/ui/markdown/md_diagram_lang.c
     # Agent history (used by Cmd+K palette to list Claude/Codex/Copilot sessions
     # and the in-app transcript viewer modal).
     src/history/scanner.c
@@ -1297,14 +1298,30 @@ if(USE_METAL AND APPLE)
         src/intro/intro_macos.m)
 endif()
 
-# In-app browser: WKWebView on macOS when LIU_BROWSER=ON; Linux stub otherwise.
+# In-app browser: WKWebView on macOS when LIU_BROWSER=ON. On Linux the page
+# is WebKitGTK's when the system has it: built against its headers only and
+# loaded at run time (src/browser/browser_gtk.c), so a system without it runs
+# the same binary and hands pages to its browser. No headers: that stub alone.
 if(LIU_BROWSER AND APPLE)
     find_library(WEBKIT_FRAMEWORK WebKit REQUIRED)
     list(APPEND PLATFORM_LIBS ${WEBKIT_FRAMEWORK})
     list(APPEND CORE_SOURCES src/browser/browser_macos.m src/browser/browser_device_art.c)
     add_compile_definitions(LIU_BROWSER=1)
 elseif(NOT APPLE)
-    list(APPEND CORE_SOURCES src/browser/browser_linux.c)
+    find_package(PkgConfig QUIET)
+    if(PKG_CONFIG_FOUND AND LIU_BROWSER)
+        pkg_check_modules(LIU_WEBKITGTK QUIET webkit2gtk-4.1 gtk+-3.0)
+    endif()
+    if(LIU_WEBKITGTK_FOUND)
+        list(APPEND CORE_SOURCES src/browser/browser_gtk.c)
+        set_source_files_properties(src/browser/browser_gtk.c PROPERTIES
+            INCLUDE_DIRECTORIES "${LIU_WEBKITGTK_INCLUDE_DIRS}")
+        list(APPEND PLATFORM_LIBS ${CMAKE_DL_LIBS})
+        message(STATUS "Browser: WebKitGTK ${LIU_WEBKITGTK_webkit2gtk-4.1_VERSION}, loaded at run time")
+    else()
+        list(APPEND CORE_SOURCES src/browser/browser_linux.c)
+        message(STATUS "Browser: no WebKitGTK headers, pages go to the system browser")
+    endif()
 else()
     list(APPEND CORE_SOURCES src/browser/browser_linux.c)
 endif()

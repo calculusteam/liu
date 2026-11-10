@@ -201,15 +201,15 @@ static inline f32 ui_win_ctl_zone_pt(void) {
 /* File-browser list rows: one uniform height everywhere — the 16pt text cell
  * plus an EQUAL top/bottom padding (content is centred inside the row, so the
  * padding lands half above / half below). The row height formula below is the
- * single source of truth; it is mirrored by fb_render_sidebar, fb_handle_click
- * and the two hit-test branches (HIT_SIDEBAR_ITEM / HIT_FBTAB_ITEM) in
- * hittest.c — always change it HERE, never inline. */
+ * single source of truth; it is mirrored by fb_render_sidebar and the two
+ * hit-test branches (HIT_SIDEBAR_ITEM / HIT_FBTAB_ITEM) in hittest.c — always
+ * change it HERE, never inline. */
 #define FB_ENTRY_VPAD_PT        6.0f    /* per-side vertical padding */
 #define FB_ENTRY_H(ch, dpi)     ((ch) + 2.0f * FB_ENTRY_VPAD_PT * (dpi))
 
 /* The explorer panel (fb_render_sidebar): a header over rows of one height.
- * The renderer, fb_handle_click and both hit tests read its geometry through
- * fb_list_hdr_h / fb_list_row_h / fb_list_entry_at (filebrowser.h).
+ * The renderer and both hit tests read its geometry through fb_list_hdr_h /
+ * fb_list_row_h / fb_list_entry_at (filebrowser.h).
  *
  * A row is [chevron][gap][icon][gap][name]. One level of depth moves a row by
  * the chevron and its gap, so a child's chevron stands under its parent's

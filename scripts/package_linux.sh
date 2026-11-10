@@ -119,7 +119,7 @@ tools_for() {
         tarball)  echo "tar python3" ;;
         deb)      echo "dpkg-deb dpkg-shlibdeps" ;;
         rpm)      echo "rpmbuild" ;;
-        appimage) echo "mksquashfs patchelf ldd sha256sum" ;;
+        appimage) echo "mksquashfs patchelf ldd sha256sum cmake patch" ;;
     esac
 }
 missing_tools() {
@@ -267,7 +267,11 @@ if want deb; then
         printf 'Maintainer: %s\n' "${MAINTAINER}"
         printf 'Installed-Size: %s\n' "$(du -sk --exclude=DEBIAN "${R}" | cut -f1)"
         printf 'Depends: %s, curl\n' "${DEPENDS}"
-        printf 'Recommends: libnotify-bin, xdg-utils\n'
+        # openssh-client: Liu runs the system's ssh-keygen and ssh-add for a
+        # new key, a passphrase change and a key's fingerprint. WebKitGTK is
+        # loaded at run time for the browser pane (not linked: without it a
+        # page goes to the system's browser).
+        printf 'Recommends: libnotify-bin, xdg-utils, openssh-client, libwebkit2gtk-4.1-0\n'
         printf 'Suggests: zenity | kdialog, pulseaudio-utils | alsa-utils, espeak-ng\n'
         printf 'Section: x11\n'
         printf 'Priority: optional\n'
@@ -312,7 +316,7 @@ if want rpm; then
         # the index.theme that makes Icon=liu resolve); without it, removing
         # Liu left them behind, owned by no package.
         printf 'Requires:  hicolor-icon-theme\n'
-        printf 'Recommends: libnotify\nRecommends: xdg-utils\n'
+        printf 'Recommends: libnotify\nRecommends: xdg-utils\nRecommends: openssh-clients\nRecommends: webkit2gtk4.1\n'
         printf 'Suggests:  zenity\nSuggests:  pulseaudio-utils\nSuggests:  espeak-ng\n'
         # The binaries are the tarball's, already stripped and checked: no
         # debuginfo split, no strip, no build-id links that two versions'
@@ -356,11 +360,16 @@ if want appimage; then
     ln -s liu.png "${AD}/.DirIcon"
     ln -s usr/bin/Liu "${AD}/AppRun"
 
-    # libssh2, the library a desktop is least likely to have, rides along; the
-    # loader finds it through the RUNPATH given to this copy of Liu only.
-    SSH2="$(ldd "${AD}/usr/bin/Liu" | awk '$1 == "libssh2.so.1" { print $3 }')"
-    [[ -n "${SSH2}" && -f "${SSH2}" ]] || die "Liu does not resolve libssh2.so.1 on this machine."
-    cp -L "${SSH2}" "${AD}/usr/lib/libssh2.so.1"
+    # libssh2, the library a desktop is least likely to have, rides along: not
+    # this machine's copy, which no update would reach inside the image, but
+    # the release with Liu's security backports (scripts/build_linux_libssh2.sh).
+    # The loader finds it through the RUNPATH given to this copy of Liu only.
+    if [[ -n "${LIU_APPIMAGE_LIBSSH2:-}" ]]; then
+        cp -L "${LIU_APPIMAGE_LIBSSH2}" "${AD}/usr/lib/libssh2.so.1"
+    else
+        "${ROOT_DIR}/scripts/build_linux_libssh2.sh" "${AD}/usr/lib" >/dev/null \
+            || die "could not build the AppImage's libssh2."
+    fi
     patchelf --set-rpath '$ORIGIN/../lib' "${AD}/usr/bin/Liu"
     normalise_tree "${AD}"
     chmod 0755 "${AD}/usr/lib/libssh2.so.1"

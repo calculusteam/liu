@@ -40,6 +40,34 @@
 
 typedef struct PlatformWindow PlatformWindow;
 
+/* How a cell looks, for a reader that exposes text attributes (AT-SPI). The
+ * colours are the grid's own encoding (a palette index below 256, or
+ * A11Y_COLOR_TRUE | 0xRRGGBB), NOT yet swapped for inverse video, brightened
+ * for bold or dimmed: atspi_attrs.h turns one of these into what is drawn,
+ * with the palette below. */
+#define A11Y_COLOR_TRUE      0x01000000u
+enum {
+    A11Y_STYLE_BOLD    = 1u << 0,
+    A11Y_STYLE_DIM     = 1u << 1,
+    A11Y_STYLE_ITALIC  = 1u << 2,
+    A11Y_STYLE_INVERSE = 1u << 3,
+    A11Y_STYLE_STRIKE  = 1u << 4,
+};
+typedef struct {
+    u32 fg, bg;
+    u16 flags;       /* A11Y_STYLE_* */
+    u8  underline;   /* 0 none, 1 single, 2 double, 3 curly, 4 dotted, 5 dashed */
+    u8  _pad;
+} PlatformA11yStyle;
+
+/* The AT-SPI bridge reads the styles; the macOS view reads none, so the
+ * provider spends nothing on them there. */
+#ifdef PLATFORM_LINUX
+#define PLATFORM_A11Y_STYLES 1
+#else
+#define PLATFORM_A11Y_STYLES 0
+#endif
+
 typedef struct {
     /* Change detection. Cheap to compute; filled in BOTH modes. `gen_value`
      * moves when the text may have changed, `gen_selection` when the
@@ -78,6 +106,24 @@ typedef struct {
     f32         grid_x, grid_y, cell_w, cell_h;
 
     const char *label;                   /* "Terminal — <tab title>" */
+
+    /* Cell styles, only when the provider builds them (PLATFORM_A11Y_STYLES):
+     * style16[i] indexes styles[] for UTF-16 unit i (every unit of a cell has
+     * its cell's style; a '\n' has styles[0], the plain cell). palette_rgb is
+     * the pane's 256-entry palette as 0x00RRGGBB, resolved the way the
+     * renderer resolves a colour (the theme, then the program's own OSC 4
+     * entries); default_fg_rgb / default_bg_rgb are what an unstyled cell
+     * shows. bold_bright and font_* come from the config. */
+    const PlatformA11yStyle *styles;
+    u32         style_count;
+    const u16  *style16;                 /* length16 entries, NULL = no styles */
+    const u32  *palette_rgb;             /* 256 entries */
+    u32         default_fg_rgb, default_bg_rgb;
+    bool        bold_bright;
+    const char *font_file;               /* the configured face's file name */
+    const char *font_family;             /* the face's own family name; NULL or empty =
+                                          * the platform reads it from font_file */
+    f32         font_pt;                 /* its size in points; 0 = unknown */
 } PlatformA11yText;
 
 /* Fill `out` for window `w`. With `generation_only`, only the two generation

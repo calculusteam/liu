@@ -1337,7 +1337,7 @@ didFailNavigation:(WKNavigation *)nav
     NSColor *bg = [self colorFromThemeCSS:css var:@"bg"];
     if (bg && self.webView) {
         self.webView.layer.backgroundColor = [bg CGColor];
-        if ([self.webView respondsToSelector:@selector(setUnderPageBackgroundColor:)])
+        if (@available(macOS 12.0, *))
             self.webView.underPageBackgroundColor = bg;
     }
 
@@ -1828,6 +1828,11 @@ void browser_native_set_viewport_pt(BrowserNative *n,
     n->vp_w = vw;
     n->vp_h = vh;
     browser_apply_geometry(n);
+}
+
+/* The notices over the page are native views here (platform_toast_sync). */
+void browser_native_set_holes(BrowserNative *n, const BrowserHole *holes, i32 count) {
+    (void)n; (void)holes; (void)count;
 }
 
 void browser_native_set_screen_shape(BrowserNative *n, const BrowserScreenShape *shape) {

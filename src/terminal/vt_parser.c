@@ -2754,7 +2754,7 @@ static void handle_dec_mode(Terminal *t, bool set) {
             if (set) t->mode |= MODE_ALT_SCROLL;
             else     t->mode &= ~MODE_ALT_SCROLL;
             break;
-        case 1015: /* URXVT mouse mode */
+        case 1015: /* Decimal-parameter mouse reports (MODE_MOUSE_URXVT) */
             if (set) t->mode |= MODE_MOUSE_URXVT;
             else     t->mode &= ~MODE_MOUSE_URXVT;
             break;

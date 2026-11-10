@@ -8,7 +8,10 @@
  * what Codex itself shows — the command, its output and exit code, the diff
  * of a change — while the model-side calls behind them can be a code-mode
  * `exec` script that names none of it. The model-side calls of the tools that
- * produce those items are then skipped, so no call is read twice.
+ * produce those items are then skipped, so no call is read twice. An MCP tool
+ * the model calls directly is recorded both ways under one id (a
+ * `function_call` with an `mcp__` namespace and an McpToolCall item): the
+ * first of the two is the call, and its result is read once.
  */
 #include "history/bridge/sources.h"
 #include "history/bridge/sources/src_jsonl.h"
@@ -47,6 +50,19 @@ static void ctx_skip_add(CodexCtx *c, BridgeHistory *h, const char *id) {
 static bool ctx_skipped(const CodexCtx *c, const char *id) {
     if (!id) return false;
     for (usize i = c->n_skip; i-- > 0;) if (strcmp(c->skip[i], id) == 0) return true;
+    return false;
+}
+
+/* Whether an event of `type` for call `id` is among the last ones read. The
+ * two records of one MCP call sit a few lines apart, so the look back is
+ * short and the parse stays linear. */
+static bool codex_has_event(const BridgeHistory *h, const char *id, BridgeEventType type) {
+    if (!id) return false;
+    usize stop = h->event_count > 256 ? h->event_count - 256 : 0;
+    for (usize k = h->event_count; k-- > stop;) {
+        const BridgeEvent *e = &h->events[k];
+        if (e->type == type && e->tool_call_id && strcmp(e->tool_call_id, id) == 0) return true;
+    }
     return false;
 }
 
@@ -156,7 +172,7 @@ static void codex_item_files(Arena *a, BridgeHistory *h, cJSON *it, i64 ts) {
         if (!path || !type || !strcmp(type, "delete")) continue;
         bool add = !strcmp(type, "add");
         char cid[160];
-        snprintf(cid, sizeof cid, "%.140s#%d", id ? id : "change", n++);
+        snprintf(cid, sizeof cid, "%.140s_%d", id ? id : "change", n++);
         cJSON *in = cJSON_CreateObject();
         if (!in) return;
         cJSON_AddStringToObject(in, "file_path", path);
@@ -182,26 +198,35 @@ static void codex_item_files(Arena *a, BridgeHistory *h, cJSON *it, i64 ts) {
     }
 }
 
-static void codex_item_mcp(Arena *a, BridgeHistory *h, cJSON *it, i64 ts) {
+static void codex_item_mcp(Arena *a, BridgeHistory *h, CodexCtx *ctx, cJSON *it, i64 ts) {
     const char *server = hist_cjson_str(it, "server"), *tool = hist_cjson_str(it, "tool");
     if (!server || !tool) return;
-    char name[256];
-    snprintf(name, sizeof name, "mcp__%s__%s", server, tool);
-    BridgeEvent c = {0};
-    c.type = BRIDGE_EVENT_TOOL_CALL;
-    c.timestamp_ms = ts;
-    c.tool_name = name;
-    c.tool_call_id = hist_cjson_str(it, "id");
-    c.tool_kind = BRIDGE_TOOL_MCP;
-    c.tool_input = json_compact(a, cJSON_GetObjectItemCaseSensitive(it, "arguments"));
-    if (!bridge_history_push(h, &c)) return;
+    const char *id = hist_cjson_str(it, "id");
+    if (codex_has_event(h, id, BRIDGE_EVENT_TOOL_CALL)) {
+        /* The model's function_call came first and is the call. The item's
+         * result is the output unless the model-side one is already read;
+         * the model-side one that comes later is then skipped. */
+        if (codex_has_event(h, id, BRIDGE_EVENT_TOOL_RESULT)) return;
+        if (ctx) ctx_skip_add(ctx, h, id);
+    } else {
+        char name[256];
+        snprintf(name, sizeof name, "mcp__%s__%s", server, tool);
+        BridgeEvent c = {0};
+        c.type = BRIDGE_EVENT_TOOL_CALL;
+        c.timestamp_ms = ts;
+        c.tool_name = name;
+        c.tool_call_id = id;
+        c.tool_kind = BRIDGE_TOOL_MCP;
+        c.tool_input = json_compact(a, cJSON_GetObjectItemCaseSensitive(it, "arguments"));
+        if (!bridge_history_push(h, &c)) return;
+    }
     cJSON *res = cJSON_GetObjectItemCaseSensitive(it, "result");
     cJSON *content = res ? cJSON_GetObjectItemCaseSensitive(res, "content") : NULL;
     u32 media = 0;
     BridgeEvent r = {0};
     r.type = BRIDGE_EVENT_TOOL_RESULT;
     r.timestamp_ms = ts;
-    r.tool_call_id = c.tool_call_id;
+    r.tool_call_id = id;
     r.tool_output = flatten_content(a, content, &media);
     if (!r.tool_output) r.tool_output = json_compact(a, res);
     r.tool_failed = res && hist_cjson_bool(res, "isError");
@@ -305,7 +330,7 @@ static bool codex_line(void *root_cjson, Arena *scratch, BridgeHistory *h,
         const char *k = it ? hist_cjson_str(it, "type") : NULL;
         if (k && !strcmp(k, "CommandExecution")) codex_item_command(h->arena, h, it, ts);
         else if (k && !strcmp(k, "FileChange")) codex_item_files(h->arena, h, it, ts);
-        else if (k && !strcmp(k, "McpToolCall")) codex_item_mcp(h->arena, h, it, ts);
+        else if (k && !strcmp(k, "McpToolCall")) codex_item_mcp(h->arena, h, ctx, it, ts);
         return true;
     }
 
@@ -357,13 +382,26 @@ static bool codex_line(void *root_cjson, Arena *scratch, BridgeHistory *h,
             if (cid) ctx_skip_add(ctx, h, cid);
             return true;
         }
+        const char *cid = hist_cjson_str(payload, "call_id");
+        const char *ns = hist_cjson_str(payload, "namespace");
+        char mcp_name[256];
+        if (name && ns && strncmp(ns, "mcp__", 5) == 0) {
+            /* An MCP tool called directly: named as its item names it, and
+             * read once when its item came first. */
+            if (ctx && ctx->items && codex_has_event(h, cid, BRIDGE_EVENT_TOOL_CALL)) {
+                ctx_skip_add(ctx, h, cid);
+                return true;
+            }
+            snprintf(mcp_name, sizeof mcp_name, "%s__%s", ns, name);
+            name = mcp_name;
+        }
         const char *args = hist_cjson_str(payload, "arguments");
         if (!args) args = hist_cjson_str(payload, "input");
         BridgeEvent e = {0};
         e.type         = BRIDGE_EVENT_TOOL_CALL;
         e.timestamp_ms = ts;
         e.tool_name    = name;
-        e.tool_call_id = hist_cjson_str(payload, "call_id");
+        e.tool_call_id = cid;
         e.tool_kind    = bridge_tool_kind_for(CHAT_TOOL_CODEX, name);
         e.tool_input   = args;
         bridge_history_push(h, &e);

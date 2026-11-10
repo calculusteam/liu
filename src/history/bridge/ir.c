@@ -21,19 +21,6 @@
 
 /* ------------------------------------------------------------------------- */
 
-const char *bridge_event_type_name(BridgeEventType t) {
-    switch (t) {
-        case BRIDGE_EVENT_SYSTEM:      return "system";
-        case BRIDGE_EVENT_USER:        return "user";
-        case BRIDGE_EVENT_ASSISTANT:   return "assistant";
-        case BRIDGE_EVENT_TOOL_CALL:   return "tool_call";
-        case BRIDGE_EVENT_TOOL_RESULT: return "tool_result";
-        case BRIDGE_EVENT_COMPACTION:  return "compaction";
-        case BRIDGE_EVENT_CONTEXT:     return "context";
-        default:                       return "unknown";
-    }
-}
-
 const char *bridge_fidelity_name(BridgeFidelity f) {
     switch (f) {
         case BRIDGE_FIDELITY_FULL:    return "full";
@@ -332,11 +319,17 @@ bool bridge_history_push(BridgeHistory *h, const BridgeEvent *e) {
     }
 
     /* An event with neither text nor tool payload carries nothing a target
-     * could write, so it is not a drop — there was never anything there. */
+     * could write, so it is not a drop — there was never anything there. A
+     * result that names its call is kept when the tool printed nothing: it
+     * is what says the call returned, and a target that replays the history
+     * to a model would otherwise show a call that was never answered. */
+    bool answers_call = e->type == BRIDGE_EVENT_TOOL_RESULT &&
+                        e->tool_call_id && e->tool_call_id[0];
     bool has_payload = (e->text && e->text[0]) ||
                        (e->tool_name && e->tool_name[0]) ||
                        (e->tool_input && e->tool_input[0]) ||
-                       (e->tool_output && e->tool_output[0]);
+                       (e->tool_output && e->tool_output[0]) ||
+                       answers_call;
     if (!has_payload) return false;
 
     if (!events_reserve(h)) {
@@ -389,6 +382,8 @@ bool bridge_history_push(BridgeHistory *h, const BridgeEvent *e) {
                                      BRIDGE_TRUNC_MARK, &clipped);
         out.tool_output_truncated = clipped || e->tool_output_truncated;
         if (out.tool_output_truncated) h->fidelity.tool_outputs_truncated++;
+    } else if (answers_call) {
+        out.tool_output = "";
     }
 
     if (e->raw_payload && e->raw_payload[0])
@@ -515,10 +510,3 @@ bool bridge_history_is_empty(const BridgeHistory *h) {
     return true;
 }
 
-isize bridge_history_last_of(const BridgeHistory *h, BridgeEventType type) {
-    if (!h) return -1;
-    for (usize i = h->event_count; i > 0; i--) {
-        if (h->events[i - 1].type == type) return (isize)(i - 1);
-    }
-    return -1;
-}

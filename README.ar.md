@@ -7,7 +7,7 @@
 <p align="center">
   <strong>طرفية واحدة لكل وكلاء الذكاء الاصطناعي.</strong><br>
   تقع Liu بينك وبين مجموعة من وكلاء البرمجة وتجعل عشرة خيوط متوازية تبدو كمكان واحد.<br>
-  مكتوبة بـ <strong>C</strong>، أصلية على macOS ومسرَّعة بواسطة GPU.
+  مكتوبة بـ <strong>C</strong>، أصلية على macOS وLinux ومسرَّعة بواسطة GPU.
 </p>
 
 <p align="center">
@@ -143,12 +143,15 @@
 | :--- | :--- | :--- |
 | **macOS** | Apple Silicon (arm64) | `.dmg` |
 | **macOS** | Intel (x86_64) | `.dmg` |
+| **Linux** | x86_64 | `.deb` · `.rpm` · `.AppImage` · `.tar.gz` |
+| **Linux** | ARM64 (aarch64) | `.deb` · `.rpm` · `.AppImage` · `.tar.gz` |
 
-macOS هو الهدف الأساسي والوحيد المدعوم حاليًا.
+يتطلب Linux مكتبة glibc 2.35 أو أحدث (Ubuntu 22.04 وDebian 12 وFedora 36 وما بعدها) وجلسة X11؛ وعلى سطح مكتب Wayland يعمل Liu عبر XWayland. تستخدم لوحة المتصفح WebKitGTK 4.1 عند تثبيتها. على Linux كل اختصار هو اختصار macOS نفسه مع Ctrl+Shift بدل ⌘ وCtrl+Alt+Shift بدل ⌘⇧ (فـ⌘K هو Ctrl+Shift+K)، وتعمل المفاتيح نفسها مع Super أيضًا. يُثبَّت من صفحة [Releases](https://github.com/calculusteam/liu/releases) أو بالأمر `curl -fsSL https://raw.githubusercontent.com/calculusteam/liu/main/scripts/install.sh | bash`.
 
 ## هدفنا
 
-- [ ] **دعم Linux**، بناءات ARM64 وx86_64 (`.tar.gz`)، وapt (PPA)، وdnf (COPR)، وAUR. Linux مخطط له لكنه غير مدعوم حاليًا.
+- [x] **دعم Linux**، بناءات ARM64 وx86_64 (`.deb` و`.rpm` و`.AppImage` و`.tar.gz`).
+- [ ] **مستودعات حزم Linux**، apt (PPA) وdnf (COPR) وAUR.
 
 ---
 
@@ -157,6 +160,7 @@ macOS هو الهدف الأساسي والوحيد المدعوم حاليًا.
 **الاعتماديات**
 
 - macOS، `brew install libssh2`
+- Linux (Debian, Ubuntu)، `sudo apt install build-essential cmake ninja-build pkg-config libx11-dev libxcursor-dev libxi-dev libxrandr-dev libfontconfig1-dev libfreetype-dev libharfbuzz-dev libdbus-1-dev libgl1-mesa-dev libssh2-1-dev libssl-dev`
 - SQLite3 وstb_truetype وstb_image وcJSON مضمّنة تحت `third_party/`
 
 ```bash
@@ -169,6 +173,7 @@ git clone https://github.com/calculusteam/liu.git && cd liu
 # أو CMake مباشرة:
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(sysctl -n hw.ncpu)
+# Linux: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DUSE_METAL=OFF && cmake --build build -j$(nproc)
 ./build/Liu
 ```
 

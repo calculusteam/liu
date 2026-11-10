@@ -54,7 +54,7 @@ typedef struct {
 } AgentctlPolicy;
 
 /* The runner binary (liu-notify, which takes the runner's role as
- * `liu-agent run`). Set before agentctl_start. */
+ * `liu-notify agent run`). Set before agentctl_start. */
 void agentctl_set_runner(const char *path);
 /* The folder that holds the `liu-agent` command, put first on a delegated
  * agent's PATH so it can read and write its team. Before agentctl_start. */
@@ -134,7 +134,6 @@ void agentctl_answer_ex(u32 job, bool approved, const char *owner_label, bool tr
 /* Whether `pane` is trusted to start agents without asking, and up to which
  * level (AgentctlPerm, -1 = not trusted). Any thread. */
 i32  agentctl_pane_trust(u64 pane);
-void agentctl_pane_untrust(u64 pane);
 
 /* The user's word on a tool a job asked for (AGACT_TOOL_ASK): "allow",
  * "always" (that kind of call, for the rest of the job) or "deny". False

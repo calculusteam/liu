@@ -137,7 +137,7 @@ static inline i32 md_live_wrap_end(const char *s, i32 len, i32 start, i32 cols) 
     if (cols < 1) cols = 1;
     i32 pos = start, used = 0, blank = -1;
     while (pos < len) {
-        EditorCell c = editor_cell_at(s, len, pos, used, 1);
+        EditorCell c = editor_cell_at(s, len, pos, used, EDITOR_LIVE_COLS);
         if (used + c.cols > cols && pos > start) break;
         pos += c.bytes; used += c.cols;
         if (s[pos - 1] == ' ' || s[pos - 1] == '\t') blank = pos;

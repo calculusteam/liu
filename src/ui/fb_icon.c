@@ -528,6 +528,3 @@ FbIcon fb_icon_for(const char *name, bool is_dir) {
     return out;
 }
 
-FbIcon fb_icon_default_file(Color dim_fg) {
-    return (FbIcon){ NF_FILE, dim_fg, FB_ASSET_ICON_FILE };
-}

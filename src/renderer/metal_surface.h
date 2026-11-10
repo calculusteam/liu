@@ -5,12 +5,15 @@
 #import <IOSurface/IOSurface.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <QuartzCore/CAAnimation.h>
+#import <QuartzCore/CAMediaTimingFunction.h>
 #include <math.h>
 #include <string.h>
 
 /* A compact image must save enough to repay one background scan/copy. It is
  * never a lower-resolution image: whole BGRA pixels and their scale survive. */
 #define LIU_SURFACE_COMPACT_MIN_BYTES (1024u*1024u)
+/* What a frame does with each hand-off rect (LiuSurfaceDrawable.fade_mode). */
+enum { LIU_FADE_END = 0, LIU_FADE_KEEP = 1, LIU_FADE_START = 2 };
 #define LIU_SURFACE_CACHE_SEC 2.0
 static bool active_target_enabled(void) {
     const char *flag=liu_dev_env("LIU_ACTIVE_TARGET");return flag && flag[0]=='1';
@@ -23,6 +26,7 @@ static bool active_target_enabled(void) {
     _Atomic bool leased;
     usize accounted;
     f64 last_required;
+    u64 lease_serial;   /* the drawable that last leased it (a hand-off's source check) */
 }
 - (instancetype)initWithDevice:(id<MTLDevice>)device width:(NSUInteger)w height:(NSUInteger)h;
 @end
@@ -65,12 +69,25 @@ static bool active_target_enabled(void) {
     CALayer *cursor_layer;
     CALayer *terminal_layers[RENDERER_TERMINAL_RECT_CAP];
     CALayer *backfill;
+    /* Hand-off fades (renderer_fade_note): a layer per rect showing what the
+     * screen had there, fading out over the frame drawn under it, and the
+     * small images those pixels are copied into. */
+    CALayer *fade_layers[RENDERER_FADE_CAP];
+    LiuSurfaceImage *fade_shows[RENDERER_FADE_CAP];   /* what each live layer shows */
+    RendererFade fade_live[RENDERER_FADE_CAP];        /* each live layer's owner, rect, picture */
+    LiuSurfaceImage *fade_images[3];
+    u64 fades_started, fades_kept, fades_ended;
     id<MTLDevice> device;
     LiuSurfaceImage *images[3], *shown;
     LiuSurfaceImage *snapshot;  /* owns a compact image outside the drawable pool */
     u64 next_serial, published;
     _Atomic bool stopped;
     _Atomic(void (*)(void)) wake;
+    /* A frame is trying to, or failed to, take a surface: the next one handed
+     * back wakes the loop for it. Raised before each acquisition and lowered
+     * when it succeeds, so a release between the two still wakes. */
+    _Atomic bool waiting;
+    bool wake_always;
     u64 accepted, discarded, starved;
     bool allocation_failed;
     bool cursor_blink;
@@ -98,6 +115,8 @@ static bool active_target_enabled(void) {
 - (bool)prepareTerminalRects:(u32)count;
 - (void)updateTerminalRects:(const RendererTerminalRect *)rects count:(u32)count;
 - (void)compactIfIdle;
+- (LiuSurfaceImage *)fadeImageWidth:(NSUInteger)w height:(NSUInteger)h;
+- (void)publishFades:(LiuSurfaceDrawable *)drawable;
 @end
 
 @interface LiuSurfaceDrawable : NSObject <CAMetalDrawable> {
@@ -110,6 +129,14 @@ static bool active_target_enabled(void) {
     RendererCursor cursor;
     RendererTerminalRect terminal_rects[RENDERER_TERMINAL_RECT_CAP];
     u32 terminal_rect_count;
+    /* The frame's hand-off fades: what it drew where, and for each whether a
+     * fade starts (its pixels at fade_slice_x of fade_image), goes on, or is
+     * ended (LIU_FADE_*). */
+    RendererFade fades[RENDERER_FADE_CAP];
+    u8 fade_mode[RENDERER_FADE_CAP];
+    u32 fade_slice_x[RENDERER_FADE_CAP];
+    u32 fade_count;
+    LiuSurfaceImage *fade_image;   /* retained and leased while the frame is in flight */
     bool compact_allowed;
     u32 compact_background;
     /* Host time at which this frame's surface became the layer's contents
@@ -123,6 +150,7 @@ static bool active_target_enabled(void) {
 @implementation LiuSurfaceDrawable
 - (instancetype)initWithOwner:(LiuSurfacePresenter *)presenter image:(LiuSurfaceImage *)value {
     if ((self=[super init])) { owner=[presenter retain];image=[value retain];serial=++owner->next_serial;
+        image->lease_serial=serial;
         logical_width=value->texture.width;logical_height=value->texture.height; }
     return self;
 }
@@ -146,8 +174,13 @@ static bool active_target_enabled(void) {
 - (void)presentAfterMinimumDuration:(CFTimeInterval)duration { (void)duration;[self present]; }
 - (void)dealloc {
     atomic_store_explicit(&image->leased,false,memory_order_release);
+    /* Only a frame that is waiting for a surface needs the loop woken for
+     * this one: every frame ends here, and an unconditional wake is a loop
+     * turn per presented frame with nothing to do. */
     void (*notify)(void)=atomic_load(&owner->wake);
-    if (!atomic_load(&owner->stopped) && notify) notify();
+    if (!atomic_load(&owner->stopped) && notify &&
+        (atomic_exchange_explicit(&owner->waiting,false,memory_order_acq_rel) || owner->wake_always)) notify();
+    if (fade_image) { atomic_store_explicit(&fade_image->leased,false,memory_order_release);[fade_image release]; }
     [handlers release];[image release];[owner release];[super dealloc];
 }
 @end
@@ -207,6 +240,10 @@ static LiuSurfaceImage *liu_surface_compact_image(LiuSurfaceImage *source,
 - (instancetype)initWithLayer:(CAMetalLayer *)layer device:(id<MTLDevice>)dev {
     if (!(self=[super init])) return nil;
     atomic_init(&stopped,false);atomic_init(&wake,NULL);host=[layer retain];device=[dev retain];
+    /* LIU_SURFACE_WAKE_ALWAYS=1: every surface handed back wakes the loop, as
+     * it did before `waiting`. Resolved here, on the main thread. */
+    const char *wa=getenv("LIU_SURFACE_WAKE_ALWAYS");
+    atomic_init(&waiting,false);wake_always=wa && wa[0]=='1';
     display=[CALayer new];display.frame=host.bounds;
     if (!display) { [self release];return nil; }
     display.autoresizingMask=kCALayerWidthSizable|kCALayerHeightSizable;
@@ -258,6 +295,7 @@ static LiuSurfaceImage *liu_surface_compact_image(LiuSurfaceImage *source,
     }
     target_width=w;target_height=h;
     drawable->image->last_required=CACurrentMediaTime();
+    drawable->image->lease_serial=drawable->serial;
     return true;
 }
 /* What a spare is kept FOR is the next frame, so while frames keep coming a
@@ -294,6 +332,19 @@ static bool liu_surface_keep_exact(void) {
         freed+=candidate->accounted;
         images[i]=nil;pool_retired++;
         [candidate release];
+    }
+    if (idle) {
+        for (u32 i=0;i<3;i++) {
+            LiuSurfaceImage *candidate=fade_images[i];
+            if (!candidate || atomic_load_explicit(&candidate->leased,memory_order_acquire) ||
+                IOSurfaceIsInUse(candidate->surface)) continue;
+            bool shows=false;
+            for (u32 k=0;k<RENDERER_FADE_CAP;k++) if (fade_shows[k]==candidate) { shows=true;break; }
+            if (shows) continue;
+            freed+=candidate->accounted;
+            fade_images[i]=nil;
+            [candidate release];
+        }
     }
     return freed;
 }
@@ -442,6 +493,111 @@ static bool liu_surface_keep_exact(void) {
     }
     if (space) CGColorSpaceRelease(space);
 }
+/* An image to copy a frame's hand-off pixels into, `w` x `h` or larger,
+ * leased to the caller: none a live fade shows, none in flight, none the
+ * compositor still holds. Three are kept; nil when all three are busy (the
+ * frame then hands nothing off). Main thread. */
+- (LiuSurfaceImage *)fadeImageWidth:(NSUInteger)w height:(NSUInteger)h {
+    if (atomic_load(&stopped) || !w || !h) return nil;
+    u32 spare=3;
+    for (u32 i=0;i<3;i++) {
+        LiuSurfaceImage *candidate=fade_images[i];
+        if (!candidate) { if (spare==3) spare=i; continue; }
+        if (atomic_load_explicit(&candidate->leased,memory_order_acquire) ||
+            IOSurfaceIsInUse(candidate->surface)) continue;
+        bool shows=false;
+        for (u32 k=0;k<RENDERER_FADE_CAP;k++) if (fade_shows[k]==candidate) { shows=true;break; }
+        if (shows) continue;
+        if (candidate->texture.width>=w && candidate->texture.height>=h) {
+            atomic_store(&candidate->leased,true);
+            return candidate;
+        }
+        if (spare==3) spare=i;   /* too small and free: replaced */
+    }
+    if (spare==3) return nil;
+    /* Room for a little growth, so a tab that widens by a pixel does not
+     * replace it every frame. */
+    NSUInteger aw=(w+63)&~(NSUInteger)63, ah=(h+15)&~(NSUInteger)15;
+    LiuSurfaceImage *made=[[LiuSurfaceImage alloc]initWithDevice:device width:aw height:ah];
+    if (!made) return nil;
+    [fade_images[spare] release];
+    fade_images[spare]=made;
+    atomic_store(&made->leased,true);
+    return made;
+}
+static bool liu_fade_same_place(const RendererFade *a,const RendererFade *b) {
+    return a->owner==b->owner && a->x==b->x && a->y==b->y && a->w==b->w && a->h==b->h;
+}
+- (void)endFadeAt:(u32)i {
+    CALayer *layer=fade_layers[i];
+    [layer removeAnimationForKey:@"liu.fade"];
+    layer.hidden=YES;layer.contents=nil;
+    [fade_shows[i] release];fade_shows[i]=nil;
+    fades_ended++;
+}
+/* Inside publish's transaction, with the frame's own contents: a live fade
+ * goes on only where the frame says KEEP for its owner at its rect; every
+ * START puts what the screen had there over the new frame, opaque, and fades
+ * it out by the rect's `until`. */
+- (void)publishFades:(LiuSurfaceDrawable *)drawable {
+    for (u32 i=0;i<RENDERER_FADE_CAP;i++) {
+        if (!fade_shows[i]) continue;
+        bool keep=false;
+        for (u32 k=0;k<drawable->fade_count;k++)
+            if (drawable->fade_mode[k]==LIU_FADE_KEEP && liu_fade_same_place(&drawable->fades[k],&fade_live[i])) {
+                keep=true;break;
+            }
+        if (keep) fades_kept++;
+        else [self endFadeAt:i];
+    }
+    LiuSurfaceImage *image=drawable->fade_image;
+    if (!image) return;
+    CGFloat scale=host.contentsScale>0 ? host.contentsScale : 1;
+    f64 now=platform_time_sec();
+    f64 iw=(f64)image->texture.width, ih=(f64)image->texture.height;
+    for (u32 k=0;k<drawable->fade_count;k++) {
+        if (drawable->fade_mode[k]!=LIU_FADE_START) continue;
+        const RendererFade *f=&drawable->fades[k];
+        f64 left=f->until-now;
+        if (left<0.004) continue;   /* its key passed while the frame was in flight */
+        u32 slot=RENDERER_FADE_CAP;
+        for (u32 i=0;i<RENDERER_FADE_CAP;i++) if (!fade_shows[i]) { slot=i;break; }
+        if (slot==RENDERER_FADE_CAP) break;
+        CALayer *layer=fade_layers[slot];
+        if (!layer) {
+            layer=[CALayer new];
+            if (!layer) break;
+            layer.actions=@{@"hidden":[NSNull null],@"bounds":[NSNull null],@"position":[NSNull null],
+                @"contents":[NSNull null],@"contentsRect":[NSNull null],@"opacity":[NSNull null]};
+            layer.contentsGravity=kCAGravityResize;
+            layer.magnificationFilter=kCAFilterNearest;layer.minificationFilter=kCAFilterNearest;
+            [host insertSublayer:layer above:display];
+            fade_layers[slot]=layer;
+        }
+        CGFloat y=f->y/scale;
+        if (!host.geometryFlipped) y=host.bounds.size.height-y-f->h/scale;
+        layer.frame=CGRectMake(f->x/scale,y,f->w/scale,f->h/scale);
+        layer.contentsScale=scale;
+        layer.contents=(id)image->surface;
+        /* The copy is the image's TOP f->h rows, and the image can be taller
+         * (fadeImageWidth rounds it up). The unit square counts from the
+         * bottom unless the geometry is flipped, as the frame above does. */
+        CGFloat cy=host.geometryFlipped ? 0 : (ih-f->h)/ih;
+        layer.contentsRect=CGRectMake(drawable->fade_slice_x[k]/iw,cy,f->w/iw,f->h/ih);
+        layer.hidden=NO;
+        /* Opaque pixels at an opacity going linearly from 1 to 0: the
+         * compositor's mix of the two pictures, in its encoded space, is the
+         * per-cell sRGB mix a frame drawn between the keys would show. */
+        layer.opacity=0;
+        CABasicAnimation *fade=[CABasicAnimation animationWithKeyPath:@"opacity"];
+        fade.fromValue=@1.0;fade.toValue=@0.0;fade.duration=left;
+        fade.timingFunction=[CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionLinear];
+        [layer addAnimation:fade forKey:@"liu.fade"];
+        fade_shows[slot]=[image retain];
+        fade_live[slot]=*f;
+        fades_started++;
+    }
+}
 /* Acquire a free role once. The role count remains three even if stale
  * storage was retired. Prefer exact storage; never borrow a GPU/compositor
  * lease or the surface currently shown by the layer. */
@@ -539,6 +695,7 @@ static bool liu_surface_probe_on(void) {
             self->compact_background=drawable->compact_background;
             [self updateCursor:drawable->cursor];
             [self updateTerminalRects:drawable->terminal_rects count:drawable->terminal_rect_count];
+            [self publishFades:drawable];
             [CATransaction commit];self->accepted++;
             drawable->layer_time=CACurrentMediaTime();
             [self->snapshot release];self->snapshot=nil;
@@ -553,11 +710,17 @@ static bool liu_surface_probe_on(void) {
     atomic_store(&stopped,true);display.contents=nil;shown=nil;[display removeFromSuperlayer];
     [cursor_layer removeAllAnimations];[cursor_layer removeFromSuperlayer];
     for(u32 i=0;i<RENDERER_TERMINAL_RECT_CAP;i++)[terminal_layers[i]removeFromSuperlayer];
+    for(u32 i=0;i<RENDERER_FADE_CAP;i++) {
+        [fade_layers[i] removeAllAnimations];[fade_layers[i] removeFromSuperlayer];
+        fade_layers[i].contents=nil;[fade_shows[i] release];fade_shows[i]=nil;
+    }
     [backfill removeFromSuperlayer];
 }
 - (void)dealloc {
     for(u32 i=0;i<3;i++)[images[i]release];
     for(u32 i=0;i<RENDERER_TERMINAL_RECT_CAP;i++)[terminal_layers[i]release];
+    for(u32 i=0;i<RENDERER_FADE_CAP;i++) { [fade_layers[i] release];[fade_shows[i] release]; }
+    for(u32 i=0;i<3;i++)[fade_images[i]release];
     [snapshot release];[backfill release];[cursor_layer release];[display release];[host release];[device release];[super dealloc];
 }
 @end

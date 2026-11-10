@@ -381,8 +381,6 @@ i32 app_open_sftp_tab(AppState *app, Session *session, const char *name, const c
 
 /* ---- the clock ----------------------------------------------------------- */
 
-bool sftp_tab_animating(const AppState *app) { (void)app; return false; }
-
 bool sftp_tab_tick(AppState *app, i32 ti, f64 now) {
     if (!app || ti < 0 || ti >= app->tab_count) return false;
     Tab *tab = &app->tabs[ti];
@@ -1711,7 +1709,8 @@ bool sftp_tab_key(AppState *app, i32 key, u32 mods) {
         }
         return false;
     }
-    if (cmd && !(m & (MOD_CTRL | MOD_ALT))) {
+    /* No modifier but the app's own and Shift: on X11 the app's IS Ctrl. */
+    if (cmd && !(m & ((MOD_CTRL | MOD_ALT | MOD_SUPER) & ~MOD_APP))) {
         switch (key) {
         case KEY_UP:     if (ready) pane_up(app, tab, pi); return true;
         case KEY_DOWN:   if (ready && p->cursor >= 0) open_row(app, tab, st, pi, p->cursor); return true;

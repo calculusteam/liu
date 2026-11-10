@@ -1607,90 +1607,9 @@ i32 vault_secret_counts(Vault *v, i32 *counts, i32 ncounts) {
  * Groups (simplified)
  * ========================================================================= */
 
-bool vault_group_insert(Vault *v, const VaultGroup *g) {
-    const char *sql = "INSERT INTO groups (id,name,parent_id,color) VALUES (?,?,?,?)";
-    sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(v->db, sql, -1, &stmt, NULL) != SQLITE_OK) return false;
-    sqlite3_bind_text(stmt, 1, g->id, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, g->name, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 3, g->parent_id[0] ? g->parent_id : NULL, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 4, g->color, -1, SQLITE_STATIC);
-    bool ok = sqlite3_step(stmt) == SQLITE_DONE;
-    sqlite3_finalize(stmt);
-    return ok;
-}
-
-bool vault_group_delete(Vault *v, const char *id) {
-    const char *sql = "DELETE FROM groups WHERE id=?";
-    sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(v->db, sql, -1, &stmt, NULL) != SQLITE_OK) return false;
-    sqlite3_bind_text(stmt, 1, id, -1, SQLITE_STATIC);
-    bool ok = sqlite3_step(stmt) == SQLITE_DONE;
-    sqlite3_finalize(stmt);
-    return ok;
-}
-
-i32 vault_group_list(Vault *v, VaultGroup *out, i32 max) {
-    const char *sql = "SELECT id,name,parent_id,color FROM groups ORDER BY name";
-    sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(v->db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
-    i32 count = 0;
-    while (count < max && sqlite3_step(stmt) == SQLITE_ROW) {
-        VaultGroup *g = &out[count];
-        memset(g, 0, sizeof(*g));
-        snprintf(g->id, sizeof(g->id), "%s", (const char *)sqlite3_column_text(stmt, 0));
-        snprintf(g->name, sizeof(g->name), "%s", (const char *)sqlite3_column_text(stmt, 1));
-        const char *p = (const char *)sqlite3_column_text(stmt, 2);
-        if (p) snprintf(g->parent_id, sizeof(g->parent_id), "%s", p);
-        const char *c = (const char *)sqlite3_column_text(stmt, 3);
-        if (c) snprintf(g->color, sizeof(g->color), "%s", c);
-        count++;
-    }
-    sqlite3_finalize(stmt);
-    return count;
-}
-
 /* =========================================================================
  * Snippets
  * ========================================================================= */
-
-bool vault_snippet_insert(Vault *v, const VaultSnippet *s) {
-    const char *sql = "INSERT INTO snippets (id,label,command,description,tags) VALUES (?,?,?,?,?)";
-    sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(v->db, sql, -1, &stmt, NULL) != SQLITE_OK) return false;
-    sqlite3_bind_text(stmt, 1, s->id, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, s->label, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 3, s->command, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 4, s->description, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 5, s->tags, -1, SQLITE_STATIC);
-    bool ok = sqlite3_step(stmt) == SQLITE_DONE;
-    sqlite3_finalize(stmt);
-    return ok;
-}
-
-bool vault_snippet_update(Vault *v, const VaultSnippet *s) {
-    const char *sql = "UPDATE snippets SET label=?,command=?,description=?,tags=? WHERE id=?";
-    sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(v->db, sql, -1, &stmt, NULL) != SQLITE_OK) return false;
-    sqlite3_bind_text(stmt, 1, s->label, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, s->command, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 3, s->description, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 4, s->tags, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 5, s->id, -1, SQLITE_STATIC);
-    bool ok = sqlite3_step(stmt) == SQLITE_DONE;
-    sqlite3_finalize(stmt);
-    return ok;
-}
-
-bool vault_snippet_delete(Vault *v, const char *id) {
-    const char *sql = "DELETE FROM snippets WHERE id=?";
-    sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(v->db, sql, -1, &stmt, NULL) != SQLITE_OK) return false;
-    sqlite3_bind_text(stmt, 1, id, -1, SQLITE_STATIC);
-    bool ok = sqlite3_step(stmt) == SQLITE_DONE;
-    sqlite3_finalize(stmt);
-    return ok;
-}
 
 /* Read one snippet row from `stmt` (already SQLITE_ROW-positioned) into `out`. */
 static void snippet_fill_from_stmt(VaultSnippet *out, sqlite3_stmt *stmt) {
@@ -1702,19 +1621,6 @@ static void snippet_fill_from_stmt(VaultSnippet *out, sqlite3_stmt *stmt) {
     if (d) snprintf(out->description, sizeof(out->description), "%s", d);
     const char *t = (const char *)sqlite3_column_text(stmt, 4);
     if (t) snprintf(out->tags, sizeof(out->tags), "%s", t);
-}
-
-i32 vault_snippet_list(Vault *v, VaultSnippet *out, i32 max) {
-    const char *sql = "SELECT id,label,command,description,tags FROM snippets ORDER BY label";
-    sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(v->db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
-    i32 count = 0;
-    while (count < max && sqlite3_step(stmt) == SQLITE_ROW) {
-        snippet_fill_from_stmt(&out[count], stmt);
-        count++;
-    }
-    sqlite3_finalize(stmt);
-    return count;
 }
 
 i32 vault_snippet_for_each(Vault *v, vault_snippet_cb cb, void *user) {
@@ -1738,51 +1644,6 @@ i32 vault_snippet_for_each(Vault *v, vault_snippet_cb cb, void *user) {
 /* =========================================================================
  * Keys
  * ========================================================================= */
-
-bool vault_key_insert(Vault *v, const VaultKey *k) {
-    const char *sql = "INSERT INTO ssh_keys (id,label,algorithm,public_key,fingerprint,created_at) VALUES (?,?,?,?,?,?)";
-    sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(v->db, sql, -1, &stmt, NULL) != SQLITE_OK) return false;
-    sqlite3_bind_text(stmt, 1, k->id, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, k->label, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 3, k->algorithm, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 4, k->public_key, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 5, k->fingerprint, -1, SQLITE_STATIC);
-    sqlite3_bind_int64(stmt, 6, k->created_at ? k->created_at : (i64)time(NULL));
-    bool ok = sqlite3_step(stmt) == SQLITE_DONE;
-    sqlite3_finalize(stmt);
-    return ok;
-}
-
-bool vault_key_delete(Vault *v, const char *id) {
-    const char *sql = "DELETE FROM ssh_keys WHERE id=?";
-    sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(v->db, sql, -1, &stmt, NULL) != SQLITE_OK) return false;
-    sqlite3_bind_text(stmt, 1, id, -1, SQLITE_STATIC);
-    bool ok = sqlite3_step(stmt) == SQLITE_DONE;
-    sqlite3_finalize(stmt);
-    return ok;
-}
-
-i32 vault_key_list(Vault *v, VaultKey *out, i32 max) {
-    const char *sql = "SELECT id,label,algorithm,public_key,fingerprint,created_at FROM ssh_keys ORDER BY label";
-    sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(v->db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
-    i32 count = 0;
-    while (count < max && sqlite3_step(stmt) == SQLITE_ROW) {
-        VaultKey *k = &out[count];
-        memset(k, 0, sizeof(*k));
-        snprintf(k->id, sizeof(k->id), "%s", (const char *)sqlite3_column_text(stmt, 0));
-        snprintf(k->label, sizeof(k->label), "%s", (const char *)sqlite3_column_text(stmt, 1));
-        snprintf(k->algorithm, sizeof(k->algorithm), "%s", (const char *)sqlite3_column_text(stmt, 2));
-        snprintf(k->public_key, sizeof(k->public_key), "%s", (const char *)sqlite3_column_text(stmt, 3));
-        snprintf(k->fingerprint, sizeof(k->fingerprint), "%s", (const char *)sqlite3_column_text(stmt, 4));
-        k->created_at = sqlite3_column_int64(stmt, 5);
-        count++;
-    }
-    sqlite3_finalize(stmt);
-    return count;
-}
 
 /* =========================================================================
  * Connection History
@@ -1846,6 +1707,30 @@ bool vault_update_history_result(Vault *v, const char *hostname, i32 port,
     return ok;
 }
 
+i64 vault_add_history_attempt(Vault *v, const char *hostname, i32 port,
+                              const char *username, const char *auth_method) {
+    if (!v || !hostname || !vault_add_history(v, hostname, port, username, auth_method, false))
+        return 0;
+    /* The row just inserted, unless the prune that follows the insert took
+     * it (it is the newest, so it never does). */
+    return (i64)sqlite3_last_insert_rowid(v->db);
+}
+
+bool vault_set_history_result(Vault *v, i64 id, bool succeeded, const char *auth_method) {
+    if (!v || id <= 0) return false;
+    bool how = auth_method && auth_method[0];
+    const char *sql = how ? "UPDATE connection_history SET succeeded=?, auth_method=? WHERE id=?"
+                          : "UPDATE connection_history SET succeeded=? WHERE id=?";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(v->db, sql, -1, &stmt, NULL) != SQLITE_OK) return false;
+    sqlite3_bind_int(stmt, 1, succeeded ? 1 : 0);
+    if (how) sqlite3_bind_text(stmt, 2, auth_method, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, how ? 3 : 2, (sqlite3_int64)id);
+    bool ok = sqlite3_step(stmt) == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
 i32 vault_get_history(Vault *v, VaultHistoryEntry *entries, i32 max_entries) {
     if (!v || !entries) return -1;
 
@@ -1901,150 +1786,9 @@ bool vault_forget_history(Vault *v, const char *hostname, i32 port, const char *
  * Command History
  * ========================================================================= */
 
-static void trim_command_text(const char *src, char *dst, usize dst_size) {
-    if (!dst || dst_size == 0) return;
-    dst[0] = '\0';
-    if (!src) return;
-
-    const char *start = src;
-    while (*start && isspace((unsigned char)*start)) start++;
-
-    const char *end = src + strlen(src);
-    while (end > start && isspace((unsigned char)end[-1])) end--;
-
-    usize len = (usize)(end - start);
-    if (len >= dst_size) len = dst_size - 1;
-    memcpy(dst, start, len);
-    dst[len] = '\0';
-}
-
-static void vault_prune_command_history(Vault *v) {
-    if (!v) return;
-
-    sqlite3_stmt *stmt = NULL;
-    const char *sql = "DELETE FROM command_history WHERE timestamp < ?";
-    if (sqlite3_prepare_v2(v->db, sql, -1, &stmt, NULL) != SQLITE_OK) return;
-
-    f64 cutoff = (f64)time(NULL) -
-                 (f64)(VAULT_COMMAND_HISTORY_RETENTION_DAYS * 24 * 60 * 60);
-    sqlite3_bind_double(stmt, 1, cutoff);
-    sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-}
-
-bool vault_add_command_history(Vault *v, const char *command) {
-    if (!v || !command) return false;
-
-    char cleaned[4096];
-    trim_command_text(command, cleaned, sizeof(cleaned));
-    if (!cleaned[0]) return false;
-
-    const char *sql = "INSERT INTO command_history (command, timestamp) VALUES (?, ?)";
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(v->db, sql, -1, &stmt, NULL) != SQLITE_OK) return false;
-
-    sqlite3_bind_text(stmt, 1, cleaned, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_double(stmt, 2, (f64)time(NULL));
-
-    bool ok = sqlite3_step(stmt) == SQLITE_DONE;
-    sqlite3_finalize(stmt);
-
-    if (ok) vault_prune_command_history(v);
-    return ok;
-}
-
-i32 vault_get_recent_command_history(Vault *v,
-                                     VaultCommandHistoryEntry *entries,
-                                     i32 max_entries) {
-    if (!v || !entries || max_entries <= 0) return -1;
-
-    vault_prune_command_history(v);
-
-    const char *sql = "SELECT command, timestamp "
-                      "FROM command_history "
-                      "WHERE timestamp >= ? "
-                      "ORDER BY timestamp DESC "
-                      "LIMIT ?";
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(v->db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
-
-    f64 cutoff = (f64)time(NULL) -
-                 (f64)(VAULT_COMMAND_HISTORY_RETENTION_DAYS * 24 * 60 * 60);
-    sqlite3_bind_double(stmt, 1, cutoff);
-    sqlite3_bind_int(stmt, 2, max_entries);
-
-    i32 count = 0;
-    while (count < max_entries && sqlite3_step(stmt) == SQLITE_ROW) {
-        VaultCommandHistoryEntry *e = &entries[count];
-        memset(e, 0, sizeof(*e));
-
-        const char *cmd = (const char *)sqlite3_column_text(stmt, 0);
-        if (cmd) snprintf(e->command, sizeof(e->command), "%s", cmd);
-        e->timestamp = sqlite3_column_double(stmt, 1);
-        count++;
-    }
-
-    sqlite3_finalize(stmt);
-    return count;
-}
-
 /* =========================================================================
  * Favorites
  * ========================================================================= */
-
-bool vault_set_favorite(Vault *v, const char *hostname, i32 port,
-                        const char *username, bool is_favorite) {
-    if (!v || !hostname) return false;
-
-    if (is_favorite) {
-        const char *sql = "INSERT OR IGNORE INTO favorites (hostname,port,username,label)"
-                          " VALUES (?,?,?,?)";
-        sqlite3_stmt *stmt;
-        if (sqlite3_prepare_v2(v->db, sql, -1, &stmt, NULL) != SQLITE_OK) return false;
-        sqlite3_bind_text(stmt, 1, hostname, -1, SQLITE_STATIC);
-        sqlite3_bind_int(stmt, 2, port);
-        sqlite3_bind_text(stmt, 3, username ? username : "", -1, SQLITE_STATIC);
-        /* Generate a default label: user@host */
-        char label[256];
-        if (username && username[0])
-            snprintf(label, sizeof(label), "%s@%s", username, hostname);
-        else
-            snprintf(label, sizeof(label), "%s", hostname);
-        sqlite3_bind_text(stmt, 4, label, -1, SQLITE_TRANSIENT);
-        bool ok = sqlite3_step(stmt) == SQLITE_DONE;
-        sqlite3_finalize(stmt);
-        return ok;
-    } else {
-        const char *sql = "DELETE FROM favorites WHERE hostname=? AND port=? AND username=?";
-        sqlite3_stmt *stmt;
-        if (sqlite3_prepare_v2(v->db, sql, -1, &stmt, NULL) != SQLITE_OK) return false;
-        sqlite3_bind_text(stmt, 1, hostname, -1, SQLITE_STATIC);
-        sqlite3_bind_int(stmt, 2, port);
-        sqlite3_bind_text(stmt, 3, username ? username : "", -1, SQLITE_STATIC);
-        bool ok = sqlite3_step(stmt) == SQLITE_DONE;
-        sqlite3_finalize(stmt);
-        return ok;
-    }
-}
-
-bool vault_is_favorite(Vault *v, const char *hostname, i32 port,
-                       const char *username) {
-    if (!v || !hostname) return false;
-
-    const char *sql = "SELECT COUNT(*) FROM favorites WHERE hostname=? AND port=? AND username=?";
-    sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(v->db, sql, -1, &stmt, NULL) != SQLITE_OK) return false;
-    sqlite3_bind_text(stmt, 1, hostname, -1, SQLITE_STATIC);
-    sqlite3_bind_int(stmt, 2, port);
-    sqlite3_bind_text(stmt, 3, username ? username : "", -1, SQLITE_STATIC);
-
-    bool found = false;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        found = sqlite3_column_int(stmt, 0) > 0;
-    }
-    sqlite3_finalize(stmt);
-    return found;
-}
 
 i32 vault_get_favorites(Vault *v, VaultHost *hosts, i32 max) {
     if (!v || !hosts) return -1;

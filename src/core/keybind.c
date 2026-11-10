@@ -50,6 +50,7 @@ static const char *g_action_names[] = {
     [ACT_SCROLL_TO_TOP]     = "Scroll to Top",
     [ACT_SCROLL_TO_BOTTOM]  = "Scroll to Bottom",
     [ACT_CLEAR_SCREEN]      = "Clear Screen",
+    [ACT_RESTART_SHELL]     = "Restart Shell",
     [ACT_BROADCAST_TOGGLE]  = "Toggle Broadcast",
     [ACT_SPLIT_HORIZONTAL]  = "Split Horizontal",
     [ACT_SPLIT_VERTICAL]    = "Split Vertical",
@@ -155,6 +156,10 @@ void keybind_init_defaults(KeyBindTable *kb) {
     /* Clear */
     BIND(ACT_CLEAR_SCREEN,    KEY_K,  MOD_SUPER | MOD_SHIFT);
 
+    /* A new shell in the focused pane. Plain Cmd+R closes what the pointer
+     * is on (main.c). */
+    BIND(ACT_RESTART_SHELL,   KEY_R,  MOD_SUPER | MOD_SHIFT);
+
     /* Split */
     BIND(ACT_SPLIT_HORIZONTAL, KEY_D,  MOD_SUPER);
     BIND(ACT_SPLIT_VERTICAL,   KEY_D,  MOD_SUPER | MOD_SHIFT);
@@ -188,20 +193,49 @@ void keybind_init_defaults(KeyBindTable *kb) {
      * if the vault is still locked). Cmd+V is paste; don't collide. */
     BIND(ACT_VAULT_BROWSER,   KEY_V,  MOD_SUPER | MOD_SHIFT);
 #else
-    /* Super is commonly reserved by the desktop shell, so application
-     * shortcuts use Ctrl and Alt combinations. Ctrl+C sends SIGINT and Ctrl+V
-     * is the shell's literal-next command; terminal clipboard shortcuts use
-     * Ctrl+Shift.
+    /* Each chord is the macOS one with Cmd read as Ctrl+Shift, so a hand that
+     * knows one platform knows the other (Cmd+K is Ctrl+Shift+K): bare Ctrl
+     * chords stay the shell's (^C, ^D, ^S, ^V ...). Where macOS has both
+     * Cmd+<key> and Cmd+<Shift>+<key> (T, S, A, V, K, D), the Shift one takes
+     * Alt as well: Ctrl+Alt+Shift+<key>.
      *
-     * When macOS shortcuts would collide after modifier translation, such as
-     * Cmd+T and Cmd+Shift+T, the second action uses Ctrl+Alt+<key> because
-     * keybind_lookup returns the first match. Tab-by-index uses Alt+<n>. */
+     * After an action's first chord comes the macOS chord itself on Super,
+     * which works wherever the window manager leaves it free (most take a good
+     * part of Super), then the table's earlier Linux chord where no other
+     * action wants it. keybind_get returns the first, so a hint or Settings
+     * shows the Ctrl one.
+     *
+     * No first chord is one a common desktop or window manager takes by
+     * default (its terminal key Ctrl+Alt+T, its show-desktop Ctrl+Alt+D, its
+     * workspaces on Ctrl+Alt+arrows and Ctrl+F<n>): a chord the desktop takes
+     * never reaches the window. */
 
     /* Tab management */
     BIND(ACT_NEW_TAB,         KEY_T,  MOD_CTRL | MOD_SHIFT);
+    BIND(ACT_NEW_TAB,         KEY_T,  MOD_SUPER);
     BIND(ACT_CLOSE_TAB,       KEY_W,  MOD_CTRL | MOD_SHIFT);
+    BIND(ACT_CLOSE_TAB,       KEY_W,  MOD_SUPER);
     BIND(ACT_NEXT_TAB,        KEY_TAB, MOD_CTRL);
     BIND(ACT_PREV_TAB,        KEY_TAB, MOD_CTRL | MOD_SHIFT);
+    BIND(ACT_TAB_1,           KEY_1,  MOD_CTRL | MOD_SHIFT);
+    BIND(ACT_TAB_2,           KEY_2,  MOD_CTRL | MOD_SHIFT);
+    BIND(ACT_TAB_3,           KEY_3,  MOD_CTRL | MOD_SHIFT);
+    BIND(ACT_TAB_4,           KEY_4,  MOD_CTRL | MOD_SHIFT);
+    BIND(ACT_TAB_5,           KEY_5,  MOD_CTRL | MOD_SHIFT);
+    BIND(ACT_TAB_6,           KEY_6,  MOD_CTRL | MOD_SHIFT);
+    BIND(ACT_TAB_7,           KEY_7,  MOD_CTRL | MOD_SHIFT);
+    BIND(ACT_TAB_8,           KEY_8,  MOD_CTRL | MOD_SHIFT);
+    BIND(ACT_TAB_9,           KEY_9,  MOD_CTRL | MOD_SHIFT);
+    BIND(ACT_TAB_1,           KEY_1,  MOD_SUPER);
+    BIND(ACT_TAB_2,           KEY_2,  MOD_SUPER);
+    BIND(ACT_TAB_3,           KEY_3,  MOD_SUPER);
+    BIND(ACT_TAB_4,           KEY_4,  MOD_SUPER);
+    BIND(ACT_TAB_5,           KEY_5,  MOD_SUPER);
+    BIND(ACT_TAB_6,           KEY_6,  MOD_SUPER);
+    BIND(ACT_TAB_7,           KEY_7,  MOD_SUPER);
+    BIND(ACT_TAB_8,           KEY_8,  MOD_SUPER);
+    BIND(ACT_TAB_9,           KEY_9,  MOD_SUPER);
+    /* Alt+<n>, as many Linux terminals have it. */
     BIND(ACT_TAB_1,           KEY_1,  MOD_ALT);
     BIND(ACT_TAB_2,           KEY_2,  MOD_ALT);
     BIND(ACT_TAB_3,           KEY_3,  MOD_ALT);
@@ -214,32 +248,55 @@ void keybind_init_defaults(KeyBindTable *kb) {
 
     /* View */
     BIND(ACT_TOGGLE_SIDEBAR,  KEY_B,  MOD_CTRL | MOD_SHIFT);
-    /* F11 is the fullscreen key on Linux desktops; macOS reaches fullscreen
-     * through the native View menu (Ctrl+Cmd+F). */
+    BIND(ACT_TOGGLE_SIDEBAR,  KEY_B,  MOD_SUPER);
+    /* F11 is the fullscreen key on Linux desktops; macOS's Ctrl+Cmd+F read as
+     * Ctrl+Shift would be Find. */
     BIND(ACT_TOGGLE_FULLSCREEN, KEY_F11, MOD_NONE);
-    /* Ctrl+Shift+P is the editor convention; Super+K stays as a second chord
-     * because it is the macOS habit and neither GNOME nor KDE claims it. */
-    BIND(ACT_COMMAND_PALETTE, KEY_P,  MOD_CTRL | MOD_SHIFT);
+    BIND(ACT_TOGGLE_FULLSCREEN, KEY_F,   MOD_CTRL | MOD_SUPER);
+    BIND(ACT_COMMAND_PALETTE, KEY_K,  MOD_CTRL | MOD_SHIFT);
     BIND(ACT_COMMAND_PALETTE, KEY_K,  MOD_SUPER);
-    BIND(ACT_SITE_MANAGER,    KEY_S,  MOD_CTRL | MOD_SHIFT);
-    BIND(ACT_VAULT_SOURCE,    KEY_A,  MOD_CTRL | MOD_ALT);   /* Ctrl+Shift+A selects all */
+    BIND(ACT_COMMAND_PALETTE, KEY_P,  MOD_CTRL | MOD_SHIFT);   /* the editors' palette key */
+    BIND(ACT_SITE_MANAGER,    KEY_S,  MOD_CTRL | MOD_ALT | MOD_SHIFT);
+    BIND(ACT_SITE_MANAGER,    KEY_S,  MOD_SUPER | MOD_SHIFT);
+    BIND(ACT_VAULT_SOURCE,    KEY_A,  MOD_CTRL | MOD_ALT | MOD_SHIFT);  /* pick a Vault doc → agent */
+    BIND(ACT_VAULT_SOURCE,    KEY_A,  MOD_SUPER | MOD_SHIFT);
+    BIND(ACT_VAULT_SOURCE,    KEY_A,  MOD_CTRL | MOD_ALT);
     BIND(ACT_VOICE_INPUT,     KEY_M,  MOD_CTRL | MOD_SHIFT);
+    BIND(ACT_VOICE_INPUT,     KEY_M,  MOD_SUPER | MOD_SHIFT);
 
-    /* Font — there is no View menu to carry Cmd+= / Cmd+- here. Ctrl+= and
-     * Ctrl+Shift+= (Ctrl++ on a US layout) both grow the text. */
+    /* Font — there is no View menu to carry Cmd+= / Cmd+- here. The desktop's
+     * Ctrl+= / Ctrl+- / Ctrl+0 come first; Ctrl+Shift+= (Ctrl++ on a US
+     * layout) grows the text too. Ctrl+Shift+- is left alone: it is Ctrl+_,
+     * the undo key of the shell's line editor and of the editors that share
+     * its keys. */
     BIND(ACT_FONT_BIGGER,     KEY_EQUAL, MOD_CTRL);
     BIND(ACT_FONT_BIGGER,     KEY_EQUAL, MOD_CTRL | MOD_SHIFT);
+    BIND(ACT_FONT_BIGGER,     KEY_EQUAL, MOD_SUPER);
     BIND(ACT_FONT_SMALLER,    KEY_MINUS, MOD_CTRL);
+    BIND(ACT_FONT_SMALLER,    KEY_MINUS, MOD_SUPER);
     BIND(ACT_FONT_RESET,      KEY_0,  MOD_CTRL);
+    BIND(ACT_FONT_RESET,      KEY_0,  MOD_CTRL | MOD_SHIFT);
+    BIND(ACT_FONT_RESET,      KEY_0,  MOD_SUPER);
 
     /* Edit — Ctrl+Shift, since bare Ctrl+C / Ctrl+V belong to the shell. */
     BIND(ACT_COPY,            KEY_C,  MOD_CTRL | MOD_SHIFT);
     BIND(ACT_PASTE,           KEY_V,  MOD_CTRL | MOD_SHIFT);
+    /* The desktop's other pair (CUA), with the clipboard, not PRIMARY: a
+     * compositor's own copy and paste keys reach a terminal as these. */
+    BIND(ACT_COPY,            KEY_INSERT, MOD_CTRL);
+    BIND(ACT_PASTE,           KEY_INSERT, MOD_SHIFT);
+    BIND(ACT_COPY,            KEY_C,  MOD_SUPER);
+    BIND(ACT_PASTE,           KEY_V,  MOD_SUPER);
     BIND(ACT_SELECT_ALL,      KEY_A,  MOD_CTRL | MOD_SHIFT);
+    BIND(ACT_SELECT_ALL,      KEY_A,  MOD_SUPER);
     BIND(ACT_CUT,             KEY_X,  MOD_CTRL | MOD_SHIFT);
+    BIND(ACT_CUT,             KEY_X,  MOD_SUPER);
     BIND(ACT_FIND,            KEY_F,  MOD_CTRL | MOD_SHIFT);
+    BIND(ACT_FIND,            KEY_F,  MOD_SUPER);
 
     /* App — no menu bar here, so Settings needs a real key. */
+    BIND(ACT_SETTINGS,        KEY_COMMA, MOD_CTRL | MOD_SHIFT);
+    BIND(ACT_SETTINGS,        KEY_COMMA, MOD_SUPER);
     BIND(ACT_SETTINGS,        KEY_COMMA, MOD_CTRL);
     BIND(ACT_SSH_CONNECT,     KEY_UNKNOWN, MOD_CTRL); /* via the toolbar */
 
@@ -249,48 +306,75 @@ void keybind_init_defaults(KeyBindTable *kb) {
     BIND(ACT_SCROLL_TO_TOP,    KEY_HOME,       MOD_SHIFT);
     BIND(ACT_SCROLL_TO_BOTTOM, KEY_END,        MOD_SHIFT);
 
-    /* Prompt jumps: <Super><Shift>Up/Down is the window manager's move to
-     * another monitor. */
+    /* Prompt jumps: Ctrl+Alt+Shift+Up / Down are the desktops' "move the
+     * window to a workspace", so these keep Ctrl+Shift (macOS's plain Cmd+Up /
+     * Down, the scrollback's ends, are Shift+Home / End on both). */
     BIND(ACT_PREV_PROMPT,      KEY_UP,         MOD_CTRL | MOD_SHIFT);
     BIND(ACT_NEXT_PROMPT,      KEY_DOWN,       MOD_CTRL | MOD_SHIFT);
+    BIND(ACT_PREV_PROMPT,      KEY_UP,         MOD_SUPER | MOD_SHIFT);
+    BIND(ACT_NEXT_PROMPT,      KEY_DOWN,       MOD_SUPER | MOD_SHIFT);
 
-    /* Clear — Ctrl+L is readline's own clear-screen, so the app's takes Shift. */
+    /* Clear — Ctrl+L is readline's own clear-screen. */
+    BIND(ACT_CLEAR_SCREEN,    KEY_K,  MOD_CTRL | MOD_ALT | MOD_SHIFT);
+    BIND(ACT_CLEAR_SCREEN,    KEY_K,  MOD_SUPER | MOD_SHIFT);
     BIND(ACT_CLEAR_SCREEN,    KEY_L,  MOD_CTRL | MOD_SHIFT);
 
-    /* Split — Ctrl+Shift+D side by side; stacked takes Ctrl+Alt+D, Shift is
-     * already spent. */
-    BIND(ACT_SPLIT_HORIZONTAL, KEY_D,  MOD_CTRL | MOD_SHIFT);
-    BIND(ACT_SPLIT_VERTICAL,   KEY_D,  MOD_CTRL | MOD_ALT);
+    /* Restart Shell. Read as above, Cmd+Shift+R would be Ctrl+Alt+Shift+R,
+     * the desktops' screen recorder, and Ctrl+Shift+R is Cmd+R (close what the
+     * pointer is on): F5 is the desktops' reload key. */
+    BIND(ACT_RESTART_SHELL,   KEY_F5, MOD_CTRL | MOD_SHIFT);
+    BIND(ACT_RESTART_SHELL,   KEY_R,  MOD_SUPER | MOD_SHIFT);
 
-    /* Panes — Alt+Shift and an arrow to the neighbour: Ctrl+Shift+Up/Down
-     * are the prompt jumps, Ctrl+Alt+Left/Right belong to the desktop's
-     * workspace switch and Super+Alt+Arrows nudge the divider. Ctrl+Shift+[ / ]
-     * go through the panes in order and Ctrl+Shift+Z fills the tab with one. */
+    /* Split */
+    BIND(ACT_SPLIT_HORIZONTAL, KEY_D,  MOD_CTRL | MOD_SHIFT);
+    BIND(ACT_SPLIT_HORIZONTAL, KEY_D,  MOD_SUPER);
+    BIND(ACT_SPLIT_VERTICAL,   KEY_D,  MOD_CTRL | MOD_ALT | MOD_SHIFT);
+    BIND(ACT_SPLIT_VERTICAL,   KEY_D,  MOD_SUPER | MOD_SHIFT);
+    BIND(ACT_SPLIT_VERTICAL,   KEY_O,  MOD_CTRL | MOD_SHIFT);   /* a Linux terminal's habit */
+
+    /* Panes — Alt+Shift and an arrow to the neighbour: Ctrl+Alt+Shift+arrows
+     * (macOS's Cmd+Option read as above) move the window to a workspace,
+     * Ctrl+Shift+Up / Down are the prompt jumps and Ctrl+Shift+Left / Right
+     * select words in programs. Ctrl+Shift+[ / ] go through the panes in
+     * order and Ctrl+Shift+Enter fills the tab with one. */
     BIND(ACT_FOCUS_PANE_LEFT,  KEY_LEFT,  MOD_ALT | MOD_SHIFT);
     BIND(ACT_FOCUS_PANE_RIGHT, KEY_RIGHT, MOD_ALT | MOD_SHIFT);
     BIND(ACT_FOCUS_PANE_UP,    KEY_UP,    MOD_ALT | MOD_SHIFT);
     BIND(ACT_FOCUS_PANE_DOWN,  KEY_DOWN,  MOD_ALT | MOD_SHIFT);
+    BIND(ACT_FOCUS_PANE_LEFT,  KEY_LEFT,  MOD_SUPER | MOD_ALT);
+    BIND(ACT_FOCUS_PANE_RIGHT, KEY_RIGHT, MOD_SUPER | MOD_ALT);
+    BIND(ACT_FOCUS_PANE_UP,    KEY_UP,    MOD_SUPER | MOD_ALT);
+    BIND(ACT_FOCUS_PANE_DOWN,  KEY_DOWN,  MOD_SUPER | MOD_ALT);
     BIND(ACT_PREV_PANE,        KEY_LEFT_BRACKET,  MOD_CTRL | MOD_SHIFT);
     BIND(ACT_NEXT_PANE,        KEY_RIGHT_BRACKET, MOD_CTRL | MOD_SHIFT);
-    BIND(ACT_TOGGLE_PANE_ZOOM, KEY_Z, MOD_CTRL | MOD_SHIFT);
+    BIND(ACT_PREV_PANE,        KEY_LEFT_BRACKET,  MOD_SUPER);
+    BIND(ACT_NEXT_PANE,        KEY_RIGHT_BRACKET, MOD_SUPER);
+    BIND(ACT_TOGGLE_PANE_ZOOM, KEY_ENTER, MOD_CTRL | MOD_SHIFT);
+    BIND(ACT_TOGGLE_PANE_ZOOM, KEY_ENTER, MOD_SUPER | MOD_SHIFT);
 
     /* Broadcast */
     BIND(ACT_BROADCAST_TOGGLE, KEY_I,  MOD_CTRL | MOD_SHIFT);
+    BIND(ACT_BROADCAST_TOGGLE, KEY_I,  MOD_SUPER | MOD_SHIFT);
 
     /* File — not Ctrl+S, which is XOFF to the tty and freezes the pane for
-     * anyone who presses it from editor habit; Ctrl+Shift+S is the site
-     * manager, so saving takes Ctrl+Alt+S. */
+     * anyone who presses it from editor habit. */
+    BIND(ACT_SAVE_FILE,       KEY_S,  MOD_CTRL | MOD_SHIFT);
+    BIND(ACT_SAVE_FILE,       KEY_S,  MOD_SUPER);
     BIND(ACT_SAVE_FILE,       KEY_S,  MOD_CTRL | MOD_ALT);
 
-    /* Ctrl+Shift+T is the new tab (the terminal convention wins over the
-     * browser's reopen), so reopening moves one modifier over. */
-    BIND(ACT_UNDO_CLOSE_TAB,  KEY_T,  MOD_CTRL | MOD_ALT);
+    BIND(ACT_UNDO_CLOSE_TAB,  KEY_T,  MOD_CTRL | MOD_ALT | MOD_SHIFT);
+    BIND(ACT_UNDO_CLOSE_TAB,  KEY_T,  MOD_SUPER | MOD_SHIFT);
     BIND(ACT_RENAME_TAB,      KEY_E,  MOD_CTRL | MOD_SHIFT);
-    BIND(ACT_VAULT_BROWSER,   KEY_V,  MOD_CTRL | MOD_ALT);   /* Ctrl+Shift+V pastes */
+    BIND(ACT_RENAME_TAB,      KEY_E,  MOD_SUPER | MOD_SHIFT);
+    BIND(ACT_VAULT_BROWSER,   KEY_V,  MOD_CTRL | MOD_ALT | MOD_SHIFT);
+    BIND(ACT_VAULT_BROWSER,   KEY_V,  MOD_SUPER | MOD_SHIFT);
+    BIND(ACT_VAULT_BROWSER,   KEY_V,  MOD_CTRL | MOD_ALT);
 
     /* Windows */
     BIND(ACT_NEW_WINDOW,      KEY_N,  MOD_CTRL | MOD_SHIFT);
+    BIND(ACT_NEW_WINDOW,      KEY_N,  MOD_SUPER);
     BIND(ACT_QUIT,            KEY_Q,  MOD_CTRL | MOD_SHIFT);
+    BIND(ACT_QUIT,            KEY_Q,  MOD_SUPER);
 #endif
 
     /* Inline autosuggest — Right arrow accepts the ghost completion (fish
@@ -355,9 +439,10 @@ void keybind_set(KeyBindTable *kb, Action action, KeyCode key, u32 mods) {
 }
 
 /* Every chord of the action goes: "Unbound" in keybindings.json and Delete in
- * Settings mean the action has none. An action can have two default chords
- * (the palette's Super+K on Linux); leaving the second would keep the cleared
- * action bound, and the next save would write that chord as the user's. */
+ * Settings mean the action has none. An action can have several default
+ * chords (on Linux its macOS chord on Super, sometimes an older one); leaving
+ * one would keep the cleared action bound, and the next save would write that
+ * chord as the user's. */
 void keybind_remove(KeyBindTable *kb, Action action) {
     for (i32 i = 0; i < kb->count; ) {
         if (kb->bindings[i].action == action) {
@@ -549,7 +634,7 @@ bool keybind_load(KeyBindTable *kb, const char *path) {
     KeyBindTable def;
     keybind_init_defaults(&def);
     bool first_seen[ACT_COUNT] = { false };
-    for (i32 i = 0; version < KEYBIND_FILE_VERSION && i < kb->count; i++) {
+    for (i32 i = 0; version < 3 && i < kb->count; i++) {
         Action a = kb->bindings[i].action;
         if (a <= ACT_NONE || a >= ACT_COUNT || first_seen[a]) continue;
         first_seen[a] = true;
@@ -558,6 +643,61 @@ bool keybind_load(KeyBindTable *kb, const char *path) {
         if (!d || (d->mods & MOD_SUPER)) continue;
         kb->bindings[i].key  = d->key;
         kb->bindings[i].mods = d->mods;
+    }
+    /* Before version 4 the table had reopen-tab on Ctrl+Alt+T and the stacked
+     * split on Ctrl+Alt+D, which common desktops take (a terminal, the
+     * desktop), so neither reached the window. A file still holding them
+     * moves to the current defaults; any other chord there was chosen. */
+    if (version < 4) {
+        static const struct { Action a; KeyCode key; u32 mods; } taken[] = {
+            { ACT_UNDO_CLOSE_TAB, KEY_T, MOD_CTRL | MOD_ALT },
+            { ACT_SPLIT_VERTICAL, KEY_D, MOD_CTRL | MOD_ALT },
+        };
+        for (usize j = 0; j < sizeof taken / sizeof taken[0]; j++) {
+            const KeyBinding *b = keybind_get(kb, taken[j].a);
+            const KeyBinding *d = keybind_get(&def, taken[j].a);
+            if (b && d && b->key == taken[j].key && b->mods == taken[j].mods)
+                keybind_set(kb, taken[j].a, d->key, d->mods);
+        }
+    }
+    /* Before version 5 the table held Linux terminals' own chords; now they
+     * are macOS's with Cmd read as Ctrl+Shift, each with a second chord on
+     * Super. An action a file still holds on its old default gets every chord
+     * it has now. The one exception is a new first chord the file gives
+     * another action, which was chosen: that action keeps it and this one
+     * stays where it was. */
+    if (version < 5) {
+        static const struct { Action a; KeyCode key; u32 mods; } old[] = {
+            { ACT_TAB_1, KEY_1, MOD_ALT }, { ACT_TAB_2, KEY_2, MOD_ALT }, { ACT_TAB_3, KEY_3, MOD_ALT },
+            { ACT_TAB_4, KEY_4, MOD_ALT }, { ACT_TAB_5, KEY_5, MOD_ALT }, { ACT_TAB_6, KEY_6, MOD_ALT },
+            { ACT_TAB_7, KEY_7, MOD_ALT }, { ACT_TAB_8, KEY_8, MOD_ALT }, { ACT_TAB_9, KEY_9, MOD_ALT },
+            { ACT_COMMAND_PALETTE,  KEY_P,     MOD_CTRL | MOD_SHIFT },
+            { ACT_SITE_MANAGER,     KEY_S,     MOD_CTRL | MOD_SHIFT },
+            { ACT_VAULT_SOURCE,     KEY_A,     MOD_CTRL | MOD_ALT },
+            { ACT_SETTINGS,         KEY_COMMA, MOD_CTRL },
+            { ACT_CLEAR_SCREEN,     KEY_L,     MOD_CTRL | MOD_SHIFT },
+            { ACT_SPLIT_VERTICAL,   KEY_O,     MOD_CTRL | MOD_SHIFT },
+            { ACT_TOGGLE_PANE_ZOOM, KEY_Z,     MOD_CTRL | MOD_SHIFT },
+            { ACT_SAVE_FILE,        KEY_S,     MOD_CTRL | MOD_ALT },
+            { ACT_VAULT_BROWSER,    KEY_V,     MOD_CTRL | MOD_ALT },
+        };
+        bool move[ACT_COUNT] = { false };
+        for (usize j = 0; j < sizeof old / sizeof old[0]; j++) {
+            const KeyBinding *b = keybind_get(kb, old[j].a);
+            if (b && b->key == old[j].key && b->mods == old[j].mods) move[old[j].a] = true;
+        }
+        for (i32 a = 1; a < ACT_COUNT; a++) {
+            const KeyBinding *d = move[a] ? keybind_get(&def, (Action)a) : NULL;
+            Action owner = d ? keybind_lookup(kb, d->key, d->mods) : ACT_NONE;
+            if (owner != ACT_NONE && owner != (Action)a && !move[owner]) move[a] = false;
+        }
+        for (i32 a = 1; a < ACT_COUNT; a++)
+            if (move[a]) keybind_remove(kb, (Action)a);
+        for (i32 i = 0; i < def.count; i++) {
+            const KeyBinding *d = &def.bindings[i];
+            if (!move[d->action] || keybind_lookup(kb, d->key, d->mods) != ACT_NONE) continue;
+            if (kb->count < MAX_KEYBINDINGS) kb->bindings[kb->count++] = *d;
+        }
     }
 #endif
     const KeyBinding *split_h = keybind_get(kb, ACT_SPLIT_HORIZONTAL);

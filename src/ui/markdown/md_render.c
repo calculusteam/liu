@@ -1242,10 +1242,12 @@ static f32 render_code(const MdBlock *b, MdRenderCtx *ctx,
                         slice_eq_ci_cstr(b->info, "tex")))
         return render_math_block(b, ctx, x, y, max_x);
 
-    /* A ```mermaid fence with a supported diagram type renders natively;
-     * anything that cannot be laid out falls through to the code path
-     * below. */
-    if (b->info.len && slice_eq_ci_cstr(b->info, "mermaid") &&
+    /* A ```mermaid, ```dot / ```graphviz or ```plantuml / ```puml fence
+     * with a supported diagram renders natively; anything that cannot be laid
+     * out falls through to the code path below. */
+    if (b->info.len && (slice_eq_ci_cstr(b->info, "mermaid") || slice_eq_ci_cstr(b->info, "dot") ||
+                        slice_eq_ci_cstr(b->info, "graphviz") || slice_eq_ci_cstr(b->info, "gv") ||
+                        slice_eq_ci_cstr(b->info, "plantuml") || slice_eq_ci_cstr(b->info, "puml")) &&
         md_diagram_probe(b->raw.data, b->raw.len) != MD_DIAGRAM_NONE)
         return render_diagram_block(b, ctx, x, y, max_x);
 

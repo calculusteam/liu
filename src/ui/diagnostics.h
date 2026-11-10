@@ -102,7 +102,6 @@ void diag_fix_all(DiagReport *r, const char *notify_bin,
  * diag_run and after each fix. */
 void diag_recount(DiagReport *r);
 
-const char *diag_status_label(DiagStatus s);   /* "OK" / "Info" / "Warning" / "Problem" */
 const char *diag_group_label(DiagGroup g);
 const char *diag_fix_label(DiagFixKind k);     /* the button's verb, "" for NONE */
 

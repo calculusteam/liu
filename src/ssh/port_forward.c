@@ -6,6 +6,8 @@
 #include "core/net.h"
 #include "ssh/socks5.h"
 #include "ssh/relay_watch.h"
+#include "ssh/open_queue.h"   /* whose channel open libssh2 carries, and who is asked next */
+#include "ssh/open_gate.h"    /* who may start one on a connection at all */
 #include "platform/platform.h"   /* platform_time_sec — the handshake deadline */
 #include <stdlib.h>
 #include <string.h>
@@ -24,11 +26,14 @@
 #define MAX_FORWARD_CONNS 64
 #define MAX_FORWARD_OPENING 16
 #define FORWARD_OPEN_SEC 10.0
+/* The longest the settle below waits for a channel open in flight to answer. */
+#define FORWARD_SETTLE_MS 2000
 
 typedef struct {
     ForwardRule     info;
     LIBSSH2_SESSION *owner;
     i32             listen_fd;
+    bool            watched;     /* the loop is woken for the listener (only while the rule has room) */
 } ForwardRuleSlot;
 
 typedef struct {
@@ -81,6 +86,9 @@ typedef struct {
     char             host[256];
     i32              port;
     f64              deadline;
+    u64              seq;        /* arrival order (ssh/open_queue.h) */
+    bool             started;    /* its open is asked for: libssh2 carries it, and only it is asked for now */
+    bool             orphan;     /* its client is gone (too long, or its rule removed) but the open must finish */
 } ForwardOpening;
 
 /* ---------------------------------------------------------------------------
@@ -126,6 +134,11 @@ typedef struct {
     /* Round-robin start for poll_connections: with a budget per call, the
      * connection served first would otherwise be served first every frame. */
     i32             rr_next;
+    /* Which connections' channel open is held by a Unix-socket forward set or
+     * reserved by a borrowing pane (forward_open_hold, forward_open_reserve):
+     * no direct-tcpip open starts on them meanwhile. */
+    OpenGate        gate;
+    u64             open_seq;
 } ForwardManager;
 
 static ForwardManager g_fwd = {0};
@@ -204,7 +217,7 @@ static int create_listener(int port) {
         return -1;
     }
 
-    if (listen(fd, 8) < 0) {
+    if (listen(fd, 32) < 0) {
         close(fd);
         return -1;
     }
@@ -439,6 +452,23 @@ static void opening_drop(ForwardOpening *p) {
     p->fd = -1;
 }
 
+/* A connection that is not to be served any more (too long, its rule removed).
+ * Its client is let go. When its open is already in flight libssh2 cannot
+ * cancel it, and the next call would be handed ITS channel: the slot stays,
+ * asked for with its own host and port, until the answer comes and is closed. */
+static void opening_abandon(ForwardOpening *p, bool tell_client) {
+    if (!p || !p->active) return;
+    if (tell_client && p->socks_reply && p->fd >= 0) socks_reply(p->fd, 0x05);
+    if (!p->started) { opening_drop(p); return; }
+    if (p->fd >= 0) close(p->fd);
+    p->fd = -1;
+    p->orphan = true;
+}
+
+static bool open_held_locked(LIBSSH2_SESSION *owner) {
+    return open_gate_blocked(&g_fwd.gate, owner, NULL);
+}
+
 static bool queue_connection_open(LIBSSH2_SESSION *owner, i32 rule_slot,
                                   int client_fd, const char *host, i32 port,
                                   bool socks_reply_on_open) {
@@ -458,6 +488,7 @@ static bool queue_connection_open(LIBSSH2_SESSION *owner, i32 rule_slot,
         p->rule_slot   = rule_slot;
         p->port        = port;
         p->deadline    = platform_time_sec() + FORWARD_OPEN_SEC;
+        p->seq         = ++g_fwd.open_seq;
         snprintf(p->host, sizeof p->host, "%s", host);
         /* Session traffic is owned by the main poll thread and is normally
          * already non-blocking. Make the requirement explicit so the channel
@@ -470,21 +501,40 @@ static bool queue_connection_open(LIBSSH2_SESSION *owner, i32 rule_slot,
 
 static void poll_opening_connections(LIBSSH2_SESSION *owner) {
     f64 now = platform_time_sec();
+    /* A connection that has waited past its deadline is let go. One whose open
+     * has not started has nothing in libssh2; one in flight stays as an orphan
+     * (opening_abandon). */
     for (i32 i = 0; i < MAX_FORWARD_OPENING; i++) {
         ForwardOpening *p = &g_fwd.opening[i];
-        if (!p->active || p->owner != owner) continue;
+        if (p->active && p->owner == owner && !p->orphan && now > p->deadline)
+            opening_abandon(p, true);
+    }
 
-        if (now > p->deadline) {
-            if (p->socks_reply) socks_reply(p->fd, 0x05);
-            opening_drop(p);
-            continue;
+    /* libssh2 carries ONE open at a time per session and continues it whatever
+     * the next call asks for (ssh/open_queue.h): the open in flight is asked for
+     * again, alone; when none is, the oldest connection starts. */
+    for (i32 turn = 0; turn < MAX_FORWARD_OPENING; turn++) {
+        OpenQueueEntry q[MAX_FORWARD_OPENING];
+        for (i32 i = 0; i < MAX_FORWARD_OPENING; i++) {
+            const ForwardOpening *o = &g_fwd.opening[i];
+            q[i] = (OpenQueueEntry){ o->active, o->started, o->seq, o->owner };
         }
+        i32 at = open_queue_pick(q, MAX_FORWARD_OPENING, owner, open_held_locked(owner));
+        if (at < 0) return;
+        ForwardOpening *p = &g_fwd.opening[at];
+        p->started = true;
 
         LIBSSH2_CHANNEL *ch = libssh2_channel_direct_tcpip(owner, p->host, p->port);
         if (!ch) {
             if (libssh2_session_last_errno(owner) == LIBSSH2_ERROR_EAGAIN)
-                continue;
-            if (p->socks_reply) socks_reply(p->fd, 0x05);
+                return;                      /* still in flight: nothing else starts */
+            if (p->socks_reply && !p->orphan) socks_reply(p->fd, 0x05);
+            opening_drop(p);
+            continue;
+        }
+        if (p->orphan) {                     /* nobody is waiting for it */
+            libssh2_channel_close(ch);
+            libssh2_channel_free(ch);
             opening_drop(p);
             continue;
         }
@@ -503,12 +553,28 @@ static void poll_opening_connections(LIBSSH2_SESSION *owner) {
     }
 }
 
-static void accept_rule_connection(ForwardRuleSlot *slot) {
+/* Can a connection taken off this rule's listener be held? With a full table the
+ * client stays in the listen queue instead of being accepted and closed, and
+ * the listener is not watched (a readable listener nobody accepts from would
+ * wake the loop for ever) until there is room again. */
+static bool rule_has_room(const ForwardRuleSlot *slot) {
+    bool opening = false;
+    for (i32 i = 0; i < MAX_FORWARD_OPENING && !opening; i++) opening = !g_fwd.opening[i].active;
+    if (!opening) return false;
+    if (slot->info.type == FWD_DYNAMIC) {
+        for (i32 i = 0; i < MAX_SOCKS_PENDING; i++)
+            if (!g_fwd.socks[i].active) return true;
+        return false;
+    }
+    return alloc_conn_slot() >= 0;
+}
+
+static bool accept_rule_connection(ForwardRuleSlot *slot) {
     struct sockaddr_in client_addr;
     socklen_t addr_len = sizeof(client_addr);
     int client_fd = accept(slot->listen_fd, (struct sockaddr *)&client_addr, &addr_len);
-    if (client_fd < 0) return;
-    if (!set_cloexec(client_fd)) { close(client_fd); return; }
+    if (client_fd < 0) return false;
+    if (!set_cloexec(client_fd)) { close(client_fd); return true; }
 #ifdef SO_NOSIGPIPE
     int one = 1;
     (void)setsockopt(client_fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
@@ -521,7 +587,7 @@ static void accept_rule_connection(ForwardRuleSlot *slot) {
                                    slot->info.remote_port, false)) {
             close(client_fd);
         }
-        return;
+        return true;
     }
 
     if (slot->info.type == FWD_DYNAMIC) {
@@ -532,10 +598,11 @@ static void accept_rule_connection(ForwardRuleSlot *slot) {
         i32 rule_slot = (i32)(slot - g_fwd.rules);
         if (!socks_pending_begin(slot->owner, rule_slot, client_fd))
             close(client_fd);
-        return;
+        return true;
     }
 
     close(client_fd);
+    return true;
 }
 
 /* The relay's poll budget. This runs on the UI thread under the session's io
@@ -730,6 +797,7 @@ i32 forward_add_local(LIBSSH2_SESSION *owner, i32 local_port, const char *remote
     r->owner = owner;
     r->listen_fd = fd;
     platform_watch_socket(fd);     /* a connection wakes the loop (ssh/relay_watch.h) */
+    r->watched = true;
     r->info.type = FWD_LOCAL;
     r->info.local_port = local_port;
     snprintf(r->info.remote_host, sizeof(r->info.remote_host), "%s", remote_host);
@@ -755,6 +823,7 @@ i32 forward_add_socks5(LIBSSH2_SESSION *owner, i32 local_port) {
     r->owner = owner;
     r->listen_fd = fd;
     platform_watch_socket(fd);
+    r->watched = true;
     r->info.type = FWD_DYNAMIC;
     r->info.local_port = local_port;
     r->info.active = true;
@@ -789,7 +858,7 @@ void forward_remove(LIBSSH2_SESSION *owner, i32 index) {
     for (i32 i = 0; i < MAX_FORWARD_OPENING; i++) {
         ForwardOpening *p = &g_fwd.opening[i];
         if (p->active && p->owner == owner && p->rule_slot == slot)
-            opening_drop(p);
+            opening_abandon(p, true);       /* an open in flight is still carried to its end */
     }
     FWD_UNLOCK();
 }
@@ -801,7 +870,10 @@ bool forward_poll(LIBSSH2_SESSION *owner) {
     for (i32 i = 0; i < g_fwd.rule_hi; i++) {
         ForwardRuleSlot *r = &g_fwd.rules[i];
         if (!r->info.active || r->owner != owner || r->listen_fd < 0) continue;
-        accept_rule_connection(r);
+        /* Everything that is waiting, as far as there is room: a listener's
+         * queue (8) is smaller than a browser's burst. */
+        for (i32 k = 0; k < MAX_FORWARD_OPENING && rule_has_room(r); k++)
+            if (!accept_rule_connection(r)) break;
     }
 
     /* SOCKS5 greetings that arrived in pieces. */
@@ -812,6 +884,16 @@ bool forward_poll(LIBSSH2_SESSION *owner) {
     poll_opening_connections(owner);
 
     bool more = poll_connections(owner);
+    /* A listener wakes the loop only while its rule would take what waits on it. */
+    for (i32 i = 0; i < g_fwd.rule_hi; i++) {
+        ForwardRuleSlot *r = &g_fwd.rules[i];
+        if (!r->info.active || r->owner != owner || r->listen_fd < 0) continue;
+        bool want = rule_has_room(r);
+        if (want == r->watched) continue;
+        if (want) platform_watch_socket(r->listen_fd);
+        else      platform_unwatch_socket(r->listen_fd);
+        r->watched = want;
+    }
     FWD_UNLOCK();
     return more;
 }
@@ -841,10 +923,8 @@ bool forward_get(LIBSSH2_SESSION *owner, i32 index, ForwardRule *out) {
     return true;
 }
 
-void forward_cleanup(LIBSSH2_SESSION *owner) {
-    if (!owner) return;
-
-    FWD_LOCK();
+/* `owner`'s rules, relays and SOCKS handshakes, ended. Under FWD_LOCK. */
+static void forward_end_rules_locked(LIBSSH2_SESSION *owner) {
     for (i32 i = 0; i < g_fwd.rule_hi; i++) {
         if (g_fwd.rules[i].owner != owner) continue;
         if (g_fwd.rules[i].info.active && g_fwd.rules[i].listen_fd >= 0) {
@@ -865,9 +945,130 @@ void forward_cleanup(LIBSSH2_SESSION *owner) {
         SocksPending *p = &g_fwd.socks[i];
         if (p->active && p->owner == owner) socks_pending_drop(p);
     }
+}
+
+void forward_cleanup(LIBSSH2_SESSION *owner) {
+    if (!owner) return;
+
+    FWD_LOCK();
+    forward_end_rules_locked(owner);
     for (i32 i = 0; i < MAX_FORWARD_OPENING; i++) {
         ForwardOpening *p = &g_fwd.opening[i];
         if (p->active && p->owner == owner) opening_drop(p);
+    }
+    open_gate_forget(&g_fwd.gate, owner);
+    FWD_UNLOCK();
+}
+
+void forward_cleanup_pane(LIBSSH2_SESSION *owner) {
+    if (!owner) return;
+    FWD_LOCK();
+    forward_end_rules_locked(owner);
+    for (i32 i = 0; i < MAX_FORWARD_OPENING; i++) {
+        ForwardOpening *p = &g_fwd.opening[i];
+        if (p->active && p->owner == owner) opening_abandon(p, true);
+    }
+    FWD_UNLOCK();
+}
+
+void forward_open_carry(LIBSSH2_SESSION *owner) {
+    if (!owner) return;
+    FWD_LOCK();
+    for (i32 i = 0; i < MAX_FORWARD_OPENING; i++) {
+        ForwardOpening *p = &g_fwd.opening[i];
+        if (p->active) continue;
+        memset(p, 0, sizeof *p);
+        p->active    = true;
+        p->fd        = -1;
+        p->owner     = owner;
+        p->rule_slot = -1;
+        snprintf(p->host, sizeof p->host, "127.0.0.1");
+        p->port      = 1;
+        p->seq       = ++g_fwd.open_seq;
+        p->started   = true;
+        p->orphan    = true;
+        break;
+    }
+    FWD_UNLOCK();
+}
+
+/* Is a TCP / SOCKS open of `owner` in flight? Under FWD_LOCK. */
+static bool opening_in_flight_locked(LIBSSH2_SESSION *owner) {
+    OpenQueueEntry q[MAX_FORWARD_OPENING];
+    for (i32 i = 0; i < MAX_FORWARD_OPENING; i++) {
+        const ForwardOpening *o = &g_fwd.opening[i];
+        q[i] = (OpenQueueEntry){ o->active, o->started, o->seq, o->owner };
+    }
+    return open_queue_busy(q, MAX_FORWARD_OPENING, owner);
+}
+
+bool forward_open_busy(LIBSSH2_SESSION *owner, const void *who) {
+    if (!owner) return false;
+    FWD_LOCK();
+    bool busy = opening_in_flight_locked(owner) || open_gate_blocked(&g_fwd.gate, owner, who);
+    FWD_UNLOCK();
+    return busy;
+}
+
+void forward_open_hold(LIBSSH2_SESSION *owner, const void *who, bool held) {
+    if (!owner) return;
+    FWD_LOCK();
+    open_gate_hold(&g_fwd.gate, owner, who, held);
+    FWD_UNLOCK();
+}
+
+void forward_open_reserve(LIBSSH2_SESSION *owner, bool on) {
+    if (!owner) return;
+    FWD_LOCK();
+    open_gate_reserve(&g_fwd.gate, owner, on);
+    FWD_UNLOCK();
+}
+
+bool forward_open_idle(LIBSSH2_SESSION *owner) {
+    if (!owner) return true;
+    FWD_LOCK();
+    bool idle = !opening_in_flight_locked(owner) && !open_gate_held(&g_fwd.gate, owner);
+    FWD_UNLOCK();
+    return idle;
+}
+
+void forward_open_settle(LIBSSH2_SESSION *owner) {
+    if (!owner) return;
+    char host[sizeof g_fwd.opening[0].host] = {0};
+    i32 port = 0;
+    u64 seq = 0;
+    FWD_LOCK();
+    for (i32 i = 0; i < MAX_FORWARD_OPENING && !port; i++) {
+        const ForwardOpening *p = &g_fwd.opening[i];
+        if (!p->active || p->owner != owner || !p->started) continue;
+        snprintf(host, sizeof host, "%s", p->host);
+        port = p->port;
+        seq = p->seq;
+    }
+    FWD_UNLOCK();
+    if (!port) return;
+    /* Asked for with its own host and port, as the poll does; the session is in
+     * blocking mode, so the call ends with the answer (or the short bound). */
+    long timeout = libssh2_session_get_timeout(owner);
+    libssh2_session_set_timeout(owner, FORWARD_SETTLE_MS);
+    LIBSSH2_CHANNEL *ch = libssh2_channel_direct_tcpip(owner, host, port);
+    bool left = !ch && libssh2_session_last_errno(owner) == LIBSSH2_ERROR_TIMEOUT;
+    libssh2_session_set_timeout(owner, timeout);
+    if (ch) {
+        libssh2_channel_close(ch);
+        libssh2_channel_free(ch);
+    }
+    if (left) return;
+    /* The open ended here, as a channel or as a refusal: libssh2 holds nothing
+     * of it, so its connection is let go now. Left as it was, it would be
+     * asked for again as an open of its own. */
+    FWD_LOCK();
+    for (i32 i = 0; i < MAX_FORWARD_OPENING; i++) {
+        ForwardOpening *p = &g_fwd.opening[i];
+        if (!p->active || p->owner != owner || !p->started || p->seq != seq) continue;
+        p->started = false;
+        opening_abandon(p, true);
+        break;
     }
     FWD_UNLOCK();
 }

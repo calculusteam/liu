@@ -9,7 +9,7 @@
 #include <math.h>
 #include <string.h>
 
-#define NOTIFICATION_MAX_LINES 3
+#define NOTIFICATION_MAX_LINES 4
 #define NOTIFICATION_TEXT_CAP 256
 
 typedef struct {

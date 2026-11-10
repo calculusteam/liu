@@ -131,11 +131,10 @@ static void claude_envelope(JsonW *w, const BridgeHistory *h, const char *sid,
 }
 
 /* Claude requires a tool_use id to start with "toolu_" and its tool_result to
- * repeat it exactly; the IR's id is reused, prefixed when it is not already. */
+ * repeat it exactly; the IR's id is reused, prefixed when it is not already,
+ * in the form the API accepts (bridge_wire_tool_id). */
 static void claude_tool_id(char *out, usize cap, const char *id) {
-    if (!id || !id[0]) id = "liu";
-    if (strncmp(id, "toolu_", 6) == 0) snprintf(out, cap, "%.150s", id);
-    else snprintf(out, cap, "toolu_%.140s", id);
+    bridge_wire_tool_id(out, cap, "toolu_", id);
 }
 
 /* The call a result at `ri` answers, searched back over the run before it. */
@@ -152,6 +151,23 @@ static const BridgeEvent *claude_call_of(const BridgeHistory *h, usize ri, usize
         }
     }
     return NULL;
+}
+
+/* The name the call that result `ri` answers is written under, "Tool" when
+ * that call is not found. */
+static void claude_result_tool_name(const BridgeHistory *h, usize ri, char *out, usize cap) {
+    snprintf(out, cap, "Tool");
+    usize ci = 0;
+    const BridgeEvent *c = claude_call_of(h, ri, &ci);
+    if (!c) return;
+    BridgeCallFacts f;
+    bridge_call_facts(c, &h->events[ri], &f);
+    char name[128] = "";
+    cJSON *args = NULL;
+    if (bridge_call_in_vocab(BRIDGE_VOCAB_CLAUDE, &f, name, sizeof name, &args) && name[0])
+        snprintf(out, cap, "%s", name);
+    cJSON_Delete(args);
+    bridge_call_facts_free(&f);
 }
 
 /* `toolUseResult` for a file change the source recorded: the hunks Claude
@@ -382,7 +398,16 @@ bool bridge_write_claude_session(const BridgeHistory *h, const char *session_id,
             jsonw_obj_begin(&w, NULL);
             jsonw_str(&w, "type", "tool_result");
             jsonw_str(&w, "tool_use_id", tid);
-            jsonw_str(&w, "content", e->tool_output ? e->tool_output : "");
+            if (e->tool_output && e->tool_output[0]) {
+                jsonw_str(&w, "content", e->tool_output);
+            } else {
+                /* An empty result is written the way Claude Code writes its
+                 * own, so the model reads it as a call that returned. */
+                char name[128], none[176];
+                claude_result_tool_name(h, i, name, sizeof name);
+                snprintf(none, sizeof none, "(%s completed with no output)", name);
+                jsonw_str(&w, "content", none);
+            }
             if (e->tool_failed) jsonw_bool(&w, "is_error", true);
             jsonw_obj_end(&w);
             jsonw_arr_end(&w);

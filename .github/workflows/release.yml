@@ -1,15 +1,14 @@
 name: Release packages (Linux)
 
-# Build Linux release packages in ubuntu:22.04 for both architectures. This
-# workflow does not sign or publish artifacts. scripts/release.sh builds the
-# macOS app, collects these packages, signs and verifies the release
-# artifacts, and publishes the release.
+# Builds the Linux release packages for a v<VERSION> tag, starts what was
+# built, installs every package on the systems it is made for and starts Liu
+# there, and uploads the packages with their checksums as pkg-linux-<arch>.
+# scripts/release.sh downloads them on the release Mac, checks the checksums,
+# signs and publishes; this workflow signs and publishes nothing.
 #
-# The workflow runs for a v<VERSION> tag pushed by ref name or when manually
-# dispatched on that tag. A push to main does not trigger it. Linux packages
-# are uploaded as pkg-linux-<arch> artifacts for release.sh to collect.
-#
-# This workflow has no signing secrets, and its token is read-only.
+# It runs for a v<VERSION> tag pushed by ref name, or by hand on that tag. A
+# push to main does not trigger it. It has no secret, and its token is
+# read-only.
 
 on:
   push:
@@ -20,39 +19,23 @@ on:
 permissions:
   contents: read
 
+# One run per tag at a time; a second push of the same tag waits instead of
+# racing the first for the artifact names.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   # ---------------------------------------------------------------------------
-  # The packager names files from `git describe --exact-match`: built from any
-  # ref but the release tag, every file would carry a +<hash> suffix and
-  # release.sh would not find it.
-  tag:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - name: The ref is the release tag v<VERSION>
-        run: |
-          set -euo pipefail
-          version="$(tr -d '[:space:]' < VERSION)"
-          if [[ ! "${version}" =~ ^[0-9]+(\.[0-9]+){0,2}(-[A-Za-z0-9.]+)?$ ]]; then
-            echo "::error::VERSION '${version}' is not a valid release token."
-            exit 1
-          fi
-          if [[ "${GITHUB_REF_TYPE}" != "tag" || "${GITHUB_REF_NAME}" != "v${version}" ]]; then
-            echo "::error::run this on the tag v${version} (this run is on the ${GITHUB_REF_TYPE} ${GITHUB_REF_NAME})."
-            exit 1
-          fi
-
-  # ---------------------------------------------------------------------------
-  # Linux is built inside ubuntu:22.04 on both architectures, not on the
-  # runner's own 24.04: a binary records the newest glibc symbol version it was
-  # linked against, and one linked on 24.04 needs GLIBC_2.38 and will not start
-  # on Ubuntu 22.04 or Debian 12. Built on 22.04 (glibc 2.35, OpenSSL 3.0,
+  # Linux is built inside ubuntu:22.04 on each architecture's own runner, not
+  # on the runner's 24.04: a binary records the newest glibc symbol version it
+  # was linked against, and one linked on 24.04 needs GLIBC_2.38 and will not
+  # start on Ubuntu 22.04 or Debian 12. Built on 22.04 (glibc 2.35, OpenSSL 3.0,
   # libssh2 1.10) it runs on Ubuntu 22.04+, Debian 12+ and Fedora 36+, and
-  # scripts/check_linux_binaries.sh fails the job if a binary asks for more.
-  # One build per arch; package_linux.sh makes the tarball from it and the
-  # .deb, the .rpm and the AppImage from the tarball.
-  build-linux:
-    needs: tag
+  # scripts/check_linux_binaries.sh fails the job if a binary asks for more,
+  # links the browser pane's engine, or was built without its loader.
+  build:
+    name: Build ${{ matrix.arch }}
     strategy:
       fail-fast: false
       matrix:
@@ -60,7 +43,10 @@ jobs:
           - { runner: ubuntu-24.04, arch: x86_64 }
           - { runner: ubuntu-24.04-arm, arch: arm64 }
     runs-on: ${{ matrix.runner }}
-    container: ubuntu:22.04
+    # By digest, like the actions: the image the release binaries are built in
+    # cannot change under a tag.
+    container: ubuntu:22.04@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11
+    timeout-minutes: 45
     steps:
       # Before the checkout: without git in the container actions/checkout
       # fetches a snapshot with no history and no tag, and the packager
@@ -74,10 +60,11 @@ jobs:
             build-essential cmake ninja-build pkg-config git ca-certificates curl python3 file \
             libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev \
             libfontconfig1-dev libfreetype-dev libharfbuzz-dev libdbus-1-dev \
-            libgl1-mesa-dev libssh2-1-dev libssl-dev ncurses-bin \
-            dpkg-dev rpm squashfs-tools patchelf desktop-file-utils
+            libgl1-mesa-dev libssh2-1-dev libssl-dev ncurses-bin libwebkit2gtk-4.1-dev \
+            dpkg-dev rpm squashfs-tools patchelf desktop-file-utils \
+            xvfb xauth libgl1-mesa-dri
 
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
 
@@ -86,6 +73,24 @@ jobs:
       # a safe directory.
       - name: Trust the checkout
         run: git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+
+      # The packager names files from `git describe --exact-match`: built from
+      # any ref but the release tag, every file would carry a +<hash> suffix and
+      # release.sh would not find it.
+      - name: The ref is the release tag v<VERSION>
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < VERSION)"
+          if [[ ! "${version}" =~ ^[0-9]+(\.[0-9]+){0,2}(-[A-Za-z0-9.]+)?$ ]]; then
+            echo "::error::VERSION '${version}' is not a valid release token."
+            exit 1
+          fi
+          if [[ "${GITHUB_REF_TYPE}" != "tag" || "${GITHUB_REF_NAME}" != "v${version}" ]]; then
+            echo "::error::run this on the tag v${version} (this run is on the ${GITHUB_REF_TYPE} ${GITHUB_REF_NAME})."
+            exit 1
+          fi
+          git describe --tags --exact-match >/dev/null
 
       # Ninja, not make: GCC 11's link-time optimisation runs a make of its own
       # for the LTRANS jobs, and under GNU make it inherits a MAKEFLAGS naming
@@ -100,6 +105,28 @@ jobs:
       - name: glibc floor and linked features
         run: scripts/check_linux_binaries.sh --glibc-floor 2.35 build/Liu build/liu-notify build/liu-history
 
+      # A binary that links and passes the checks above can still die at once
+      # (a missing asset, a renderer that cannot start): each one is started,
+      # the app on a virtual display with an empty home, and must still be
+      # running when it is stopped.
+      - name: The binaries start
+        shell: bash
+        run: |
+          set -euo pipefail
+          for b in Liu liu-notify liu-history; do build/"${b}" --version; done
+          home="$(mktemp -d)"
+          Xvfb :91 -screen 0 1600x1000x24 -nolisten tcp >/dev/null 2>&1 &
+          xvfb=$!
+          sleep 1
+          rc=0
+          env -i PATH=/usr/bin:/bin HOME="${home}" USER=liu SHELL=/bin/bash DISPLAY=:91 \
+              timeout 10 build/Liu > "${home}/liu.log" 2>&1 || rc=$?
+          kill "${xvfb}" || true
+          if [[ "${rc}" != "124" ]]; then
+            echo "::error::Liu exited with status ${rc} before it was stopped"; cat "${home}/liu.log"; exit 1
+          fi
+          echo "Liu ran until it was stopped"
+
       # The AppImage runtime is downloaded by scripts/package_linux.sh and
       # pinned by release and SHA-256.
       - name: Package (tarball, .deb, .rpm, AppImage)
@@ -107,7 +134,15 @@ jobs:
           BUILD_DIR: build
         run: scripts/package_linux.sh --formats tarball,deb,rpm,appimage
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - name: Checksums
+        shell: bash
+        working-directory: build/package
+        run: |
+          set -euo pipefail
+          sha256sum liu-*-linux-${{ matrix.arch }}.tar.gz liu_*.deb liu-*.rpm Liu-*.AppImage > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: pkg-linux-${{ matrix.arch }}
           path: |
@@ -115,4 +150,99 @@ jobs:
             build/package/liu_*.deb
             build/package/liu-*.rpm
             build/package/Liu-*.AppImage
+            build/package/SHA256SUMS
           if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Each package on the systems it is made for, on both architectures: the
+  # .deb on Ubuntu 22.04 and 24.04 and Debian 12, the .rpm on Fedora 41, the
+  # AppImage on Ubuntu 24.04 and the tarball on Ubuntu 22.04. Installed as a
+  # user would (the package manager pulls its dependencies), then `liu
+  # --version`, every library resolved, and the app started on a virtual
+  # display with an empty home, alive when stopped.
+  install:
+    name: Install ${{ matrix.arch }} ${{ matrix.target.format }} on ${{ matrix.target.os }}
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, arm64]
+        target:
+          - { os: "ubuntu:22.04", image: "ubuntu:22.04@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11", format: deb }
+          - { os: "ubuntu:24.04", image: "ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852", format: deb }
+          - { os: "debian:12", image: "debian:12@sha256:268fb24c39bca92d326dd83ea3abebe4a3f7751c804ffef23bb6d857dd343ff8", format: deb }
+          - { os: "fedora:41", image: "fedora:41@sha256:f1a3fab47bcb3c3ddf3135d5ee7ba8b7b25f2e809a47440936212a3a50957f3d", format: rpm }
+          - { os: "ubuntu:24.04", image: "ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852", format: appimage }
+          - { os: "ubuntu:22.04", image: "ubuntu:22.04@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11", format: tarball }
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    container: ${{ matrix.target.image }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: pkg-linux-${{ matrix.arch }}
+          path: pkg
+
+      - name: Checksums
+        working-directory: pkg
+        run: sha256sum -c SHA256SUMS
+
+      - name: Install
+        shell: bash
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -euo pipefail
+          case "${{ matrix.target.format }}" in
+            deb)
+              apt-get update -qq
+              apt-get install -y -qq ./pkg/liu_*.deb xvfb xauth libgl1-mesa-dri
+              echo "LIU=/usr/bin/liu" >> "${GITHUB_ENV}" ;;
+            rpm)
+              dnf install -y -q ./pkg/liu-*.rpm xorg-x11-server-Xvfb mesa-dri-drivers
+              echo "LIU=/usr/bin/liu" >> "${GITHUB_ENV}" ;;
+            appimage)
+              # The libraries a desktop has (the AppImage brings libssh2 and
+              # nothing a desktop already has); no FUSE in a container, so it
+              # runs from its extracted self.
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends libx11-6 libxext6 libxrandr2 libxi6 libxcursor1 \
+                libgl1 libopengl0 libglx0 libfontconfig1 libfreetype6 libharfbuzz0b libdbus-1-3 libssl3t64 \
+                xvfb xauth libgl1-mesa-dri
+              chmod +x pkg/Liu-*.AppImage
+              echo "APPIMAGE_EXTRACT_AND_RUN=1" >> "${GITHUB_ENV}"
+              echo "LIU=$(ls "${PWD}"/pkg/Liu-*.AppImage)" >> "${GITHUB_ENV}" ;;
+            tarball)
+              # what install.sh would unpack (its signature check needs the
+              # release key's signature, made on the release Mac afterwards)
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends curl ca-certificates libssh2-1 libssl3 \
+                libx11-6 libxext6 libxrandr2 libxi6 libxcursor1 libgl1 libopengl0 libglx0 \
+                libfontconfig1 libfreetype6 libharfbuzz0b libdbus-1-3 libgl1-mesa-dri xvfb xauth
+              mkdir -p /opt/liu-tar && tar -xzf pkg/liu-*-linux-${{ matrix.arch }}.tar.gz -C /opt/liu-tar
+              echo "LIU=$(ls -d /opt/liu-tar/liu-*)/Liu" >> "${GITHUB_ENV}" ;;
+          esac
+
+      - name: Liu starts
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${LIU}" --version
+          if [[ "${{ matrix.target.format }}" != "appimage" ]]; then
+            target="$(readlink -f "${LIU}")"
+            if ldd "${target}" | grep 'not found'; then echo "::error::unresolved libraries"; exit 1; fi
+          fi
+          home="$(mktemp -d)"
+          Xvfb :91 -screen 0 1600x1000x24 -nolisten tcp >/dev/null 2>&1 &
+          xvfb=$!
+          sleep 1
+          rc=0
+          env -i PATH=/usr/bin:/bin HOME="${home}" USER=liu SHELL=/bin/bash DISPLAY=:91 \
+              APPIMAGE_EXTRACT_AND_RUN="${APPIMAGE_EXTRACT_AND_RUN:-}" \
+              timeout 15 "${LIU}" > "${home}/liu.log" 2>&1 || rc=$?
+          kill "${xvfb}" || true
+          if [[ "${rc}" != "124" ]]; then
+            echo "::error::Liu exited with status ${rc} before it was stopped"; cat "${home}/liu.log"; exit 1
+          fi
+          echo "Liu ran until it was stopped"

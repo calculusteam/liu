@@ -244,7 +244,10 @@ void agentctl_subread_status(AgentctlSubRead *r, AgentctlSubStatus st, const cha
     }
     if (r->status == st && r->settle_shown) return;
     r->status = (u8)st;
-    if (why && why[0]) agentctl_sanitize(why, strnlen(why, 4096), r->error, sizeof r->error, false);
+    /* `why` can be r->error itself (a reader that recorded the failure
+     * first): already clean, and copying a buffer onto itself overlaps. */
+    if (why && why[0] && why != r->error)
+        agentctl_sanitize(why, strnlen(why, 4096), r->error, sizeof r->error, false);
     r->end_ms = when_ms > 0 ? when_ms : r->last_ms;
     if (r->settle_shown) return;
     r->settle_shown = true;

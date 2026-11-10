@@ -282,11 +282,6 @@ static bool img_row_could_match_ex(const Cell *cells, i32 len,
     return *io_has_dot && *io_has_sep;
 }
 
-static bool img_row_could_match(const Cell *cells, i32 len, i32 *out_content_end) {
-    bool has_dot = false, has_sep = false;
-    return img_row_could_match_ex(cells, len, out_content_end, &has_dot, &has_sep);
-}
-
 /* Materialize a visible row as ASCII, with a byte -> column map.
  *
  * Non-ASCII collapses to one '\x01' byte per cell: it can never appear in a

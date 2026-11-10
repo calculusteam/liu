@@ -2,6 +2,7 @@
  * Liu — UI system with multi-pass rendering
  */
 #include "core/pty_reader.h"
+#include "core/child_reaper.h"   /* ending a helper without waiting for it */
 #include "core/path_escape.h"
 #include "core/app_support.h"   /* the notes vault's default folder */
 #include "core/same_dir.h"
@@ -48,9 +49,11 @@
 #include "ui/sites_ui.h"
 #include "ui/anim.h"
 #include "ui/chrome_palette.h"
+#include "ui/window_edge.h"
 #include "ui/notification.h"
 #include "ui/status_colors.h"
 #include "ui/toast_stack.h"
+#include "ui/notice_wrap.h"
 #include "ui/icon.h"
 #include "ui/prompt_thumb.h"
 #include "ui/prompt_card_math.h"
@@ -617,6 +620,21 @@ void app_agentctl_asks_settle(AppState *app) {
 
 bool app_toast_active(const AppState *app, f64 now) {
     return app && toast_stack_active(&app->toasts, now);
+}
+
+bool app_toast_moving(const AppState *app, f64 now) {
+    return app && toast_stack_next_change(&app->toasts, now) == 0.0;
+}
+
+f64 app_toast_wake_in(const AppState *app, f64 now) {
+    return app ? toast_stack_next_change(&app->toasts, now) : -1.0;
+}
+
+bool app_toast_retire_finished(AppState *app, f64 now) {
+    if (!app) return false;
+    i32 before = app->toasts.n;
+    toast_stack_retire(&app->toasts, now);
+    return app->toasts.n != before;
 }
 
 bool app_toast_click(AppState *app, f32 x, f32 y) {
@@ -1439,10 +1457,6 @@ bool app_init(AppState *app, i32 width, i32 height, f32 dpi_scale) {
     settings_init(&app->settings, &app->config, &app->keybinds, app->vault);
     updater_init(&app->updater);
     fb_init(&app->filebrowser);
-    if (app->vault) {
-        extern void sidebar_load_hosts(Vault *v);
-        sidebar_load_hosts(app->vault);
-    }
 
     /* Apply theme colors to ANSI palette */
     app_apply_config(app);
@@ -1831,6 +1845,10 @@ Terminal *app_tab_pane_terminal(const Tab *tab, i32 pane) {
     return tab_pane_terminal(tab, pane);
 }
 
+TermRenderCache *app_tab_pane_cache(Tab *tab, i32 pane) {
+    return tab_pane_cache(tab, pane);
+}
+
 void app_tab_pane_layout(const Tab *tab, f32 x, f32 y, f32 w, f32 h,
                          f32 dpi, PaneRect out[MAX_SPLIT_PANES]) {
     if (!out) return;
@@ -1957,26 +1975,6 @@ static void tab_split_draw_dividers(Renderer *r, const Tab *tab, i32 node,
     }
 }
 
-/* Bounded child reap for app_destroy: SIGTERM, then poll ~300 ms, then
- * SIGKILL. The translate/create-theme children can be a Node/Python agent
- * CLI that traps SIGTERM and won't exit promptly; a naive blocking
- * waitpid would hang Liu on quit. Mirrors main.c's kill_child_graceful
- * (static there, so duplicated rather than shared). EINTR-safe. */
-static void app_reap_child_bounded(pid_t pid) {
-    if (pid <= 0) return;
-    kill(pid, SIGTERM);
-    for (int i = 0; i < 60; i++) {              /* ~300 ms */
-        pid_t r;
-        do { r = waitpid(pid, NULL, WNOHANG); } while (r < 0 && errno == EINTR);
-        if (r == pid || (r < 0 && errno == ECHILD)) return;
-        struct timespec ts = { 0, 5 * 1000 * 1000 };  /* 5 ms */
-        nanosleep(&ts, NULL);
-    }
-    kill(pid, SIGKILL);
-    /* Bounded: SIGKILL is uncatchable, so the child exits promptly. */
-    while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) { }
-}
-
 /* Per-window teardown. Runs on EVERY window close, so it must touch nothing
  * a surviving window still needs — the process singletons live in
  * app_shutdown_process() below. */
@@ -1992,6 +1990,7 @@ static void app_drop_terminal_pair(Terminal **terminal,Session **session) {
 
 void app_destroy_window(AppState *app) {
     palette_release_owner(app);
+    anim_forget_owner(app);
     if (app && liu_dev_env("LIU_RENDER_PREPARE_STATS"))
         fprintf(stderr,"render_prepare: submitted=%llu adopted=%llu discarded=%llu expired=%llu\n",
             (unsigned long long)app->prepare_submitted,(unsigned long long)app->prepare_adopted,
@@ -2030,6 +2029,7 @@ void app_destroy_window(AppState *app) {
      * lightbox.c — and it is per WINDOW, so it is freed here and not in
      * app_shutdown_process(). */
     lightbox_free(&app->lightbox);
+    diagram_viewer_free(&app->dgv);
     sketch_free(&app->sketch);
 
     /* Shared-file writes are the LAST window's job. Every AppState carries
@@ -2189,10 +2189,12 @@ void app_destroy_window(AppState *app) {
     }
     /* Create Theme dialog state — the agent buffer + log outlive a
      * single dialog session, so they are released only here. An agent
-     * that is still running is sent SIGTERM and reaped, so no
-     * subprocess is left writing to a closed pipe past process exit. */
+     * that is still running is ended the one way a helper is
+     * (child_reaper_terminate): SIGTERM now, SIGKILL after its grace on a
+     * thread of its own, and SIGKILL at exit if it is still there — the
+     * window's close does not wait for a CLI that traps SIGTERM. */
     if (app->create_theme_child_pid > 0) {
-        app_reap_child_bounded((pid_t)app->create_theme_child_pid);
+        child_reaper_terminate((pid_t)app->create_theme_child_pid);
         app->create_theme_child_pid = 0;
     }
     free(app->create_theme_agents);
@@ -2204,10 +2206,10 @@ void app_destroy_window(AppState *app) {
         close(app->create_theme_stdout_fd);
         app->create_theme_stdout_fd = -1;
     }
-    /* Translate-on-Tab — mirror Create Theme: SIGTERM + reap any orphan
-     * agent child, then release the rolling log buffer. */
+    /* Translate-on-Tab — mirror Create Theme: end any agent child, then
+     * release the rolling log buffer. */
     if (app->translate_child_pid > 0) {
-        app_reap_child_bounded((pid_t)app->translate_child_pid);
+        child_reaper_terminate((pid_t)app->translate_child_pid);
         app->translate_child_pid = 0;
     }
     if (app->translate_stdout_fd >= 0) {
@@ -2224,10 +2226,10 @@ void app_destroy_window(AppState *app) {
 /* Process-wide teardown. Call ONCE, after the last window is gone — every
  * item here is module-level state shared by all windows, and running any of
  * it on a window close breaks the survivors: palette_shutdown() frees tables
- * another window's open palette is drawing from, sidebar_free_hosts() drops
- * the shared host list, the model/translate shutdowns abort another window's
- * download or translation, and tab_trash_shutdown() joins the deferred
- * tab-destroy worker so every later close blocks the main loop instead. */
+ * another window's open palette is drawing from, the model/translate
+ * shutdowns abort another window's download or translation, and
+ * tab_trash_shutdown() joins the deferred tab-destroy worker so every later
+ * close blocks the main loop instead. */
 void app_shutdown_process(void) {
     live_title_async_shutdown();
     agent_session_async_shutdown();
@@ -2243,9 +2245,7 @@ void app_shutdown_process(void) {
 
     /* Module-global caches freed for a quiescent exit (the OS reclaims them
      * regardless; this keeps leak-checkers clean). */
-    extern void sidebar_free_hosts(void);
     extern void chat_scan_shutdown(void);
-    sidebar_free_hosts();
     chat_scan_shutdown();
     /* The local stat worker leaves on its own when idle; on the way out it is
      * told to leave now, so no thread is mid-lstat under a freed queue. */
@@ -3077,10 +3077,6 @@ bool app_save_sessions_multi(AppState **apps, i32 app_count) {
     if (ok && !same) session_screens_collect();
     g_screen_save_on = false;
     return ok;
-}
-
-bool app_save_sessions(AppState *app) {
-    return app_save_sessions_multi(&app, 1);
 }
 
 /* Minimal JSON token helpers for session restore */
@@ -4636,6 +4632,8 @@ i32 app_new_filebrowser_tab(AppState *app, const char *path) {
     tab->kind         = TAB_FILEBROWSER;
     tab->browser_pane = -1;
     tab->fb           = fb;
+    static u64 s_fb_uid;
+    tab->fb_uid       = ++s_fb_uid;
     tab->fb_viewer_ratio = 0.0f;     /* lazy: use VIEWER_WIDTH_RATIO default */
     tab->active       = true;
     tab->dirty        = true;
@@ -5111,10 +5109,11 @@ static bool app_sleep_pump(AppState *app) {
             TabSleepSnapshot *snap = *tab_snapshot_slot(tab, tab->sleep_io_panes[p]);
             i32 pane = tab->sleep_io_panes[p];
             Session *s = app_pane_session(tab, pane), *dying = NULL;
-            bool reused = false;
-            if (t && s && !session_is_suspended(s) && session_status(s) == SESSION_CONNECTED)
-                reused = true; /* Session restored in a previous partial attempt. */
-            else if (t) reused = wake_take_session(&s, &dying, t->cols, t->rows);
+            /* A session restored in a previous partial attempt is kept as it
+             * is; otherwise the pane takes its session back (or a new one). */
+            bool restored = t && s && !session_is_suspended(s) &&
+                            session_status(s) == SESSION_CONNECTED;
+            if (t && !restored) (void)wake_take_session(&s, &dying, t->cols, t->rows);
             if (t && !s && snap) s = tab_restore_pane(snap->type, snap->ssh_config, snap->cwd,
                                                      t->cols, t->rows);
             if (s && t) {
@@ -5434,7 +5433,10 @@ bool app_any_pane_at_work(AppState *app) {
             SessionStatus st = session_status(s);
             bool link_up = st == SESSION_CONNECTED || st == SESSION_CONNECTING;
             bool local = session_type(s) == SESSION_LOCAL;
-            if (activity_pane_at_work(local, link_up, local ? session_fg_pid(s) : -1,
+            /* The reader's own sample: this runs every second for every pane,
+             * the agent probe already asks each one for a fresh sample every
+             * 0.75-2 s, and the hold lingers 30 s anyway. */
+            if (activity_pane_at_work(local, link_up, local ? session_fg_pid_cached(s) : -1,
                                       local ? session_shell_pgid(s) : -1))
                 return true;
         }
@@ -5679,6 +5681,13 @@ void app_forget_tab_aliases(AppState *app, i32 index) {
         if (app->fb_prompt_active && app->fb_prompt_actor.id == tab->sftp->id) app->fb_prompt_active = false;
         if (app->fb_prompt_actor.id == tab->sftp->id) app->fb_prompt_actor = (SftpActor){ 0, 0 };
         if (app->fb_actor.id == tab->sftp->id) app->fb_actor = (SftpActor){ 0, 0 };
+    }
+    /* The same for the rail of a Code Editor tab that a Delete asked about. */
+    if (tab->kind == TAB_FILEBROWSER && tab->fb_uid) {
+        const u64 rail = FB_ACTOR_RAIL | tab->fb_uid;
+        if (app->fb_prompt_active && app->fb_prompt_actor.id == rail) app->fb_prompt_active = false;
+        if (app->fb_prompt_actor.id == rail) app->fb_prompt_actor = (SftpActor){ 0, 0 };
+        if (app->fb_actor.id == rail) app->fb_actor = (SftpActor){ 0, 0 };
     }
 
     for (i32 p = 0; p < MAX_SPLIT_PANES; p++) {
@@ -6571,52 +6580,6 @@ static i32 app_pane_zone_from_frac(f32 rx, f32 ry, f32 w, f32 h, f32 dpi) {
     return zone;
 }
 
-i32 app_pane_drop_zone_at(AppState *app, const Tab *tab,
-                          i32 pane, f32 x, f32 y) {
-    if (!app || !tab || pane < 0) return 0;
-    f32 ox = 0, oy = 0, total_w = 0, total_h = 0;
-    app_terminal_content_rect(app, &ox, &oy, &total_w, &total_h);
-    PaneRect rr = {0};
-    if (tab->split_root >= 0) {
-        PaneRect rects[MAX_SPLIT_PANES];
-        tab_split_layout_rects(tab, ox, oy, total_w, total_h,
-                               app->dpi_scale, rects);
-        if (pane >= MAX_SPLIT_PANES) return 0;
-        rr = rects[pane];
-    } else if (tab->split == SPLIT_H) {
-        /* Two-pane fallback layout for split_root < 0, used if
-         * tab_split_init_tree cannot allocate its three nodes. Keep the
-         * inter-pane gap at 6*dpi, matching tab_split_layout_node,
-         * tab_split_draw_dividers, render_terminal, and both hittest.c paths
-         * so pane rectangles align with rendered pixels. */
-        f32 div = total_w * tab->split_ratio;
-        f32 dw = 6.0f * app->dpi_scale;
-        rr = (pane == 0)
-           ? (PaneRect){ox, oy, div - dw * 0.5f, total_h}
-           : (PaneRect){ox + div + dw * 0.5f, oy,
-                        total_w - div - dw * 0.5f, total_h};
-    } else if (tab->split == SPLIT_V) {
-        f32 div = total_h * tab->split_ratio;
-        f32 dh = 6.0f * app->dpi_scale;
-        rr = (pane == 0)
-           ? (PaneRect){ox, oy, total_w, div - dh * 0.5f}
-           : (PaneRect){ox, oy + div + dh * 0.5f, total_w,
-                        total_h - div - dh * 0.5f};
-    } else {
-        return 0;
-    }
-    if (rr.w <= 1.0f || rr.h <= 1.0f) return 0;
-
-    f32 rx = (x - rr.x) / rr.w;
-    f32 ry = (y - rr.y) / rr.h;
-    if (rx < 0.0f) rx = 0.0f;
-    if (rx > 1.0f) rx = 1.0f;
-    if (ry < 0.0f) ry = 0.0f;
-    if (ry > 1.0f) ry = 1.0f;
-
-    return app_pane_zone_from_frac(rx, ry, rr.w, rr.h, app->dpi_scale);
-}
-
 /* Which of a zoomed tab's rects pane_rects_of() answers with: what is drawn,
  * what each terminal is sized to, or the layout as if nothing were zoomed. */
 typedef enum { PANE_RECTS_DRAWN, PANE_RECTS_FIT, PANE_RECTS_TREE } PaneRectsKind;
@@ -7333,6 +7296,101 @@ void app_close_split_pane(AppState *app, i32 tab_index, i32 pane) {
     if (tab->terminal) TERM_DIRTY_ALL(tab->terminal);
 }
 
+bool app_pane_restartable(const Tab *tab, i32 pane) {
+    if (!tab || tab->kind != TAB_TERMINAL || tab->sleeping || tab->sleep_prepare) return false;
+    if (pane < 0 || pane >= tab_split_pane_count(tab)) return false;
+    if (tab->browser && tab->browser_pane == pane) return false;
+    Session *s = tab_pane_session(tab, pane);
+    if (!s || !tab_pane_terminal(tab, pane)) return false;
+    switch (session_type(s)) {
+    case SESSION_LOCAL: return true;
+    case SESSION_SSH:
+    case SESSION_MOSH: {
+        const SSHConfig *cfg = session_get_config(s);
+        return cfg && cfg->hostname[0];
+    }
+    default: return false;
+    }
+}
+
+bool app_restart_pane(AppState *app, i32 tab_index, i32 pane) {
+    if (!app || tab_index < 0 || tab_index >= app->tab_count) return false;
+    Tab *tab = &app->tabs[tab_index];
+    if (!app_pane_restartable(tab, pane)) {
+        /* A browser pane, a file tab: the chord has nothing to do there. */
+        Session *s = tab->kind == TAB_TERMINAL ? tab_pane_session(tab, pane) : NULL;
+        if (s && (session_type(s) == SESSION_TELNET || session_type(s) == SESSION_SERIAL))
+            app_show_toast(app, "Telnet and serial panes cannot be restarted");
+        return false;
+    }
+    Terminal *old_t = tab_pane_terminal(tab, pane);
+    Session  *old_s = tab_pane_session(tab, pane);
+    /* The pane's grid as drawn: the new shell's first prompt is laid out for it. */
+    i32 cols = old_t->cols > 0 ? old_t->cols : 80;
+    i32 rows = old_t->rows > 0 ? old_t->rows : 24;
+
+    Session *new_s = NULL;
+    if (session_type(old_s) == SESSION_LOCAL) {
+        /* Where the shell is now (the kernel's answer, the reported folder for a
+         * shell already gone), copied: the answer can sit in a shared buffer. */
+        char cwd[1024] = "";
+        const char *where = app_terminal_cwd(old_t, old_s);
+        if (where && where[0] && strlen(where) < sizeof cwd) snprintf(cwd, sizeof cwd, "%s", where);
+        new_s = session_create_local_with_env(cols, rows, NULL, 0, cwd[0] ? cwd : NULL);
+        if (new_s && session_status(new_s) != SESSION_CONNECTED) {
+            session_destroy(new_s);
+            new_s = NULL;
+        }
+    } else {
+        /* The whole connection again, forwards included: they go down with the
+         * old one. A ControlMaster host's shell opens on the connection it
+         * shares (session_pool_take). */
+        SSHConfig cfg = {0};
+        if (ssh_config_clone(&cfg, session_get_config(old_s))) {
+            if (ssh_start_dir_ok(old_t->cwd))
+                snprintf(cfg.start_dir, sizeof cfg.start_dir, "%s", old_t->cwd);
+            new_s = session_type(old_s) == SESSION_MOSH ? session_create_mosh(&cfg, cols, rows)
+                                                        : session_create_ssh(&cfg, cols, rows);
+            ssh_config_dispose(&cfg);
+        }
+    }
+    Terminal *new_t = new_s ? terminal_create(cols, rows) : NULL;
+    if (!new_s || !new_t) {
+        if (new_s) session_destroy(new_s);
+        app_show_toast_kind(app, NOTIFY_WARNING, "Could not start a new shell in this pane");
+        return false;
+    }
+    terminal_set_scrollback_limit(new_t, app->config.scrollback_lines);
+    new_t->bidi_enabled = app->config.bidi_enabled;
+    app_configure_terminal_callbacks(app, new_t, new_s);
+
+    /* Everything that holds the old pair lets go of it, as for a closed pane:
+     * the trash worker frees both shortly. The pane's slot, its place in the
+     * layout and its broadcast mark stay. */
+    app->scroll_btn_count = 0;
+    app_scroll_btn_forget(old_t);
+    app_forget_pane_session(app, old_t, old_s);
+    pane_agent_reset(&tab->pane_agents[pane]);
+    TermRenderCache *cache = tab_pane_cache(tab, pane);
+    if (cache) {
+        term_render_cache_free(cache);
+        memset(cache, 0, sizeof *cache);
+        cache->all_rows_dirty = true;
+    }
+    free(tab->git_status.cached_cwd);
+    tab->git_status.cached_cwd = NULL;
+
+    tab_set_pane_refs(tab, pane, new_t, new_s);
+    if (!tab_trash_defer(old_t, old_s)) {
+        terminal_destroy(old_t);
+        session_destroy(old_s);
+    }
+    app_resize_tab_panes(app, tab);
+    TERM_DIRTY_ALL(new_t);
+    tab->dirty = true;
+    return true;
+}
+
 /* The title a terminal describes on its own: the OSC 0/2 string the shell set,
  * else its cwd with $HOME folded back to ~. Returns false when the terminal
  * offers neither, so a caller can leave whatever title it already has (the
@@ -8022,8 +8080,6 @@ void app_ungroup_tab_group(AppState *app, i32 group_index) {
      * slot. Tabs stay open — that's the "Ungroup" semantics. */
     app_delete_tab_group(app, group_index);
 }
-
-i32 app_group_palette_size(void) { return MAX_TAB_GROUPS; }
 
 Color app_group_palette_color(i32 idx) {
     if (idx < 0 || idx >= MAX_TAB_GROUPS) return (Color){1,1,1,1};
@@ -9419,41 +9475,6 @@ const char *ui_fit_cols(const char *s, i32 cols, char *buf, usize cap) {
     return buf;
 }
 
-/* `s` on at most two lines of `cols` display columns: broken at the last
- * space that fits (inside the word when there is none), the second line
- * ellipsized. Returns the number of lines. The sidebar is ~22 columns at its
- * default width, which one line of "Not deleted: the folder is not empty"
- * does not fit in. */
-static i32 ui_wrap_two(const char *s, i32 cols, char *l1, usize c1, char *l2, usize c2) {
-    if (cols < 4) cols = 4;
-    usize len = strlen(s);
-    l2[0] = '\0';
-    if ((i32)utf8_display_cols((const u8 *)s, len) <= cols) {
-        snprintf(l1, c1, "%s", s);
-        return 1;
-    }
-    usize off = 0, last_space = 0;
-    i32 used = 0;
-    while (off < len) {
-        u32 cp = 0; i32 gc = 1;
-        u32 gb = utf8_next_grapheme((const u8 *)s + off, len - off, &cp, &gc);
-        if (gb == 0) break;
-        if (gc < 0) gc = 0;
-        if (used + gc > cols) break;
-        if (cp == ' ') last_space = off;
-        used += gc; off += gb;
-    }
-    usize cut = last_space > 0 ? last_space : off;
-    usize n1 = cut < c1 - 1 ? cut : c1 - 1;
-    memcpy(l1, s, n1);
-    l1[n1] = '\0';
-    const char *rest = s + cut;
-    while (*rest == ' ') rest++;
-    char fit[512];
-    snprintf(l2, c2, "%s", ui_fit_cols(rest, cols, fit, sizeof fit));
-    return l2[0] ? 2 : 1;
-}
-
 /* ---- Context menus: one panel, one row painter ---------------------------
  *
  * A tab's menu, a pane's, the explorer's and a tab group's are the same menu
@@ -9584,9 +9605,9 @@ static i32 tab_menu_group(TabMenuRow k) {
 }
 
 /* A shortcut hint for an action in the keybinding table. On macOS it is the
- * menu's own spelling; elsewhere it is the chord the table really holds — the
- * Linux table is not the Cmd table with another word for Cmd, and a hint that
- * names Super+W there names a chord that does nothing. "" when unbound. */
+ * menu's own spelling; elsewhere it is the action's first chord in the table,
+ * which reads Cmd as Ctrl+Shift, or whatever the user bound. "" when
+ * unbound. */
 static const char *app_shortcut_hint(const AppState *app, Action a, const char *mac,
                                      char *buf, usize cap) {
 #ifdef PLATFORM_MACOS
@@ -9874,6 +9895,16 @@ void ui_ime_field_caret(Renderer *r, AppState *app, const void *owner,
     if (!mask) ui_ime_draw_composition(r, app, x, y, cw, ch, 0.0f, 0.0f);
 }
 
+void ui_ime_field_off(AppState *app, const void *owner, f32 x, f32 y, f32 ch) {
+    app->ime_field_owner = owner;
+    app->ime_spot_x = x;
+    app->ime_spot_y = y;
+    app->ime_spot_h = ch;
+    app->ime_spot_valid = true;
+    app->ime_field_now = true;
+    app->ime_field_off = true;
+}
+
 /* The code editor draws its caret in filebrowser.c, which has no AppState: it
  * leaves the caret on the FileBrowser and the caller claims it here, in the
  * code's own cell. */
@@ -9889,11 +9920,7 @@ static void ui_ime_editor_caret(Renderer *r, AppState *app, const FileBrowser *f
  * four columns in, not two (it stood between the two characters). A masked
  * field draws one bullet per character. */
 static i32 ui_field_cols(const char *buf, i32 len, i32 from, i32 to, bool mask) {
-    if (to <= from) return 0;
-    if (mask) return to - from;
-    i32 a = textedit_byte_offset(buf, len, from);
-    i32 b = textedit_byte_offset(buf, len, to);
-    return b > a ? (i32)utf8_display_cols((const u8 *)buf + a, (usize)(b - a)) : 0;
+    return textedit_field_cols(buf, len, from, to, mask);
 }
 
 /* Draw a chrome text field's value together with the shared editor's caret,
@@ -9910,10 +9937,10 @@ static i32 ui_field_cols(const char *buf, i32 len, i32 from, i32 to, bool mask) 
  *
  * Scroll is advisory state on AppState and updated here: the renderer is the
  * only place that knows how many cells actually fit. */
-f32 ui_draw_edit_field(Renderer *r, AppState *app, const char *buf, i32 len,
-                           f32 x, f32 y, f32 cw, f32 ch, i32 max_cells,
-                           Color fg, Color caret_c, Color sel_c,
-                           bool mask, bool show_caret) {
+f32 ui_draw_edit_field_ex(Renderer *r, AppState *app, const char *buf, i32 len,
+                          f32 x, f32 y, f32 cw, f32 ch, i32 max_cells,
+                          Color fg, Color caret_c, Color sel_c,
+                          bool mask, bool show_caret, bool ime_off) {
     if (max_cells < 1) max_cells = 1;
 
     /* Fields drawn straight onto a panel (settings' API rows, the search bar)
@@ -9968,17 +9995,27 @@ f32 ui_draw_edit_field(Renderer *r, AppState *app, const char *buf, i32 len,
         f32 caret_w = fmaxf(2.0f, 2.0f * (app->dpi_scale > 0.0f
                                           ? app->dpi_scale : 1.0f));
         renderer_draw_rect(r, caret_x, y, caret_w, ch, caret_c);
-        /* The field with the keyboard: an input method composes here. */
-        ui_ime_field_caret(r, app, buf, caret_x, y, cw, ch, mask);
+        /* The field with the keyboard: an input method composes here, unless
+         * the value takes none (ime_off). */
+        if (ime_off) ui_ime_field_off(app, buf, caret_x, y, ch);
+        else         ui_ime_field_caret(r, app, buf, caret_x, y, cw, ch, mask);
     }
     return caret_x;
+}
+
+f32 ui_draw_edit_field(Renderer *r, AppState *app, const char *buf, i32 len,
+                       f32 x, f32 y, f32 cw, f32 ch, i32 max_cells,
+                       Color fg, Color caret_c, Color sel_c,
+                       bool mask, bool show_caret) {
+    return ui_draw_edit_field_ex(r, app, buf, len, x, y, cw, ch, max_cells,
+                                 fg, caret_c, sel_c, mask, show_caret, false);
 }
 
 /* Blink phase shared by every chrome caret: a square on/off pulse on the
  * macOS cadence, with a strong floor so it never reads as "caret missing"
  * on a dark theme. */
 f32 ui_caret_alpha(void) {
-    return fmod(platform_time_sec(), 1.06) < 0.53 ? 1.0f : 0.85f;
+    return fmod(platform_time_sec(), 2.0 * UI_CARET_HALF_SEC) < UI_CARET_HALF_SEC ? 1.0f : 0.85f;
 }
 
 static void draw_square_mark(Renderer *r, f32 x, f32 y, f32 sz, Color c) {
@@ -11648,15 +11685,6 @@ static void draw_tab_accent_ex(Renderer *r, Tab *tab, f32 x, f32 y, f32 w, f32 h
         return app->tab_jobs[tab][k].job;
     }
 
-    bool app_window_shows_jobs(const AppState *app) {
-        if (!app) return false;
-        if (app->agentctl_panel_open || app->agentctl_prompt_active || app->agentctl_tip_job || app->agentctl_team_open)
-            return true;
-        for (i32 ti = 0; ti < app->tab_count && ti < MAX_TABS; ti++)
-            if (app->tab_jobs_n[ti]) return true;
-        return false;
-    }
-
     typedef struct {
         f32   dpi, pill_y, pill_h, radius, tab_y, tab_h, icon;
         Color wash;     /* a loose job tab under the pointer */
@@ -11796,6 +11824,31 @@ static void draw_tab_accent_ex(Renderer *r, Tab *tab, f32 x, f32 y, f32 w, f32 h
         }
     }
 
+#ifdef USE_METAL
+    /* What a haze frame drawn in full shows: its key, its grid, its strength
+     * and its colours. The same value on two frames means the same pixels. */
+    static u64 job_haze_picture(i64 key, i32 cols, i32 rows, f32 k, const Color ramp[6]) {
+        u64 h = 1469598103934665603ull;
+        u32 v[4 + 6 * 4];
+        u32 n = 0;
+        v[n++] = (u32)key;
+        v[n++] = (u32)(key >> 32);
+        v[n++] = (u32)cols | ((u32)rows << 16);
+        memcpy(&v[n++], &k, 4);
+        for (i32 q = 0; q < 6; q++) {
+            memcpy(&v[n++], &ramp[q].r, 4);
+            memcpy(&v[n++], &ramp[q].g, 4);
+            memcpy(&v[n++], &ramp[q].b, 4);
+            memcpy(&v[n++], &ramp[q].a, 4);
+        }
+        for (u32 i = 0; i < n; i++) {
+            h ^= v[i];
+            h *= 1099511628211ull;
+        }
+        return h | 1u;
+    }
+#endif
+
     /* The haze over one job tab (ui/agentctl_card.h), edge to edge: cells
      * from its top-left corner, cut at its edges, and, where its right
      * corners are rounded (`rr`), cut along the curve a pixel row at a time.
@@ -11811,7 +11864,7 @@ static void draw_tab_accent_ex(Renderer *r, Tab *tab, f32 x, f32 y, f32 w, f32 h
      * one between the rounded corners, the first and last row. */
     static bool render_job_haze(AppState *app, Renderer *r, const Theme *t, const AgcTabJob *tj,
                                 f32 x, f32 y, f32 w, f32 h, f32 rr, f32 dpi, Color under, f32 alpha,
-                                i64 now_ms, i64 *next_ms, i32 edges[4]) {
+                                i64 now_ms, i64 *next_ms, i32 edges[4], bool may_hand_off) {
         AgcCue cue = agentctl_job_cue_ex(tj->state, tj->outcome, tj->end, tj->asking);
         f64 tnow = platform_time_sec();
         AgcHazeMemo *m = job_haze_memo(app, tj->job, cue, tnow);
@@ -11828,7 +11881,18 @@ static void draw_tab_accent_ex(Renderer *r, Tab *tab, f32 x, f32 y, f32 w, f32 h
         bool moving = agentctl_haze_moves(cue);
         i64 run = agentctl_haze_run_ms(cue, tj->turn_start_ms, tj->turn_end_ms, now_ms);
         i64 key = run * AGC_HAZE_FPS / 1000;
-        f32 frac = moving ? agentctl_haze_frac(run) : 0.0f;
+        /* With nothing else in the window on the clock, the steps between two
+         * keys are the compositor's: this frame draws the NEXT key in full,
+         * the screen's picture of the tab fades out over it until that key
+         * (renderer_fade_note), and the window owes no frame before then —
+         * 12 frames a second at most instead of one per refresh. */
+        bool handoff = false;
+#ifdef USE_METAL
+        handoff = may_hand_off && moving && !fading && renderer_fade_available(r);
+#else
+        (void)may_hand_off;
+#endif
+        f32 frac = handoff ? 1.0f : (moving ? agentctl_haze_frac(run) : 0.0f);
         const AgcHazeLook *look = &m->look;
         f32 ftf = agentctl_haze_time(agentctl_haze_run_ms(from, tj->turn_start_ms, tj->turn_end_ms, now_ms));
 
@@ -11911,7 +11975,20 @@ static void draw_tab_accent_ex(Renderer *r, Tab *tab, f32 x, f32 y, f32 w, f32 h
             }
         }
         renderer_flush_rects(r);
-        if (fading || flowing) {
+#ifdef USE_METAL
+        if (moving) {
+            /* the owner is the job at its row: a job drawn in two places is
+             * two owners, and a rect that moved starts no fade */
+            u64 owner = (u64)tj->job | ((u64)(u32)(i32)floorf(y) << 32);
+            if (handoff) {
+                f64 until = platform_time_sec() + (f64)(agentctl_haze_key_ms(key + 1) - run) / 1000.0;
+                renderer_fade_note(r, x, y, w, h, owner, job_haze_picture(key + 1, cols, rows, k, ramp), until);
+            } else {
+                renderer_fade_note(r, x, y, w, h, owner, 0, 0.0);
+            }
+        }
+#endif
+        if (!handoff && (fading || flowing)) {
             /* cells on their way from one key to the next, or a fade */
             if (next_ms) *next_ms = 1000 / AGC_HAZE_DRAW_HZ;
             return true;
@@ -11932,6 +12009,19 @@ static void draw_tab_accent_ex(Renderer *r, Tab *tab, f32 x, f32 y, f32 w, f32 h
             *next_ms = m->change_ms > run ? m->change_ms - run : 1;
         }
         return true;
+    }
+
+    /* A chip's count, at the chip's own cell. The strip and the sidebar row
+     * draw their titles at a scale of their own, so the one in force is given
+     * back afterwards: a reset would hand every title drawn after the chip the
+     * terminal font's size. */
+    static void job_chip_text(Renderer *r, const char *m, f32 x, f32 y, Color fg, f32 cw, f32 ch) {
+        f32 keep_cw = r->ui_cell_w, keep_ch = r->ui_cell_h;
+        renderer_set_ui_scale(r, cw, ch);
+        draw_text_ex(r, m, x, y, fg, 8, cw);
+        renderer_flush_glyphs(r);
+        if (keep_cw > 0.0f && keep_ch > 0.0f) renderer_set_ui_scale(r, keep_cw, keep_ch);
+        else                                  renderer_reset_ui_scale(r);
     }
 
     /* Tab `ti`'s job tabs, from `x0` (its pill's right edge) rightward, each
@@ -11999,7 +12089,7 @@ static void draw_tab_accent_ex(Renderer *r, Tab *tab, f32 x, f32 y, f32 w, f32 h
             AgcTabJob shown = *tj;
             if (tj->chip) shown.job = tj->look;
             bool moves = render_job_haze(app, r, t, &shown, x + seam, jp->pill_y, w - seam, jp->pill_h, rr, dpi,
-                                         under, op, now_ms, &next_ms, edges);
+                                         under, op, now_ms, &next_ms, edges, app->haze_handoff && !lifted);
             if (moves && !lifted) {
                 f64 edge = platform_time_sec() + (f64)(next_ms + 1) / 1000.0;
                 if (app->agentctl_next_edge <= 0.0 || edge < app->agentctl_next_edge)
@@ -12044,10 +12134,7 @@ static void draw_tab_accent_ex(Renderer *r, Tab *tab, f32 x, f32 y, f32 w, f32 h
                 }
                 Color fg = t->tab_active_fg;
                 fg.a *= alpha;
-                renderer_set_ui_scale(r, cw, ch);
-                draw_text_ex(r, m, cp.text_x, floorf(jp->pill_y + (jp->pill_h - ch) * 0.5f), fg, 8, cw);
-                renderer_flush_glyphs(r);
-                renderer_reset_ui_scale(r);
+                job_chip_text(r, m, cp.text_x, floorf(jp->pill_y + (jp->pill_h - ch) * 0.5f), fg, cw, ch);
             } else if (more) {
                 char m[8];
                 snprintf(m, sizeof m, "+%u", (unsigned)app->tab_jobs_more[ti]);
@@ -12055,11 +12142,8 @@ static void draw_tab_accent_ex(Renderer *r, Tab *tab, f32 x, f32 y, f32 w, f32 h
                 f32 tw = (f32)strlen(m) * cw;
                 Color fg = t->tab_active_fg;
                 fg.a *= alpha;
-                renderer_set_ui_scale(r, cw, ch);
-                draw_text_ex(r, m, floorf(x + (w - tw) * 0.5f),
-                             floorf(jp->pill_y + (jp->pill_h - ch) * 0.5f), fg, 8, cw);
-                renderer_flush_glyphs(r);
-                renderer_reset_ui_scale(r);
+                job_chip_text(r, m, floorf(x + (w - tw) * 0.5f),
+                              floorf(jp->pill_y + (jp->pill_h - ch) * 0.5f), fg, cw, ch);
             } else {
                 ChatTool tool = agentctl_chat_tool(tj->agent);
                 f32 ix = floorf(x + (w - isz) * 0.5f);
@@ -12093,6 +12177,34 @@ static void draw_tab_accent_ex(Renderer *r, Tab *tab, f32 x, f32 y, f32 w, f32 h
                 app->agentctl_tip_y = jp->tab_y + jp->tab_h;
             }
         }
+    }
+
+    /* The edge of a floating window (ui/window_edge.h): X11 draws no frame,
+     * border or shadow for Liu's windows, so two overlapping ones would have no
+     * line between them. One device-pixel outline in the theme's divider colour
+     * over the window's outermost ring; none while maximized or fullscreen. */
+    static void render_window_edge(AppState *app) {
+#ifndef PLATFORM_MACOS
+        PlatformWindow *hw = app->host_window;
+        if (!hw) return;
+        f32 line = window_edge_line_px(app->dpi_scale);
+        if (!window_edge_wanted(platform_draws_own_window_controls(),
+                                platform_window_is_maximized(hw),
+                                platform_window_is_fullscreen(hw),
+                                (f32)app->fb_width, (f32)app->fb_height, line))
+            return;
+        Renderer *r = &app->renderer;
+        const Theme *t = app->config.theme ? app->config.theme : &THEME_Liu;
+        Color c = chrome_palette_for(t).divider_strong;
+        c.a = 1.0f;
+        WindowEdgeRect e[4];
+        i32 n = window_edge_rects((f32)app->fb_width, (f32)app->fb_height, line, e);
+        for (i32 i = 0; i < n; i++)
+            renderer_draw_rect(r, e[i].x, e[i].y, e[i].w, e[i].h, c);
+        renderer_flush_rects(r);
+#else
+        (void)app;
+#endif
     }
 
     static void render_toolbar(AppState *app) {
@@ -12166,7 +12278,6 @@ static void draw_tab_accent_ex(Renderer *r, Tab *tab, f32 x, f32 y, f32 w, f32 h
         /* Background — exactly the terminal background colour (no lightening) so the
          * tab bar reads as the same surface as the terminal body. Alpha follows
          * window opacity so transparency stays uniform across the whole window. */
-        f32 op = app->config.opacity;
         /* Deliberately NOT painting a t->bg strip here — see the note in the
          * "both hidden" branch above. The clear already IS this colour at this
          * opacity; drawing it again stacks a second translucent layer and the tab
@@ -15751,6 +15862,7 @@ void app_explorer_open_for_active_tab(AppState *app) {
             bool live = over || dragging;
             if (live) app->scrollbar_last_activity = platform_time_sec();
             alpha = ui_autohide_alpha(app->scrollbar_last_activity, live);
+            app->scrollbar_alpha_drawn = alpha > 0.004f ? alpha : 0.0f;
             if (alpha <= 0.004f) return;
         }
 
@@ -15869,6 +15981,7 @@ void app_explorer_open_for_active_tab(AppState *app) {
      * rect-keyed pool, but driven by a boolean state instead of the pointer. */
     typedef struct {
         const Terminal *key;
+        u32             uid;    /* key->uid: the address alone can be a closed pane's */
         f32             v;      /* eased visibility, 0..1 */
         f64             t;      /* last frame time this slot was advanced */
     } ScrollBtnFade;
@@ -15883,16 +15996,17 @@ void app_explorer_open_for_active_tab(AppState *app) {
         ScrollBtnFade *slot = NULL, *free_slot = NULL, *weakest = NULL;
         for (usize i = 0; i < sizeof(s_scroll_btn_fade)/sizeof(s_scroll_btn_fade[0]); i++) {
             ScrollBtnFade *s = &s_scroll_btn_fade[i];
-            if (s->key == term) { slot = s; break; }
+            if (s->key == term && s->uid == term->uid) { slot = s; break; }
+            /* The same address under another number is a closed pane's slot:
+             * free for anyone, never inherited. */
+            if (s->key == term) { s->key = NULL; s->v = 0.0f; }
             if (!free_slot && (s->key == NULL || s->v <= 0.0f)) free_slot = s;
-            /* Evictable fallback: a live pane advances its slot every frame, so a
-             * slot untouched for half a second belongs to a pane that is gone. */
             if (!weakest || s->v < weakest->v) weakest = s;
         }
-        /* A slot matched by pointer but not advanced for a while is a dead pane's,
-         * inherited because the allocator reused the address. Restart it rather
-         * than letting the new pane adopt a stale animation mid-flight. */
-        if (slot && now - slot->t > 0.5) { slot->v = 0.0f; slot->t = now; }
+        /* A pane that was not painted for a while (an idle window scrolled back
+         * paints about once a second) goes on from where its button stood: a
+         * fade is never restarted for want of frames — dt's clamp below keeps
+         * the first step after the quiet small. */
         if (!slot) {
             if (!want) return 0.0f;          /* nothing to show, don't burn a slot */
             slot = free_slot;
@@ -15901,6 +16015,7 @@ void app_explorer_open_for_active_tab(AppState *app) {
             if (!slot && weakest && now - weakest->t > 0.5) slot = weakest;
             if (!slot) return want ? 1.0f : 0.0f;  /* genuinely full: snap */
             slot->key = term;
+            slot->uid = term->uid;
             slot->v   = 0.0f;
             /* Back-date by one frame so the first call already advances the fade.
              * Seeding `t = now` yields dt == 0 → v stays 0 → the button is skipped
@@ -16732,7 +16847,15 @@ void app_explorer_open_for_active_tab(AppState *app) {
         PUSH(TERM_MENU_SPLIT_RIGHT, false);
         PUSH(TERM_MENU_SPLIT_LEFT,  false);
         PUSH(TERM_MENU_SPLIT_DOWN,  false);
-        PUSH(TERM_MENU_SPLIT_UP,    false);
+        /* Restart Shell ends what runs in the pane: last, under a hairline,
+         * as Close Tab is in the tab's menu. */
+        const Tab *mt = (app->active_tab >= 0 && app->active_tab < app->tab_count)
+                            ? &app->tabs[app->active_tab] : NULL;
+        i32 mp = app->term_ctx_menu_pane >= 0 ? app->term_ctx_menu_pane
+                                              : (mt ? mt->active_pane : -1);
+        bool restart = app_pane_restartable(mt, mp);
+        PUSH(TERM_MENU_SPLIT_UP,    restart);
+        if (restart) PUSH(TERM_MENU_RESTART_SHELL, false);
         #undef PUSH
         return n;
     }
@@ -16747,24 +16870,37 @@ void app_explorer_open_for_active_tab(AppState *app) {
         case TERM_MENU_SPLIT_LEFT:   return "Split Left";
         case TERM_MENU_SPLIT_DOWN:   return "Split Down";
         case TERM_MENU_SPLIT_UP:     return "Split Up";
+        case TERM_MENU_RESTART_SHELL: return "Restart Shell";
         }
         return "";
     }
 
-    /* One row of it, as the shared painter takes it. */
-    static CtxMenuRow term_menu_row(TermMenuAction a) {
+    /* One row of it, as the shared painter takes it, with the chord of the
+     * row's action when it has one (the tab's menu does the same). */
+    static CtxMenuRow term_menu_row(const AppState *app, TermMenuAction a) {
+        static char hint[TERM_MENU_RESTART_SHELL + 1][32];
         IconKind ik = ICON_NONE;
+        Action act = ACT_NONE;
+        const char *mac = "";
         switch (a) {
-        case TERM_MENU_COPY:        ik = ICON_COPY;           break;
+        case TERM_MENU_COPY:
+            ik = ICON_COPY; act = ACT_COPY; mac = UI_MOD_PRIMARY "+C"; break;
         case TERM_MENU_OPEN_LINK:   ik = ICON_ARROW_UP_RIGHT; break;
         case TERM_MENU_COPY_LINK:   ik = ICON_COPY;           break;
-        case TERM_MENU_RENAME_TAB:  ik = ICON_PENCIL;         break;
-        case TERM_MENU_SPLIT_RIGHT: ik = ICON_PANEL_RIGHT;    break;
+        case TERM_MENU_RENAME_TAB:
+            ik = ICON_PENCIL; act = ACT_RENAME_TAB; mac = "Shift+" UI_MOD_PRIMARY "+E"; break;
+        case TERM_MENU_SPLIT_RIGHT:
+            ik = ICON_PANEL_RIGHT; act = ACT_SPLIT_HORIZONTAL; mac = UI_MOD_PRIMARY "+D"; break;
         case TERM_MENU_SPLIT_LEFT:  ik = ICON_PANEL_LEFT;     break;
-        case TERM_MENU_SPLIT_DOWN:  ik = ICON_PANEL_BOTTOM;   break;
+        case TERM_MENU_SPLIT_DOWN:
+            ik = ICON_PANEL_BOTTOM; act = ACT_SPLIT_VERTICAL; mac = "Shift+" UI_MOD_PRIMARY "+D"; break;
         case TERM_MENU_SPLIT_UP:    ik = ICON_PANEL_TOP;      break;
+        case TERM_MENU_RESTART_SHELL:
+            ik = ICON_REFRESH; act = ACT_RESTART_SHELL; mac = "Shift+" UI_MOD_PRIMARY "+R"; break;
         }
-        return (CtxMenuRow){ ik, app_term_menu_label(a), "", true, false };
+        const char *keys = act != ACT_NONE
+            ? app_shortcut_hint(app, act, mac, hint[a], sizeof hint[a]) : "";
+        return (CtxMenuRow){ ik, app_term_menu_label(a), keys, true, false };
     }
 
     /* Which rows is this menu's; the width and where they land are the shared
@@ -16776,7 +16912,7 @@ void app_explorer_open_for_active_tab(AppState *app) {
         bool sep[TERM_MENU_MAX_ROWS] = { false };
         out->count = app_term_menu_rows(app, out->acts, sep, TERM_MENU_MAX_ROWS);
         CtxMenuRow rows[TERM_MENU_MAX_ROWS];
-        for (i32 i = 0; i < out->count; i++) rows[i] = term_menu_row(out->acts[i]);
+        for (i32 i = 0; i < out->count; i++) rows[i] = term_menu_row(app, out->acts[i]);
         CtxMenuBox b;
         ctx_menu_place(&b, out->count, sep, app->term_ctx_menu_x, app->term_ctx_menu_y,
                        ctx_menu_measure(rows, out->count, dpi),
@@ -17205,7 +17341,11 @@ void app_explorer_open_for_active_tab(AppState *app) {
         case AGC_BTN_HIDE:     return "Esc";
         case AGC_BTN_CLOSE:    return "Ctrl+D";
         case AGC_BTN_STOP:     return "Ctrl+C";
+#ifdef PLATFORM_MACOS
         case AGC_BTN_CONTINUE: return "Cmd+Enter";
+#else
+        case AGC_BTN_CONTINUE: return "Ctrl+Enter";
+#endif
         case AGC_BTN_ALLOW:    return "Y";
         case AGC_BTN_ALWAYS:   return "A";
         case AGC_BTN_DENY:     return "N";
@@ -18183,6 +18323,11 @@ void app_explorer_open_for_active_tab(AppState *app) {
         renderer_draw_rect(r, x, y, w, h, dim);
     }
 
+bool app_fb_status_card_room(const AppState *app) {
+    return app->sidebar_visible && app->sidebar_width >= 150.0f * app->dpi_scale &&
+           !sftp_transfer_active();
+}
+
 /* Something is in front of the panes (a dialog, a panel, a menu) and the
  * pointer belongs to it: nothing under it hears of the pointer. Several of
  * them take the click and let the motion and the wheel go on to the main
@@ -18201,7 +18346,7 @@ bool app_dialog_has_pointer(const AppState *a) {
            a->agent_picker_active || a->cmd_history_active || a->sbc_open ||
            a->close_confirm_active || a->paste_confirm_active || a->agentctl_prompt_active ||
            a->agentctl_panel_open || a->agentctl_team_open ||
-           a->lightbox.open || a->sketch.open ||
+           a->lightbox.open || a->sketch.open || a->dgv.open ||
            a->term_ctx_menu_active || a->tab_ctx_menu_active || a->group_ctx_menu_active ||
            a->job_ctx_menu_active ||
            a->fb_ctx_menu_active || a->fb_prompt_active ||
@@ -18228,6 +18373,7 @@ static bool app_cursor_layer_allowed(const AppState *a) {
         app_voice_hud_animating() ||
         a->tab_ctx_menu_active || a->group_ctx_menu_active || a->fb_ctx_menu_active ||
         a->fb_prompt_active || a->lightbox.open || a->sketch.open || a->tab_popup.want_open ||
+        a->dgv.open || diagram_viewer_animating(&a->dgv) ||
         a->tab_popup.kind || sftp_transfer_active() ||
         !anim_done(&a->settings.close_anim) || !anim_done(&a->sites.close_anim) ||
         !anim_done(&a->lightbox.close_anim) || !anim_done(&a->sketch.close_anim) || !anim_done(&a->tab_popup.close_anim)) return false;
@@ -18881,6 +19027,14 @@ static bool app_cursor_layer_allowed(const AppState *a) {
 
     /* === Inline images (Sixel / Liu graphics) === */
     term_draw_inline_images(app, source, term, origin_x, origin_y, ghost_clip);
+
+    /* === Diagrams over an agent's Mermaid blocks (ui/agent_diagram.h) ===
+     * After everything the rows draw, so a card covers exactly the rows its
+     * source took. Its summaries ride the dirty signal this draw is about to
+     * clear, so a ghost keeps them current too; the cards and their controls
+     * belong to the pane. */
+    agent_diagram_pane_pass(app, source, term, &cache->adg, origin_x, origin_y,
+                            deco_full_rebuild, !ghost_clip);
 
     /* Everything below is the pane's own chrome and overlays. */
     if (ghost_clip) { term_clear_dirty(term); return; }
@@ -19685,6 +19839,8 @@ static void render_terminal(AppState *app) {
      * behind. */
     app->img_badge_count = 0;
     app->img_badge_dropped = 0;
+    app->adg_hit_count = 0;
+    app->adg_cards = 0;
     app->prompt_badge_count = 0;
     app->prompt_thumb_count = 0;
 
@@ -20548,17 +20704,19 @@ static void render_bench_overlay(AppState *app) {
                  bm->last_pty_ms, kp50, kp99);
         snprintf(r3,  sizeof(r3),  " redraw req %6.2f  p50 %5.2f  p99 %6.2f",
                  bm->last_req_ms, rp50, rp99);
-        snprintf(r4,  sizeof(r4),
+        /* Two calls rather than a directive inside one: snprintf can be a
+         * macro, and a directive in a macro's arguments is undefined. */
 #ifdef USE_METAL
-                 "%s%6.2f  p50 %5.2f  p99 %6.2f",
-                 /* The IOSurface presenter has no presentation time: its
-                  * stamp is the frame becoming the layer's contents. */
+        /* The IOSurface presenter has no presentation time: its stamp is the
+         * frame becoming the layer's contents. */
+        snprintf(r4,  sizeof(r4),  "%s%6.2f  p50 %5.2f  p99 %6.2f",
                  renderer_presentation_is_layer_time(&app->renderer)
                      ? " on layer   " : " presented  ",
-#else
-                 " submitted  %6.2f  p50 %5.2f  p99 %6.2f",
-#endif
                  bm->last_paint_ms, pp50, pp99);
+#else
+        snprintf(r4,  sizeof(r4),  " submitted  %6.2f  p50 %5.2f  p99 %6.2f",
+                 bm->last_paint_ms, pp50, pp99);
+#endif
         snprintf(r5, sizeof(r5), "PTY / omitted %llu  unmapped %llu",
                  (unsigned long long)bm->input_samples_dropped,
                  (unsigned long long)bm->input_samples_uncertain);
@@ -21230,6 +21388,7 @@ void app_render(AppState *app) {
      * this frame: the focused pane, then a field drawn over it. */
     app->ime_field_prev = app->ime_field_now;
     app->ime_field_now = false;
+    app->ime_field_off = false;
 
     /* On Metal a glyph is drawable only once a frame's preparation (inside
      * renderer_begin_frame, just above) has queued its texels. A glyph packed
@@ -22816,9 +22975,9 @@ void app_render(AppState *app) {
              * keycap row is ONE combination. */
             struct { const char *words, *key; bool pair; } hint[3] = {
                 { "Next field", "Tab", false }, { "Recent", "\xe2\x86\x91 \xe2\x86\x93", true },
-                { "Remove", "Cmd+Backspace", false },
+                { "Remove", UI_MOD_APP "+Backspace", false },
             };
-            /* Remove: what Cmd+Backspace does to the row the keys chose. */
+            /* Remove: what the app modifier + Backspace does to the row the keys chose. */
             i32 nh = g.recent_drawn <= 0 ? 1 : app->ssh_history_selected >= 0 ? 3 : 2;
             f32 hx = g.hint_x;
             for (i32 i = 0; i < nh; i++) {
@@ -23606,10 +23765,10 @@ void app_render(AppState *app) {
         Color title_fg = t->fg; title_fg.a *= panel_alpha;
         /* The text below is the SERVER's, in a dialog of Liu's: the title says
          * whose it is, so a prompt worded like "Vault master password" cannot
-         * pass for one of ours (PuTTY's prompt-spoofing advisory). */
+         * pass for one of ours. */
         i32 kbi_title_room = (i32)((dw - 24) / ui_cw);
         char kbi_title[400];
-        snprintf(kbi_title, sizeof kbi_title, "Server prompt: %s",
+        snprintf(kbi_title, sizeof kbi_title, app->kbi_liu ? "Password for %s" : "Server prompt: %s",
                  app->kbi_peer[0] ? app->kbi_peer : "SSH server");
         draw_text_ex(r, kbi_title, dx + 12, ty, title_fg, kbi_title_room, ui_cw);
 
@@ -24224,7 +24383,10 @@ void app_render(AppState *app) {
         renderer_flush_rrects(r);
 
         /* Title */
-        const char *cc_title = app->close_confirm_group >= 0 ? "Close Group?"
+        /* The same question before a pane's shell is restarted. */
+        bool cc_restart = app->close_confirm_restart;
+        const char *cc_title = cc_restart                     ? "Restart Shell?"
+                             : app->close_confirm_group >= 0 ? "Close Group?"
                              : app->close_confirm_pane >= 0  ? "Close Pane?"
                                                              : "Close Tab?";
         f32 title_y = dy + pad;
@@ -24249,9 +24411,10 @@ void app_render(AppState *app) {
                  app->close_confirm_agent, cc_where);
         f32 body_y = divider_y + 18.0f * dpi;
         draw_text_ex(r, cc_msg, dx + pad, body_y, cc_fg, (i32)strlen(cc_msg), ui_cw);
-        draw_text_ex(r, "Closing will end its session.",
-                     dx + pad, body_y + ui_ch + 6.0f * dpi,
-                     cc_dim, 29, ui_cw);
+        const char *cc_end = cc_restart ? "Restarting will end its session."
+                                        : "Closing will end its session.";
+        draw_text_ex(r, cc_end, dx + pad, body_y + ui_ch + 6.0f * dpi,
+                     cc_dim, (i32)strlen(cc_end), ui_cw);
 
         /* Buttons: destructive Close (right), Cancel beside it. */
         f32 btn_h = 34 * dpi;
@@ -24280,8 +24443,10 @@ void app_render(AppState *app) {
 
         draw_text_ex(r, "Cancel", cancel_x + (btn_w_cancel - 6 * ui_cw) / 2,
                      btn_y + (btn_h - ui_ch) / 2, cancel_fg, 6, ui_cw);
-        draw_text_ex(r, "Close", close_x + (btn_w_close - 5 * ui_cw) / 2,
-                     btn_y + (btn_h - ui_ch) / 2, close_fg, 5, ui_cw);
+        const char *cc_go = cc_restart ? "Restart" : "Close";
+        i32 cc_go_n = (i32)strlen(cc_go);
+        draw_text_ex(r, cc_go, close_x + (btn_w_close - (f32)cc_go_n * ui_cw) / 2,
+                     btn_y + (btn_h - ui_ch) / 2, close_fg, cc_go_n, ui_cw);
 
         renderer_flush_rects(r);
         renderer_flush_glyphs(r);
@@ -25437,9 +25602,12 @@ void app_render(AppState *app) {
         if (tmax < 1) tmax = 1;
         draw_text_ex(r, app->agent_picker_title, ppx + 16.0f * dpi, title_y,
                      title_fg, tmax, ui_cw);
+#ifdef PLATFORM_MACOS
         const char *sub = "Pick an agent to continue · ⌘+R to refresh";
-        draw_text_ex(r, sub, ppx + 16.0f * dpi, sub_y, sub_fg,
-                     (i32)strlen(sub), ui_cw);
+#else
+        const char *sub = "Pick an agent to continue · " UI_MOD_PANE "+R to refresh";
+#endif
+        draw_text_ex(r, sub, ppx + 16.0f * dpi, sub_y, sub_fg, tmax, ui_cw);
         /* Title divider */
         renderer_draw_rect(r, ppx + 1.0f * dpi, ppy + title_h - 1.0f * dpi,
                            pw - 2.0f * dpi, 1.0f * dpi,
@@ -25564,8 +25732,16 @@ void app_render(AppState *app) {
         renderer_draw_rect(r, ppx + 1.0f * dpi, footer_top,
                            pw - 2.0f * dpi, 1.0f * dpi,
                            (Color){panel_bd.r, panel_bd.g, panel_bd.b, 0.25f});
+#ifdef PLATFORM_MACOS
         const char *hint = "Enter select  ·  Esc cancel  ·  ⌘+R refresh";
-        i32 hlen = (i32)strlen(hint);
+#else
+        /* Single spaces: the longer chord's words fill the panel otherwise. */
+        const char *hint = "Enter select · Esc cancel · " UI_MOD_PANE "+R refresh";
+#endif
+        /* Centred by the columns it draws (⌘ and · are more bytes than one),
+         * and never wider than the panel. */
+        i32 hlen = (i32)utf8_display_cols((const u8 *)hint, strlen(hint));
+        if (hlen > tmax) hlen = tmax;
         f32 hx = ppx + (pw - (f32)hlen * ui_cw) * 0.5f;
         f32 hy = footer_top + (footer_h - ui_ch) * 0.5f;
         Color hcol = { t->sidebar_fg.r, t->sidebar_fg.g, t->sidebar_fg.b, 0.5f };
@@ -25924,8 +26100,7 @@ void app_render(AppState *app) {
      * arrives and leaves on the clock (fb_status_alpha), so it is one of the
      * loop's clock-driven visuals while it fades and a still picture between
      * (liu_continuous_visual + the wait ladder's fb_status_wake_in). */
-    else if (app->fb_status[0] && app->sidebar_visible &&
-             app->sidebar_width >= 150.0f * app->dpi_scale) {
+    else if (app->fb_status[0] && app_fb_status_card_room(app)) {
         f32 sa = fb_status_alpha(platform_time_sec() - app->fb_status_since,
                                  app->fb_status_until - app->fb_status_since);
         if (sa > 0.001f) {
@@ -25946,12 +26121,14 @@ void app_render(AppState *app) {
         f32 w = app->sidebar_width - 2.0f * inset;
         f32 x = inset;
         f32 tx = x + 10.0f * dpi + isz + 8.0f * dpi;
-        char l1[sizeof app->fb_status + 8], l2[sizeof app->fb_status + 8];
-        i32 lines = ui_wrap_two(app->fb_status, (i32)((x + w - 10.0f * dpi - tx) / ui_cw),
-                                l1, sizeof l1, l2, sizeof l2);
+        NoticeWrap nw;
+        i32 cols = (i32)((x + w - 10.0f * dpi - tx) / ui_cw);
+        i32 lines = notice_wrap_keep_end(app->fb_status, cols, NOTICE_WRAP_MAX, &nw);
         f32 line_h = ui_ch + 2.0f * dpi;
         f32 h = (f32)lines * line_h - 2.0f * dpi + 14.0f * dpi;
         f32 y = (f32)app->fb_height - h - app->status_bar_height - inset;
+        app->fb_status_lines = lines; app->fb_status_cols = cols < 4 ? 4 : cols;
+        app->fb_status_x = x; app->fb_status_y = y; app->fb_status_w = w; app->fb_status_h = h;
         Color danger = ui_danger(t);
         Color mark = kind == FB_STATUS_ERROR ? danger
                    : kind == FB_STATUS_OK    ? theme_ui_accent(t) : t->fg;
@@ -25975,8 +26152,8 @@ void app_render(AppState *app) {
         icon_draw(r, kind == FB_STATUS_OK ? ICON_CHECK : ICON_INFO,
                   x + 10.0f * dpi, ty + (ui_ch - isz) * 0.5f, isz, ic);
         Color fg = t->fg; fg.a = 0.95f * sa;
-        draw_text_ex(r, l1, tx, ty, fg, (i32)strlen(l1), ui_cw);
-        if (lines > 1) draw_text_ex(r, l2, tx, ty + line_h, fg, (i32)strlen(l2), ui_cw);
+        for (i32 li = 0; li < lines; li++)
+            draw_text_ex(r, nw.line[li], tx, ty + (f32)li * line_h, fg, (i32)strlen(nw.line[li]), ui_cw);
         renderer_flush_glyphs(r);
         renderer_reset_ui_scale(r);
         }
@@ -26032,7 +26209,7 @@ void app_render(AppState *app) {
         TermMenuLayout ml;
         if (app_term_menu_layout(app, &ml) > 0) {
             CtxMenuRow rows[TERM_MENU_MAX_ROWS];
-            for (i32 i = 0; i < ml.count; i++) rows[i] = term_menu_row(ml.acts[i]);
+            for (i32 i = 0; i < ml.count; i++) rows[i] = term_menu_row(app, ml.acts[i]);
             CtxMenuBox box = ctx_menu_box_of(ml.x, ml.y, ml.w, ml.h, ml.row_h, ml.count,
                                              ml.row_y, ml.sep_after);
             ctx_menu_draw_panel(r, t, box.x, box.y, box.w, box.h, dpi);
@@ -26257,7 +26434,12 @@ void app_render(AppState *app) {
      * draw, and the frame after its close animation drains is where it releases
      * the decoded image. */
     lightbox_render(app);
+    /* Unconditional for the same reason: the frame its close drains is the
+     * one that lets the diagram go. */
+    diagram_viewer_render(app);
     sketch_render(app);
+
+    render_window_edge(app);
 
     /* Floating notices, sharing their grid and chrome with agent notices:
      * newest on top, up to three, each in its kind's mark and colour. Drawn
@@ -26278,7 +26460,11 @@ void app_render(AppState *app) {
 
         /* Pause a notice's timer only while the pointer rests on it in the
          * active window. Notices in background windows continue to expire. */
+#ifdef PLATFORM_MACOS
         bool use_native = browser_should_show(app) && app->host_window;
+#else
+        bool use_native = false;   /* the page is cut away under them instead */
+#endif
         i32 hovered = -1;
         toast_stack_retire(ts, tnow);   /* a finished one is not held back */
         /* Over the page the pointer never reaches this view, so the last
@@ -26296,6 +26482,7 @@ void app_render(AppState *app) {
         if (!use_native && app->host_window) platform_toast_hide(app->host_window);
 
         f32 run = 0.0f;   /* the slot's offset: the heights above it, and gaps */
+        ts->settling = false;
         for (i32 i = 0; i < ts->n; i++) {
             ToastEntry *e = &ts->e[i];
             NotificationLayout l = notification_toast_layout(e->msg, app->fb_width,
@@ -26303,6 +26490,7 @@ void app_render(AppState *app) {
             if (!l.text.count) { e->hw = 0.0f; continue; }
             if (!e->placed) { e->y = run; e->placed = true; }
             else e->y = toast_follow(e->y, run, ts->dt);
+            if (e->y != run) ts->settling = true;
             run += l.h + gap;
 
             f32 talpha = toast_entry_alpha(e, tnow);
@@ -26373,6 +26561,9 @@ void app_render(AppState *app) {
     } else if (app->host_window) {
         platform_toast_hide(app->host_window);
     }
+#ifndef PLATFORM_MACOS
+    app_browser_notice_holes(app);
+#endif
 
     /* Render benchmark overlay — last, so it sits above every other panel. */
     render_bench_overlay(app);
@@ -27116,14 +27307,26 @@ bool app_poll_sessions(AppState *app) {
                 render_cpu += term_render_cache_bytes(&tb->cache2);
                 for (i32 pn = 2; pn < MAX_SPLIT_PANES; pn++)
                     render_cpu += term_render_cache_bytes(&tb->extra_caches[pn - 2]);
+                /* the diagrams drawn over its agents' Mermaid blocks */
+                for (i32 pn = 0; pn < MAX_SPLIT_PANES; pn++) {
+                    TermRenderCache *pc = tab_pane_cache(tb, pn);
+                    if (pc) render_cpu += agent_diagram_pane_bytes(pc->adg);
+                }
                 /* A history that stopped scrolling gives back the blocks it
-                 * kept for the next lines (4 s: 16 walks of 250 ms). */
-                for (i32 pn = 0; pn < tab_split_pane_count(tb); pn++)
-                    termline_cache_tick(tab_pane_terminal(tb, pn), 16);
+                 * kept for the next lines (4 s: 16 walks of 250 ms), and a
+                 * screen that stopped scrolling its slide rows (30 s). */
+                for (i32 pn = 0; pn < tab_split_pane_count(tb); pn++) {
+                    Terminal *pt = tab_pane_terminal(tb, pn);
+                    termline_cache_tick(pt, 16);
+                    terminal_grid_slack_tick(pt, 120);
+                }
             }
             for (i32 si = 0; si < app->site_mgr.count; si++) {
                 Site *st = sites_get(&app->site_mgr, si);
-                if (st) termline_cache_tick(st->term, 16);
+                if (st) {
+                    termline_cache_tick(st->term, 16);
+                    terminal_grid_slack_tick(st->term, 120);
+                }
             }
             app->render_cpu_walk_at    = poll_now;
             app->render_cpu_walk_bytes = render_cpu;

@@ -34,7 +34,6 @@ void  *arena_alloc_array(Arena *a, usize count, usize elem_size);
 /* arena_alloc + zero-fill. NULL on OOM. */
 void  *arena_calloc(Arena *a, usize size);
 void   arena_reset(Arena *a);
-usize  arena_remaining(const Arena *a);
 
 /* Temp arena - save/restore point for scratch allocations */
 typedef struct {

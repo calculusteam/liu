@@ -382,6 +382,8 @@ typedef struct {
     bool    agent_subagent_tabs;           /* the subagents an agent in a pane starts itself (Claude Code's
                                             * Agent tool, Codex's spawned agents…) are shown as job tabs
                                             * beside its tab, read from the agent's own store (default ON) */
+    bool    agent_diagrams;                /* a Mermaid block an agent prints is drawn as its diagram over
+                                            * the rows its source took (ui/agent_diagram.h, default ON) */
     u8      agent_jobs_fold;               /* AgcFoldPolicy: when a tab's job tabs start folded into their
                                             * count chip — 0 auto (past what fits), 1 always, 2 never */
     bool    cursor_blink;
@@ -555,6 +557,14 @@ const char *font_user_dir(void);
  * Cached on first call. Returns an empty string if resolution fails.
  * Used to find sibling helper binaries (liu-history, agenthistory, …). */
 const char *liu_executable_dir(void);
+
+/* The folder liu-notify and liu-history are run from by what outlives this
+ * process: the agents' hook shim and the pane PATH's helper links. It is
+ * liu_executable_dir(), except where that folder goes away when Liu exits
+ * and another user could make it again (an AppImage's mount under /tmp):
+ * then a copy of both in a folder only this user can write (~/.liu/helpers),
+ * renewed when they differ. Cached on first call; empty when unresolved. */
+const char *liu_helper_exe_dir(void);
 
 /* Get the custom font directory under the repository font root. */
 const char *font_custom_dir(void);

@@ -133,7 +133,7 @@ static void retained_rows_free(RetainedSlot *slot) {
 #endif
 /* Metadata is only an optimization. Refusal keeps the full-copy path usable;
  * it must never turn an allocation failure into a skipped row update. */
-static bool retained_rows_prepare(RetainedSlot *slot, const RendererRows *rows) {
+static inline bool retained_rows_prepare(RetainedSlot *slot, const RendererRows *rows) {
     if (!rows->versions) { slot->rows_valid=false;return false; }
     if (slot->row_count==rows->rows && (slot->rows || !rows->rows)) return true;
     usize bytes;

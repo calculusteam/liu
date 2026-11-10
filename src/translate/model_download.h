@@ -35,11 +35,6 @@ typedef struct {
     char error[160];      /* human-readable reason when state == ERROR */
 } ModelDownloadStatus;
 
-/* The configure-time defaults. */
-const char *model_download_default_url(void);
-const char *model_download_default_sha256(void);
-u64         model_download_default_size(void);
-
 /* Canonical destination ($HOME/Library/Application Support/Liu/models/<file>).
  * Writes into `out`; returns `out` or NULL when $HOME is unavailable. */
 const char *model_download_default_dest(char *out, usize cap);

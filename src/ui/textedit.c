@@ -92,6 +92,14 @@ i32 textedit_cell_index(const char *buf, i32 byte_off) {
     return (i32)utf8_len((const u8 *)buf, strnlen(buf, (usize)byte_off));
 }
 
+i32 textedit_field_cols(const char *buf, i32 len, i32 from, i32 to, bool mask) {
+    if (to <= from) return 0;
+    if (mask) return to - from;
+    i32 a = textedit_byte_offset(buf, len, from);
+    i32 b = textedit_byte_offset(buf, len, to);
+    return b > a ? (i32)utf8_display_cols((const u8 *)buf + a, (usize)(b - a)) : 0;
+}
+
 i32 textedit_byte_offset(const char *buf, i32 len, i32 cell) {
     if (!buf || cell <= 0) return 0;
     i32 off = 0;
@@ -220,8 +228,7 @@ static void insert_bytes(TextEdit *e, const char *src, i32 n) {
 }
 
 void textedit_insert_cp(TextEdit *e, TextEditUndo *u, u32 cp) {
-    if (!e || !e->buf || cp < 32 || cp == 127) return;
-    if ((e->flags & TEXTEDIT_DIGITS) && (cp < '0' || cp > '9')) return;
+    if (!e || !e->buf || !textedit_cp_allowed(e->flags, cp)) return;
     u8 enc[4];
     u32 n = utf8_encode(cp, enc);
     if (n == 0) return;
@@ -267,6 +274,14 @@ bool textedit_key(TextEdit *e, TextEditUndo *u, i32 key, u32 mods) {
      * macOS Cmd+Ctrl ones. Of the Emacs set only the erasers stay — Ctrl+A is
      * select-all here. */
     if (ctrl && alt) return false;
+    /* The desktop's other copy / cut / paste keys (CUA): Ctrl+Insert,
+     * Shift+Delete, Shift+Insert — also what a compositor sends a terminal for
+     * its own copy and paste keys. Taken as Ctrl+C / X / V. */
+    if (!alt && !super && ((key == KEY_INSERT && ctrl != shift) || (key == KEY_DELETE && shift && !ctrl))) {
+        key = key == KEY_DELETE ? KEY_X : ctrl ? KEY_C : KEY_V;
+        ctrl = true;
+        shift = false;
+    }
     bool edit_chord = ctrl && !alt && !super;
     bool to_end     = false;
     bool by_word    = ctrl || alt;
@@ -399,24 +414,20 @@ bool textedit_key(TextEdit *e, TextEditUndo *u, i32 key, u32 mods) {
             char tmp[512];
             i32 n = 0;
             bool digits = (e->flags & TEXTEDIT_DIGITS) != 0;
-            for (const char *p = clip; *p && n < (i32)sizeof tmp - 1; p++) {
-                char ch = *p;
-                if (digits) {
-                    if (ch < '0' || ch > '9') continue;   /* drop, don't stop */
-                } else if ((u8)ch < 0x20 || ch == 0x7f) {
-                    ch = ' ';
-                }
-                tmp[n++] = ch;
-            }
-            /* Only a paste that filled tmp can end mid-sequence; drop that
-             * partial tail. `n` is one PAST the last byte written, so the
-             * scan has to start at n-1 — reading tmp[n] tested a byte the
-             * loop never wrote, and a stray continuation value there ate the
-             * last character of every long paste. A paste that fit ends on a
-             * whole character and is left alone. */
-            if (n >= (i32)sizeof tmp - 1) {
-                while (n > 0 && is_cont(tmp, n - 1)) n--;
-                if (n > 0 && ((u8)tmp[n - 1] & 0xC0) == 0xC0) n--;
+            /* By character, as a typed one is judged: bytes that are not UTF-8
+             * are dropped (a clipboard is arbitrary bytes), the field's flags
+             * refuse what it does not take, and a character that does not fit
+             * whole stops the paste instead of leaving half of it. */
+            const u8 *p = (const u8 *)clip;
+            usize left = strlen(clip);
+            while (left > 0 && n + 4 < (i32)sizeof tmp) {
+                u32 cp = 0;
+                u32 k = utf8_decode(p, left, &cp);
+                if (k == 0) { p++; left--; continue; }
+                p += k; left -= k;
+                if (!digits && (cp < 0x20 || cp == 0x7f)) cp = ' ';
+                if (!textedit_cp_allowed(e->flags, cp)) continue;   /* drop, don't stop */
+                n += (i32)utf8_encode(cp, (u8 *)tmp + n);
             }
             tmp[n] = '\0';
             insert_bytes(e, tmp, n);

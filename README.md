@@ -7,7 +7,7 @@
 <p align="center">
   <strong>One terminal for every AI agent.</strong><br>
   Liu sits between you and a variety of coding agents and makes ten parallel threads feel like one place.<br>
-  Written in <strong>C</strong>: native on macOS, GPU-accelerated.
+  Written in <strong>C</strong>: native on macOS and Linux, GPU-accelerated.
 </p>
 
 <p align="center">
@@ -143,12 +143,15 @@ Flip on the element picker in Liu's built-in browser and click anything on a liv
 | :--- | :--- | :--- |
 | **macOS** | Apple Silicon (arm64) | `.dmg` |
 | **macOS** | Intel (x86_64) | `.dmg` |
+| **Linux** | x86_64 | `.deb` · `.rpm` · `.AppImage` · `.tar.gz` |
+| **Linux** | ARM64 (aarch64) | `.deb` · `.rpm` · `.AppImage` · `.tar.gz` |
 
-macOS is the primary and only supported target.
+Linux needs glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 and later) and an X11 session; on a Wayland desktop Liu runs through XWayland. The browser pane uses WebKitGTK 4.1 when it is installed. On Linux every shortcut is the macOS one with Ctrl+Shift for ⌘ and Ctrl+Alt+Shift for ⌘⇧ (⌘K is Ctrl+Shift+K); Super with the same keys works too. Install from the [Releases](https://github.com/calculusteam/liu/releases) page or with `curl -fsSL https://raw.githubusercontent.com/calculusteam/liu/main/scripts/install.sh | bash`.
 
 ## Our Goal
 
-- [ ] **Linux support**: ARM64 and x86_64 builds (`.tar.gz`), apt (PPA), dnf (COPR), and AUR packages. Linux is planned but not currently supported.
+- [x] **Linux support**: ARM64 and x86_64 builds (`.deb`, `.rpm`, `.AppImage`, `.tar.gz`).
+- [ ] **Linux package repositories**: apt (PPA), dnf (COPR), and AUR.
 
 ---
 
@@ -157,6 +160,7 @@ macOS is the primary and only supported target.
 **Dependencies**
 
 - macOS: `brew install libssh2`
+- Linux (Debian, Ubuntu): `sudo apt install build-essential cmake ninja-build pkg-config libx11-dev libxcursor-dev libxi-dev libxrandr-dev libfontconfig1-dev libfreetype-dev libharfbuzz-dev libdbus-1-dev libgl1-mesa-dev libssh2-1-dev libssl-dev`
 - SQLite3, stb_truetype, stb_image, and cJSON are vendored under `third_party/`
 
 ```bash
@@ -169,6 +173,7 @@ git clone https://github.com/calculusteam/liu.git && cd liu
 # Or CMake directly:
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(sysctl -n hw.ncpu)
+# Linux: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DUSE_METAL=OFF && cmake --build build -j$(nproc)
 ./build/Liu
 ```
 

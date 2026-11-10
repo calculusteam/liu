@@ -25,12 +25,14 @@
 #include "ui/agent_icons.h"   /* TEMP */
 #include "ui/agent_resume.h"  /* codex_thread_uuid — the resume argv */
 #include "ui/agent_catalog.h" /* the agents Liu can start and resume */
+#include "ui/agent_visual.h"
 #include "ui/ui.h"
 #include "ui/pane_sessions.h"
 #include "ui/pane_zoom.h"
 #include "ui/pane_nav.h"
 #include "ui/bench_metrics.h"
 #include "ui/effective_settings.h"
+#include "ui/settings_field.h"
 #include "ui/a11y_text.h"
 #include "ui/bg_image.h"
 #include "ui/task_owner.h"
@@ -155,9 +157,9 @@ extern char **environ;
 
 #include "ui/markdown/md_parse.h"
 #include "ui/diagnostics.h"
+#include "ui/fb_rail_keys.h"   /* which keys a Code Editor tab's rail takes */
+#include "ui/editor_primary.h" /* when the editor's selection is published as X11's PRIMARY */
 #include "cJSON.h"
-
-extern void sidebar_load_hosts(Vault *v);
 
 /* Forward declarations for native settings callbacks.
  *
@@ -316,6 +318,7 @@ static void on_live_resize_render(PlatformWindow *rw, void *user) {
      * under whichever window painted last — and both the fade slots and the
      * damage set are keyed by that scope. */
     anim_set_hover_scope(app);
+    app->haze_handoff = false;   /* every tick of the drag is a frame */
     app_render(app);
     browser_apply_visibility_and_frame(app, rw);
     platform_window_swap_buffers(rw);
@@ -1053,9 +1056,9 @@ static void fp_end(const char *tag) {
                     (f64)s_fp_rebuild_ns / 1.0e6, (f64)s_fp_replay_ns / 1.0e6,
                     (long long)s_fp_inst_bg, (long long)s_fp_inst_glyph,
                     (long long)s_fp_inst_deco);
-            {   /* Full PROC_ALL_PIDS sweeps and what they cost. The
-                 * snapshot is shared across panes, so `psweep` should stay
-                 * near 4/s regardless of pane count. */
+            {   /* Process-group lookups (the members of a pane's
+                 * foreground group) and what they cost. Each pane backs off
+                 * to one every 4.8 s while its group stays the same. */
                 u64 sw = 0; f64 secs = 0;
                 session_proc_scan_stats(&sw, &secs);
                 static u64 prev_sw = 0; static f64 prev_secs = 0;
@@ -1687,6 +1690,15 @@ static bool liu_display_link_enabled(void) {
     return v != 0;
 }
 
+/* LIU_LINK_WAKE_ALWAYS=1 lets every display-link tick wake the loop again,
+ * whether or not the window has a frame to make at it — the revert arm for
+ * platform_window_set_link_wake. */
+static bool liu_link_wake_always(void) {
+    static i32 v = -1;
+    if (v < 0) { const char *e = getenv("LIU_LINK_WAKE_ALWAYS"); v = (e && atoi(e) == 1) ? 1 : 0; }
+    return v != 0;
+}
+
 /* LIU_POINTER_GATE=0 restores the blanket "any queued event repaints"
  * behaviour — the revert arm for the pointer-damage gate below, same
  * convention as LIU_PACE / LIU_DISPLAY_LINK / LIU_POLL_HOLD / LIU_PTY_THREAD. */
@@ -2087,7 +2099,6 @@ static void app_keygen_submit(AppState *app) {
 
 static void app_refresh_vault_views(AppState *app) {
     if (!app->vault) return;
-    sidebar_load_hosts(app->vault);
     if (app->palette_active) {
         palette_open(app->vault, &app->config, app);
     }
@@ -3602,6 +3613,12 @@ static void liu_lifecycle_atexit(void) {
      * actually goes away. Stopping capture here makes the light go out with
      * the window. */
     platform_audio_capture_stop();
+#ifdef PLATFORM_LINUX
+    /* A copy only Liu holds goes with it: hand it to the desktop's clipboard
+     * manager when there is one (bounded; nothing happens when there is none).
+     * Last, after everything above is saved. */
+    platform_clipboard_hand_off();
+#endif
 }
 
 /* SIGTERM / SIGINT / SIGHUP terminate the process WITHOUT running atexit, so
@@ -4323,10 +4340,12 @@ static void app_open_host_from_palette(AppState *app, const PaletteItem *item) {
         char title[256];
         snprintf(title, sizeof title, "%s@%s",
                  cfg.username, cfg.hostname);
-        if (app_adopt_tab(app, s, title) >= 0) {
-            vault_add_history(app->vault, cfg.hostname, cfg.port,
-                              cfg.username, "password",
-                              session_status(s) != SESSION_ERROR);
+        i32 ti = app_adopt_tab(app, s, title);
+        if (ti >= 0) {
+            const char *how = cfg.auth_method == AUTH_PUBLICKEY ? "publickey"
+                            : cfg.auth_method == AUTH_AGENT     ? "agent" : "password";
+            app->tabs[ti].history_row =
+                vault_add_history_attempt(app->vault, cfg.hostname, cfg.port, cfg.username, how);
         }
     } else {
         app_show_toast(app, "Connect failed");
@@ -4590,9 +4609,43 @@ static bool app_confirm_close_arm(AppState *app, i32 tab_index, i32 pane, i32 gr
     app->close_confirm_tab = tab_index;
     app->close_confirm_pane = pane;
     app->close_confirm_group = group;
+    app->close_confirm_restart = false;
+    app->close_confirm_pane_sid = pane >= 0 && tab_index >= 0 && tab_index < app->tab_count
+        ? session_instance_id(tab_pane_session_at(&app->tabs[tab_index], pane)) : 0;
     snprintf(app->close_confirm_agent, sizeof(app->close_confirm_agent),
              "%s", (disp && disp[0]) ? disp : "An AI agent");
     return true;
+}
+
+/* The pane the close question was about, where it is now: another pane of the
+ * tab closing meanwhile moves it. -1 when it is gone. */
+static i32 liu_confirm_pane_now(const AppState *app) {
+    i32 t = app->close_confirm_tab;
+    if (t < 0 || t >= app->tab_count || app->close_confirm_pane < 0) return -1;
+    const Tab *tab = &app->tabs[t];
+    if (!app->close_confirm_pane_sid) return app->close_confirm_pane;
+    i32 n = app_tab_pane_count(tab);       /* a slot past the count may hold a stale pointer */
+    for (i32 p = 0; p < n; p++) {
+        Session *s = tab_pane_session_at(tab, p);
+        if (s && session_instance_id(s) == app->close_confirm_pane_sid) return p;
+    }
+    return -1;
+}
+
+/* Restart Shell, from a pane's menu, the palette or its chord. It ends what
+ * runs in the pane as a close does, so an agent there is asked about the same
+ * way first. */
+static void liu_restart_pane(AppState *app, i32 tab_index, i32 pane) {
+    if (!app || tab_index < 0 || tab_index >= app->tab_count) return;
+    if (!app_pane_restartable(&app->tabs[tab_index], pane)) {
+        (void)app_restart_pane(app, tab_index, pane);   /* says why, where there is a reason */
+        return;
+    }
+    if (app_confirm_close_arm(app, tab_index, pane, -1)) {
+        app->close_confirm_restart = true;
+        return;
+    }
+    (void)app_restart_pane(app, tab_index, pane);
 }
 
 /* Rebuild one window, then share a successful preference change. */
@@ -7065,6 +7118,9 @@ static void app_execute_palette_row(AppState *app, PlatformWindow *window, const
         app_focus_pane_cycle(app, -1);
     } else if (strcmp(item->text, "Toggle Pane Zoom") == 0) {
         app_pane_zoom_toggle(app);
+    } else if (strcmp(item->text, "Restart Shell") == 0) {
+        Tab *rt = app_active_tab(app);
+        if (rt) liu_restart_pane(app, app->active_tab, rt->active_pane);
     } else if (strcmp(item->text, "Toggle Sidebar") == 0) {
         if (app->sidebar_visible) app_sidebar_set_visible(app, false);
         else                      app_open_sidebar_for_context(app);
@@ -7313,10 +7369,7 @@ static void app_execute_palette_row(AppState *app, PlatformWindow *window, const
         app->known_hosts_filter[0] = '\0';
         app->known_hosts_filter_len = 0;
     } else if (strcmp(item->text, "Clear History") == 0) {
-        if (app->vault) {
-            vault_clear_history(app->vault);
-            sidebar_load_hosts(app->vault);
-        }
+        if (app->vault) vault_clear_history(app->vault);
     } else if (strcmp(item->text, "Settings") == 0) {
         settings_toggle(&app->settings);
     } else if (strcmp(item->text, "Site Manager") == 0) {
@@ -7912,7 +7965,6 @@ static void app_ssh_dialog_forget_recent(AppState *app, i32 row) {
         return;
     }
     app_ssh_dialog_load_history(app);
-    sidebar_load_hosts(app->vault);
     /* The keys' selection keeps its place in the list — on the row that took
      * the removed one's, so Cmd+Backspace again removes the next — and none
      * stays none. */
@@ -7933,7 +7985,6 @@ static void app_ssh_dialog_clear_recent(AppState *app) {
         return;
     }
     app_ssh_dialog_load_history(app);
-    sidebar_load_hosts(app->vault);
 }
 
 /* The identity ssh falls back to when a host names none: the first of
@@ -7961,20 +8012,21 @@ static void sftp_label_for(char *out, usize cap, const char *user, const char *h
 /* Open an SFTP tab on `cfg` (consumed: disposed here), the remote pane in
  * `remote_dir` ("" = the account's home). `asked` is the host as the user
  * named it (an ~/.ssh/config alias, or NULL): the tab is called that. */
-static bool app_open_sftp_with(AppState *app, SSHConfig *cfg, const char *asked,
-                               const char *remote_dir, const char *note) {
+/* The new SFTP tab's index, or -1 when it could not be opened. */
+static i32 app_open_sftp_with(AppState *app, SSHConfig *cfg, const char *asked,
+                              const char *remote_dir, const char *note) {
     sftp_only_config(cfg);
     char label[320], name[256];
     sftp_label_for(label, sizeof label, cfg->username, cfg->hostname, cfg->port);
     sftp_tab_name_for(name, sizeof name, asked, cfg->hostname, cfg->port);
     Session *s = session_create_ssh(cfg, 80, 24);
     ssh_config_dispose(cfg);
-    if (!s) { app_show_toast_kind(app, NOTIFY_ERROR, "The SFTP connection could not be started"); return false; }
+    if (!s) { app_show_toast_kind(app, NOTIFY_ERROR, "The SFTP connection could not be started"); return -1; }
     i32 ni = app_open_sftp_tab(app, s, name, label, NULL, remote_dir);
-    if (ni < 0) return false;
+    if (ni < 0) return -1;
     app_switch_tab(app, ni);
     if (note) app_show_toast(app, note);
-    return true;
+    return ni;
 }
 
 /* "Open SFTP Tab" on an SSH pane: the same host, as its own file-transfer
@@ -8119,9 +8171,13 @@ static void app_ssh_dialog_submit(AppState *app) {
     bool from_row = app->ssh_dialog_alias[0] &&
                     strcmp(app->ssh_host, app->ssh_dialog_alias_host) == 0;
     SSHResolvedConfig *resolved = ssh_config_resolve(from_row ? app->ssh_dialog_alias : app->ssh_host);
+    /* A key the host's entry names is the person's choice; ssh's default
+     * identities (which apply() also takes) and the agent are not. */
+    bool key_named = false;
     if (resolved) {
         if (!from_row && resolved->hostname[0])
             snprintf(cfg.hostname, sizeof(cfg.hostname), "%s", resolved->hostname);
+        key_named = resolved->identity_file_count > 0 && !resolved->identity_defaults;
         ssh_config_apply(resolved, &cfg, false);
         ssh_config_free(resolved);
     }
@@ -8159,23 +8215,28 @@ static void app_ssh_dialog_submit(AppState *app) {
             snprintf(key_toast, sizeof key_toast, "Signing in with the SSH agent");
         }
         key_note = key_toast;
+        /* No password, and no key chosen for this host (a Recent row keeps no
+         * password): when the server refuses these, the person is asked, as
+         * ssh asks — the server's prompt, else Liu's password dialog. */
+        cfg.ask_password = !key_named;
     }
     const char *auth_label = cfg.auth_method == AUTH_PUBLICKEY ? "publickey"
                            : cfg.auth_method == AUTH_AGENT     ? "agent" : "password";
+    /* What was asked for: the alias (typed, or the palette row's), not the
+     * address it resolved to. The SFTP tab is named by it and Recent keeps
+     * it, so a Recent row finds the alias's own key and port again. */
+    char asked_host[256];
+    snprintf(asked_host, sizeof asked_host, "%s", from_row ? app->ssh_dialog_alias : app->ssh_host);
 
     if (app->ssh_dialog_sftp) {
-        char host[256], user[128];
+        char user[128];
         i32 port = cfg.port;
-        snprintf(host, sizeof host, "%s", cfg.hostname);
         snprintf(user, sizeof user, "%s", cfg.username);
-        /* The tab is named by what was asked for: the alias (typed, or the
-         * palette row's), not the address it resolved to. */
-        char asked[256];
-        snprintf(asked, sizeof asked, "%s", from_row ? app->ssh_dialog_alias : app->ssh_host);
-        bool opened = app_open_sftp_with(app, &cfg, asked, "", key_note);   /* disposes cfg */
+        i32 ti = app_open_sftp_with(app, &cfg, asked_host, "", key_note);   /* disposes cfg */
+        /* The tab writes its own result on its row. */
         if (app->vault) {
-            vault_add_history(app->vault, host, port, user, auth_label, opened);
-            sidebar_load_hosts(app->vault);
+            i64 row = vault_add_history_attempt(app->vault, asked_host, port, user, auth_label);
+            if (ti >= 0) app->tabs[ti].history_row = row;
         }
         app_close_ssh_dialog(app);
         return;
@@ -8192,18 +8253,17 @@ static void app_ssh_dialog_submit(AppState *app) {
         char title[256];
         const char *prefix = (session_type(s) == SESSION_MOSH) ? "[mosh] " : "";
         snprintf(title, sizeof(title), "%s%s@%s", prefix, cfg.username, cfg.hostname);
-        bool adopted = (app_adopt_tab(app, s, title) >= 0);
-        if (adopted && key_note) app_show_toast(app, key_note);
+        i32 ti = app_adopt_tab(app, s, title);
+        if (ti >= 0 && key_note) app_show_toast(app, key_note);
+        /* Stored as not connected until the tab's own session says it is
+         * (the result loop writes it on this row). */
         if (app->vault) {
-            bool initial_ok = adopted && (session_status(s) != SESSION_ERROR);
-            vault_add_history(app->vault, cfg.hostname, cfg.port,
-                              cfg.username, auth_label, initial_ok);
-            sidebar_load_hosts(app->vault);
+            i64 row = vault_add_history_attempt(app->vault, asked_host, cfg.port,
+                                                cfg.username, auth_label);
+            if (ti >= 0) app->tabs[ti].history_row = row;
         }
     } else if (app->vault) {
-        vault_add_history(app->vault, cfg.hostname, cfg.port,
-                          cfg.username, auth_label, false);
-        sidebar_load_hosts(app->vault);
+        vault_add_history_attempt(app->vault, asked_host, cfg.port, cfg.username, auth_label);
     }
     /* Session (if any) owns its own deep clone; release this stack copy
      * and scrub the dialog's password buffer (session has its own). */
@@ -8231,7 +8291,7 @@ static void app_fb_status(AppState *app, FbStatusKind kind, const char *fmt, ...
     /* An action done for an SFTP tab's pane says it in that pane's footer.
      * The text stays here too (a prompt that could not start an operation
      * copies it), but the explorer's line does not show it. */
-    if (app->fb_actor.id) {
+    if (app->fb_actor.id && !(app->fb_actor.id & FB_ACTOR_RAIL)) {
         sftp_tab_say(app, app->fb_actor.id, app->fb_actor.pane,
                      kind == FB_STATUS_ERROR ? SFTP_MSG_ERROR : kind == FB_STATUS_OK ? SFTP_MSG_OK : SFTP_MSG_INFO,
                      app->fb_status);
@@ -8244,6 +8304,14 @@ static void app_fb_status(AppState *app, FbStatusKind kind, const char *fmt, ...
     app->fb_status_kind  = (u8)kind;
     app->fb_status_since = now;
     app->fb_status_until = now + fb_status_hold_sec(kind);
+    /* The rail of a Code Editor tab has no status line of its own: the
+     * explorer's is on screen only while the sidebar is up, so otherwise the
+     * result is a notice. */
+    if (app->fb_actor.id & FB_ACTOR_RAIL) {
+        if (!app_fb_status_card_room(app))
+            app_show_toast_kind(app, kind == FB_STATUS_ERROR ? NOTIFY_ERROR : NOTIFY_SUCCESS,
+                                app->fb_status);
+    }
 }
 
 /* The neutral form: progress, and what Copy / Cut put on the clipboard. */
@@ -8252,14 +8320,23 @@ static void app_fb_set_status(AppState *app, const char *msg) {
 }
 
 /* ---- Which browser the explorer's file operations act on -----------------
- * The docked explorer, or a pane of an SFTP tab while AppState.fb_actor names
- * one (set around a call made for it, kept with the prompt it opened and with
- * the task it started — ui/sftp_tab.h). A pane that has gone is a browser
- * with nothing in it: the action finds no row and does nothing. */
+ * The docked explorer, a pane of an SFTP tab, or the rail of a Code Editor
+ * tab while AppState.fb_actor names one (set around a call made for it, kept
+ * with the prompt it opened and with the task it started — ui/sftp_tab.h). A
+ * pane or rail that has gone is a browser with nothing in it: the action finds
+ * no row and does nothing. */
 static FileBrowser g_fb_gone;
 static FileBrowser *app_fb_actor_fb(AppState *app, SftpActor actor) {
     if (!actor.id) return &app->filebrowser;
-    FileBrowser *fb = sftp_tab_actor_fb(app, actor.id, actor.pane);
+    FileBrowser *fb = NULL;
+    if (actor.id & FB_ACTOR_RAIL) {
+        for (i32 i = 0; i < app->tab_count && !fb; i++) {
+            const Tab *t = &app->tabs[i];
+            if (t->kind == TAB_FILEBROWSER && t->fb && (FB_ACTOR_RAIL | t->fb_uid) == actor.id) fb = t->fb;
+        }
+    } else {
+        fb = sftp_tab_actor_fb(app, actor.id, actor.pane);
+    }
     if (fb) return fb;
     memset(&g_fb_gone, 0, sizeof g_fb_gone);
     g_fb_gone.selected = -1;
@@ -12162,6 +12239,8 @@ static void app_fb_delete_request(AppState *app, i32 index) {
     i32 idx[FB_CLIP_MAX];
     i32 n = app_fb_delete_collect(app, index, idx, FB_CLIP_MAX);
     if (n <= 0) return;
+    /* A Code Editor tab's rail lists this machine. */
+    if ((app->fb_actor.id & FB_ACTOR_RAIL) && fb->source != FB_SOURCE_LOCAL) return;
     bool remote = fb->source == FB_SOURCE_SFTP && fb->sftp_handle;
     if (remote || !app_fb_trash_available(app)) { app_fb_delete_ask(app, index, n, ""); return; }
 
@@ -12771,10 +12850,20 @@ typedef struct {
     u64  ls_vsync_ticks;   /* monotonic counter from the CoreVideo callback */
     u64  ls_vsync_seen;    /* the value this window last painted at */
     f64  ls_link_want_at;  /* last time something wanted frames (hysteresis) */
+    /* Something on this window is drawn from the clock (an animation, the
+     * working bar, a caret, the pointer's hold): every tick may owe a frame.
+     * Output alone is not on it — its bytes wake the loop themselves. */
+    bool ls_link_clock;
+    /* When an open field dialog's picture next changes (its caret's edge, the
+     * form's error running out); 0 while none is open. */
+    f64  ls_field_due;
     f64  ls_last_anim_t;
     /* Soft (~30 Hz) animation deadline, kept apart from ls_last_anim_t — see
      * the comment at the site that writes it. */
     f64  ls_last_soft_anim_t;
+    /* When this window's last frame was drawn, for anything: a soft
+     * animation's slot that has one owes no frame of its own. */
+    f64  ls_drawn_at;
     f64  ls_last_resource_trim_t;
 #if LIU_ANIM_PROBE
     f64  ls_last_present_t;
@@ -12783,6 +12872,29 @@ typedef struct {
 
 static LiuWindow g_liu_wins[LIU_MAX_WINDOWS];
 static i32       g_liu_win_count;
+
+/* LIU_SOFT_ANIM_EVERY_TURN=1: a soft animation repaints on every loop turn
+ * again, and the wait ladder wakes for it FRAME_DT_SOFT_ANIM after each. */
+static bool liu_soft_anim_every_turn(void) {
+    static i32 v = -1;
+    if (v < 0) { const char *e = getenv("LIU_SOFT_ANIM_EVERY_TURN"); v = (e && atoi(e) == 1) ? 1 : 0; }
+    return v != 0;
+}
+
+/* How long until a window's soft animation owes its next frame (<= 0: now).
+ * The clock is cut into FRAME_DT_SOFT_ANIM slots and each slot is owed one
+ * frame, drawn for anything. The animation's own frame comes at the END of a
+ * slot that has had none, so output drawn anywhere in the slot draws it too;
+ * a frame owed a fixed time after the last one would land just before the
+ * next frame of a ~30 Hz stream, and both would be drawn. */
+static f64 liu_soft_anim_wait(const LiuWindow *w, f64 now) {
+    const f64 slot = floor(now / FRAME_DT_SOFT_ANIM) * FRAME_DT_SOFT_ANIM;
+    /* A little early: the wait ladder wakes to the millisecond, and a frame
+     * refused for want of 1 ms would fall into the next slot. */
+    f64 due = slot + FRAME_DT_SOFT_ANIM - 0.002;
+    if (w->ls_drawn_at >= slot) due += FRAME_DT_SOFT_ANIM;
+    return due - now;
+}
 
 /* Hand every queued agent-hook signal to the window that holds its pane.
  *
@@ -13101,6 +13213,28 @@ static FileBrowser *app_editor_drag_live(AppState *a) {
     return fb;
 }
 
+#ifndef PLATFORM_MACOS
+/* X11's PRIMARY: a selection made in the code editor is what a middle click
+ * pastes, here and in every other X application, as one made in a pane is.
+ * Published once per change of the selection, when no button is down (a drag
+ * in progress is not published at every move). */
+static void app_editor_publish_primary(AppState *a) {
+    FileBrowser *fb = app_editing_fb(a);
+    /* No selection forgets the last one: the same range selected again, after
+     * another application took PRIMARY, is published again. */
+    if (!fb || !fb_editor_sel_active(fb)) { a->ed_primary_sig = 0; return; }
+    u64 sig = editor_primary_sig(fb, fb->view_edit_gen, fb->sel_line, fb->sel_col,
+                                 fb->cursor_line, fb->cursor_col);
+    if (sig == a->ed_primary_sig) return;
+    a->ed_primary_sig = sig;
+    usize n = 0;
+    char *t = fb_editor_sel_text(fb, &n);
+    if (!t) return;
+    if (n) (void)platform_primary_set(t);
+    free(t);
+}
+#endif
+
 /* A left-button event to the program, at a VISUAL cell: a program that grabbed
  * the mouse painted the screen itself and its protocol names physical cells. */
 /* Ctrl and Alt as they were held when the press that is being forwarded went
@@ -13130,7 +13264,28 @@ static void app_mouse_fwd_button(AppState *app, Terminal *t, Session *s, i32 col
  * pane, through the paste path Ctrl+Shift+V takes, and gives it the keyboard
  * as a click would. */
 static void app_middle_click(AppState *app, f32 x, f32 y, u32 mods, bool pressed) {
-    if (ui_hit_test(app, x, y).type != HIT_TERMINAL) return;
+    HitResult hit = ui_hit_test(app, x, y);
+    /* Over a document being edited (docked, or in a Code Editor tab) the press
+     * puts the caret at the click and inserts the PRIMARY selection there, as
+     * a text field does; it is one undo step. */
+    {
+        Tab *at = app_active_tab(app);
+        FileBrowser *efb = hit.type == HIT_VIEWER ? &app->filebrowser
+                         : (hit.type == HIT_FBTAB_VIEWER && at && at->kind == TAB_FILEBROWSER) ? at->fb
+                         : NULL;
+        if (efb && efb->editor_mode && efb->view_content) {
+            if (!pressed) return;
+            const char *prim = platform_primary_get();
+            efb->kbd_away = false;
+            if (fb_editor_press(efb, x, y, 1, false) && prim && prim[0]) {
+                fb_editor_push_undo(efb);
+                fb_editor_insert_text(efb, prim, strlen(prim));
+                fb_editor_push_undo(efb);
+            }
+            return;
+        }
+    }
+    if (hit.type != HIT_TERMINAL) return;
     Tab *tab = app_active_tab(app);
     if (!tab || tab->sleeping) return;
     i32 pane = app_pane_index_at(app, tab, x, y);
@@ -13260,6 +13415,12 @@ static void liu_pump_completions(AppState *restore_scope) {
     prompt_seen = revision;
     const void *history_owner = NULL;
     bool history_changed = palette_history_pump(&history_owner);
+
+    /* a picture an agent printed finished drawing: every window that may
+     * show its card paints once */
+    static u64 visual_seen;
+    u64 visual_rev = agv_revision();
+    if (visual_rev != visual_seen) { visual_seen = visual_rev; shared_changed = true; }
 
     app_async_frame_begin();
     for (i32 wi = 0; wi < g_liu_win_count; wi++) {
@@ -13627,6 +13788,20 @@ static void liu_agentctl_owner_label(u64 owner, char *out, usize cap) {
     snprintf(out, cap, "%s (tab %d)", who, ti + 1);
 }
 
+/* The shown prompt's "Allow all N": its pane's requests queued behind it,
+ * counted again whenever the queue changes, since one can arrive or be
+ * withdrawn while the prompt is up. A withdrawn request is not counted. */
+static void liu_agentctl_count_waiting(AppState *st) {
+    if (!st->agentctl_prompt_active) return;
+    AgentctlAction qa;
+    if (!agentctl_job_describe(st->agentctl_prompt.job, &qa)) return;
+    u64 owner = qa.owner_serial;
+    i32 n = 0;
+    for (i32 q = 0; q < st->agentctl_prompt_queued; q++)
+        if (agentctl_job_describe(st->agentctl_prompt_queue[q], &qa) && qa.owner_serial == owner) n++;
+    st->agentctl_prompt.waiting = n;
+}
+
 /* The next queued request of this window, raised as the start prompt.
  * Requests withdrawn while they waited are skipped. */
 static bool liu_agentctl_show_next(AppState *st) {
@@ -13641,12 +13816,6 @@ static bool liu_agentctl_show_next(AppState *st) {
         AgentctlPromptView *v = &st->agentctl_prompt;
         memset(v, 0, sizeof *v);
         v->job = job;
-        /* the requests of the same pane queued behind it: "Allow all N" */
-        for (i32 q = 0; q < st->agentctl_prompt_queued; q++) {
-            AgentctlAction qa;
-            if (agentctl_job_describe(st->agentctl_prompt_queue[q], &qa) && qa.owner_serial == a->owner_serial)
-                v->waiting++;
-        }
         const AgentctlAgentInfo *ai = agentctl_agent_info(a->agent);
         const char *name = ai ? ai->display : "an agent";
         char owner[96];
@@ -13663,6 +13832,7 @@ static bool liu_agentctl_show_next(AppState *st) {
         free(a);
         f64 now = platform_time_sec();
         st->agentctl_prompt_active = true;
+        liu_agentctl_count_waiting(st);          /* the requests of the same pane queued behind it */
         st->agentctl_prompt_shown_at = now;
         st->agentctl_prompt_quiet_since = now;
         app_agentctl_prompt_banner(st, v->title, v->who);
@@ -13753,6 +13923,7 @@ static void liu_route_agentctl(void) {
                 break;
             }
             st->agentctl_prompt_queue[st->agentctl_prompt_queued++] = a->job;
+            liu_agentctl_count_waiting(st);
             g_liu_wins[wi].needs_redraw = true;
             break;
         }
@@ -13763,6 +13934,10 @@ static void liu_route_agentctl(void) {
                 if (st->agentctl_prompt_active && st->agentctl_prompt.job == a->job) {
                     st->agentctl_prompt_active = false;
                     g_liu_wins[w].needs_redraw = true;
+                } else if (st->agentctl_prompt_active) {
+                    i32 before = st->agentctl_prompt.waiting;
+                    liu_agentctl_count_waiting(st);
+                    if (st->agentctl_prompt.waiting != before) g_liu_wins[w].needs_redraw = true;
                 }
             }
             break;
@@ -16197,6 +16372,12 @@ static usize liu_script_unescape(const char *s, u8 *out, usize cap) {
     return o;
 }
 
+/* The key-downs the loop was handed, and the last one: a driver pressing
+ * real keys under a window manager asks whether the window got each chord,
+ * whatever the chord then does (the manager keeps the chords it takes). */
+static u32 g_script_keys_seen;
+static KeyBinding g_script_key_last;
+
 static void liu_script_state(AppState *a, PlatformWindow *pw) {
     char v[1200];
 #define SAYI(k, x) liu_script_say("%s=%d\n", (k), (int)(x))
@@ -16207,8 +16388,22 @@ static void liu_script_state(AppState *a, PlatformWindow *pw) {
     platform_window_get_size(pw, &ww, &wh);
     liu_script_say("window=%.0f,%.0f,%d,%d\n", (double)wx, (double)wy, ww, wh);
     liu_script_say("fb=%d,%d\n", a->fb_width, a->fb_height);
+    liu_script_say("key_seen=%u %s\n", g_script_keys_seen,
+                   g_script_keys_seen ? keybind_format(&g_script_key_last) : "-");
     SAYF("dpi", a->dpi_scale);
     SAYI("focused", a->window_focused);
+    /* What the keyboard belongs to: a surface that takes the app's own
+     * modifier (the editor, a rendered note, the explorer) or a terminal pane,
+     * where the binding table speaks. A driver picks a chord by it. */
+    {
+        const Tab *kt = app_active_tab(a);
+        const char *kbd = "terminal";
+        if (app_editing_fb(a)) kbd = "editor";
+        else if (app_keyboard_md_fb(a)) kbd = "note";
+        else if ((kt && kt->kind == TAB_FILEBROWSER) || (a->sidebar_focused && a->filebrowser.open)) kbd = "explorer";
+        else if (kt && kt->kind == TAB_SFTP) kbd = "sftp";
+        liu_script_kv("kbd", kbd);
+    }
 
     SAYI("tabs", a->tab_count);
     SAYI("active_tab", a->active_tab);
@@ -16265,6 +16460,7 @@ static void liu_script_state(AppState *a, PlatformWindow *pw) {
         SAYI("mouse_tracking", (term->mode & MODE_MOUSE_TRACKING) != 0);
         SAYI("selection", selection_active(term));
         SAYI("scroll_offset", term->scroll_offset);
+        SAYF("scrollbar_alpha", a->scrollbar_alpha_drawn);
         SAYI("scrollback", term->sb_count);
         liu_script_kv("term_title", term->title);
         liu_script_kv("cwd", app_terminal_cwd(term, app_focused_session(a)));
@@ -16272,6 +16468,7 @@ static void liu_script_state(AppState *a, PlatformWindow *pw) {
     {
         Session *fs = app_focused_session(a);
         if (fs) liu_script_say("session=%d,%d\n", (int)session_type(fs), (int)session_status(fs));
+        if (fs) liu_script_kv("session_error", session_error(fs));
     }
     for (i32 i = 0; i < a->site_mgr.count; i++) {
         Site *site = sites_get(&a->site_mgr, i);
@@ -16359,6 +16556,7 @@ static void liu_script_state(AppState *a, PlatformWindow *pw) {
             if (bt->native && browser_native_screen_probe(bt->native, &sp)) {
                 SAYF("browser_native_radius", sp.radius);
                 SAYI("browser_native_corners", sp.corners);
+                SAYI("browser_native_holes", sp.holes);
                 /* AppKit's page rect, back to frame pixels from the top. */
                 if (sp.have_page) {
                     f32 top_pt = (f32)a->fb_height / bd - (sp.page_y + sp.page_h);
@@ -16395,6 +16593,7 @@ static void liu_script_state(AppState *a, PlatformWindow *pw) {
         SAYI("fb_view_scroll_px", (i32)fb->view_scroll_px);   /* the rendered Markdown view, in pixels */
         SAYI("fb_cursor_line", fb->cursor_line);
         SAYI("fb_cursor_col", fb->cursor_col);
+        SAYI("fb_vcol", fb_editor_cursor_vcol(fb));        /* where the caret is on screen, in columns */
         SAYI("fb_md_sel", fb_md_selection_active(fb));
         {   /* the rendered note's selection, as far as the screen goes ("|" for a break) */
             char *mt = fb_md_selection_text_visible(fb);
@@ -16423,6 +16622,26 @@ static void liu_script_state(AppState *a, PlatformWindow *pw) {
         SAYI("fb_find", fb->find_active);
         liu_script_kv("fb_cwd", fb->cwd);
         liu_script_kv("fb_file", fb->view_path);
+        /* A Code Editor tab's rail: who has the keyboard, where its rows are
+         * (the origin of the first row, the header and row heights, the
+         * scroll) and what they are called. */
+        if (tab->kind == TAB_FILEBROWSER && tab->fb) {
+            SAYI("fb_rail_keys", fb->kbd_away);
+            f32 dpi = a->dpi_scale;
+            f32 ox = (a->sidebar_visible ? a->sidebar_width : 0.0f) + a->padding;
+            f32 oy = a->tab_bar_height + a->config.style.terminal_top_gap * dpi;
+            liu_script_say("fb_rail=%.2f,%.2f,%.2f,%.2f,%.2f\n", (double)ox, (double)oy,
+                           (double)fb_list_hdr_h(dpi), (double)fb_list_row_h(dpi),
+                           (double)fb->scroll_offset_px);
+            /* fb_entry.N is the rail's row N (".." is no row). */
+            i32 first = fb_list_first(fb);
+            for (i32 i = first; i < fb->entry_count && i - first < 64; i++) {
+                char k[24];
+                snprintf(k, sizeof k, "fb_entry.%d", i - first);
+                liu_script_kv(k, fb->entries[i].name);
+            }
+            liu_script_say("fb_selected=%d,%d\n", fb->selected, fb->selection_count);
+        }
     }
     /* The SFTP tab: each pane's folder and rows (the view, in its order) and
      * the rectangles its last paint laid out — rows have no fixed place a
@@ -16576,6 +16795,21 @@ static void liu_script_state(AppState *a, PlatformWindow *pw) {
     SAYI("settings_tab", a->settings.active_tab);
     SAYI("cfg.resume_agents", a->config.resume_agents);
     SAYI("cfg.restore_screen", a->config.restore_screen);
+    /* The text fields the last frame of Settings drew, kind then x,y,w,h in pixels. */
+    SAYI("settings_fields", a->settings.field_probe_n);
+    liu_script_kv("settings_vault_status", a->settings.vault_status);
+    /* Appearance's - / + boxes, top to bottom, in pixels. */
+    SAYI("settings_steppers", a->settings.stepper_probe_n);
+    for (i32 i = 0; i < a->settings.stepper_probe_n && i < 6; i++)
+        liu_script_say("settings_stepper.%d=%.0f,%.0f,%.0f,%.0f\n", i,
+                       a->settings.stepper_probe[i].x, a->settings.stepper_probe[i].y,
+                       a->settings.stepper_probe[i].w, a->settings.stepper_probe[i].h);
+    for (i32 i = 0; i < a->settings.field_probe_n && i < 8; i++) {
+        liu_script_say("settings_field.%d=%s,%.0f,%.0f,%.0f,%.0f\n", i,
+                       settings_field_policy((SettingsFieldKind)a->settings.field_probe[i].kind)->name,
+                       a->settings.field_probe[i].x, a->settings.field_probe[i].y,
+                       a->settings.field_probe[i].w, a->settings.field_probe[i].h);
+    }
     {   /* Settings > Translate's Model menu: what it lists, which row is the
          * active one and which the configured model's, and where the last
          * frame put the chip, the card and the window's first row (pixels) —
@@ -16653,6 +16887,8 @@ static void liu_script_state(AppState *a, PlatformWindow *pw) {
         SAYI("side_tabs_glide", a->side_tabs_glide && platform_time_sec() - a->side_tabs_glide_t0 < SIDEBAR_GLIDE_S);
     }
     SAYI("search", a->search_active);
+    SAYI("search_case", a->search_case);
+    SAYI("search_regex", a->search_regex);
     liu_script_kv("search_query", a->search_query);
     SAYI("bench", a->bench_enabled);
     SAYI("sketch", a->sketch.open);
@@ -16723,6 +16959,10 @@ static void liu_script_state(AppState *a, PlatformWindow *pw) {
     SAYF("hostkey_age", a->hostkey_dialog_active ? platform_time_sec() - a->hostkey_shown_at : 0.0);
     SAYI("passphrase_dialog", a->passphrase_dialog_active);
     SAYI("kbi_dialog", a->kbi_dialog_active);
+    SAYI("kbi_liu", a->kbi_dialog_active && a->kbi_liu);
+    liu_script_kv("kbi_peer", a->kbi_dialog_active ? a->kbi_peer : "");
+    liu_script_kv("kbi_note", a->kbi_dialog_active ? a->kbi_instruction : "");
+    SAYF("kbi_age", a->kbi_dialog_active ? platform_time_sec() - a->kbi_shown_at : 0.0);
     SAYI("close_confirm", a->close_confirm_active);
     SAYI("paste_confirm", a->paste_confirm_active);
     SAYI("agent_prompt", a->agentctl_prompt_active);
@@ -16792,6 +17032,20 @@ static void liu_script_state(AppState *a, PlatformWindow *pw) {
         }
         SAYI("agent_frame_due", a->agentctl_next_edge > 0.0);
         SAYF("agent_frame_in", a->agentctl_next_edge > 0.0 ? a->agentctl_next_edge - platform_time_sec() : 0.0);
+    }
+    /* Frames this window has painted, and the fades it handed to the
+     * compositor (renderer_fade_note): the steps a working haze owes no
+     * frame for. */
+    {
+        char fv[64];
+        snprintf(fv, sizeof fv, "%llu", (unsigned long long)a->frame_seq);
+        liu_script_kv("frame_seq", fv);
+#ifdef USE_METAL
+        u64 fs = 0, fk = 0;
+        renderer_fade_counts((Renderer *)&a->renderer, &fs, &fk);
+        snprintf(fv, sizeof fv, "%llu,%llu", (unsigned long long)fs, (unsigned long long)fk);
+        liu_script_kv("haze_fades", fv);
+#endif
     }
     SAYI("agent_panel", a->agentctl_panel_open);
     SAYI("agent_compose", a->agentctl_compose_agent);
@@ -16897,6 +17151,12 @@ static void liu_script_state(AppState *a, PlatformWindow *pw) {
     SAYI("group_menu", a->group_ctx_menu_active);
     SAYI("fb_menu", a->fb_ctx_menu_active);
     liu_script_kv("fb_status", a->fb_status);     /* the explorer's status line: what was done, refused or failed */
+    {   /* ...and the card it was last drawn as: lines|columns|x,y,w,h in pixels of a dump, "0|" before it is */
+        char card[96];
+        snprintf(card, sizeof card, "%d|%d|%.0f,%.0f,%.0f,%.0f", (int)a->fb_status_lines, (int)a->fb_status_cols, (double)a->fb_status_x,
+                 (double)a->fb_status_y, (double)a->fb_status_w, (double)a->fb_status_h);
+        liu_script_kv("fb_status_card", a->fb_status_lines > 0 ? card : "0|");
+    }
     SAYI("fb_prompt", a->fb_prompt_active);
     SAYI("agent_picker", a->agent_picker_active);
     if (a->agent_picker_active && a->agent_picker_rows) {
@@ -16917,6 +17177,33 @@ static void liu_script_state(AppState *a, PlatformWindow *pw) {
     SAYI("sidebar_customize", a->sbc_open);
     SAYI("img_badges", a->img_badge_count);
     SAYI("prompt_badges", a->prompt_badge_count);
+    SAYI("diagram_cards", a->adg_cards);
+    {   /* each card's click rect, and its controls: kind,x,y,w,h,scale */
+        char key[32], v[112];
+        i32 nc = 0;
+        for (i32 i = 0; i < a->adg_hit_count; i++) {
+            const AgentDiagramHit *h = &a->adg_hit[i];
+            snprintf(key, sizeof key, "diagram_hit.%d", i);
+            snprintf(v, sizeof v, "%s,%.0f,%.0f,%.0f,%.0f,%.3f",
+                     h->kind == ADG_HIT_CARD ? "card" : h->kind == ADG_HIT_EXPAND ? "expand"
+                     : h->kind == ADG_HIT_SOURCE ? "source" : "diagram",
+                     (double)h->x, (double)h->y, (double)h->w, (double)h->h, (double)h->scale);
+            liu_script_kv(key, v);
+            nc++;
+        }
+        SAYI("diagram_hits", nc);
+    }
+    SAYI("diagram_viewer", a->dgv.open);
+    if (a->dgv.open && a->dgv.vis) {
+        f32 vx, vy, vw, vh;
+        diagram_viewer_panel_rect(a, &vx, &vy, &vw, &vh);
+        char title[64], vv[128];
+        agv_title(a->dgv.vis, title, sizeof title);
+        snprintf(vv, sizeof vv, "%s,%.0f,%.0f,%.0f,%.0f,%.3f", title,
+                 (double)vx, (double)vy, (double)vw, (double)vh, (double)a->dgv.zoom);
+        liu_script_kv("diagram_viewer_panel", vv);
+        liu_script_kv("diagram_viewer_hint", diagram_viewer_hint());
+    }
     SAYI("lightbox", a->lightbox.open);
     if (a->lightbox.open) {                              /* the caption's plate: x,y,w,h in pixels */
         f32 lx, ly, lw, lh;
@@ -17093,6 +17380,11 @@ static void liu_script_screen(AppState *a, const char *arg) {
  * pressed (the window is never key, so no other reaches it). */
 static bool liu_script_drop_real(const PlatformEvent *ev) {
     if (s_find_demo_own_event) { s_find_demo_own_event = false; return false; }
+    /* A drive that moves the pointer itself (a pointer tool on X11, in a container)
+     * and reads the app back through the script keeps its mouse. */
+    static i32 real_mouse = -1;
+    if (real_mouse < 0) real_mouse = liu_dev_env("LIU_E2E_REAL_MOUSE") != NULL;
+    if (real_mouse) return false;
     return ev->type == EVENT_MOUSE_DOWN || ev->type == EVENT_MOUSE_UP ||
            ev->type == EVENT_MOUSE_MOVE || ev->type == EVENT_SCROLL;
 }
@@ -17212,9 +17504,28 @@ static bool liu_script_next(AppState *a, PlatformEvent *ev, PlatformWindow *pw, 
     if (!strcmp(line, "key")) {
         i32 key; u32 mods;
         if (!liu_script_chord(arg, &key, &mods)) { liu_script_say("err %d unknown chord\n", line_no); return false; }
+#ifndef PLATFORM_MACOS
+        /* As X11's KeyPress does it: the key event, and for Ctrl+A..Z without
+         * Shift its control byte as well, both stamped with the same time so
+         * the loop can tell the text from a key that already acted. The queue
+         * hands them over and answers the line. */
+        if ((mods & MOD_CTRL) && !(mods & (MOD_SHIFT | MOD_SUPER)) && key >= KEY_A && key <= KEY_Z) {
+            f64 t = platform_time_sec();
+            PlatformEvent k, c;
+            memset(&k, 0, sizeof k);
+            k.type = EVENT_KEY_DOWN; k.timestamp = t; k.key.key = key; k.key.mods = mods;
+            memset(&c, 0, sizeof c);
+            c.type = EVENT_CHAR_INPUT; c.timestamp = t;
+            c.char_input.codepoint = (u32)(key - KEY_A + 1); c.char_input.mods = mods;
+            liu_script_push(&k);
+            liu_script_push(&c);
+            return false;
+        }
+#endif
         liu_script_say("ok %d\n", line_no);
-        /* As the platform's keyDown does it: Ctrl+A..Z is text with the
-         * modifier on it (EVENT_CHAR_INPUT), never a key event. */
+#ifdef PLATFORM_MACOS
+        /* As macOS's keyDown does it: Ctrl+A..Z is text with the modifier on
+         * it (EVENT_CHAR_INPUT), never a key event. */
         if ((mods & MOD_CTRL) && !(mods & MOD_SUPER) && key >= KEY_A && key <= KEY_Z) {
             s_find_demo_own_event = true;
             memset(ev, 0, sizeof *ev);
@@ -17223,6 +17534,7 @@ static bool liu_script_next(AppState *a, PlatformEvent *ev, PlatformWindow *pw, 
             ev->char_input.mods = mods;
             return true;
         }
+#endif
         return liu_find_demo_key(ev, pw, key, mods);
     }
     if (!strcmp(line, "type")) {
@@ -17247,8 +17559,10 @@ static bool liu_script_next(AppState *a, PlatformEvent *ev, PlatformWindow *pw, 
         /* `press x y cmd`: the button goes down with Cmd held, which is how a
          * pane is picked up. `shift`: Shift is held — the bypass that makes a
          * pane whose program grabbed the mouse select text itself. A `move`
-         * and a `release` carry it too, as a hand holding the key would. */
-        u32 mods = strcmp(what, "cmd") == 0 ? MOD_SUPER : strcmp(what, "shift") == 0 ? MOD_SHIFT : 0;
+         * and a `release` carry it too, as a hand holding the key would. `ctrl`
+         * is the application's own modifier on X11. */
+        u32 mods = strcmp(what, "cmd") == 0 ? MOD_SUPER : strcmp(what, "shift") == 0 ? MOD_SHIFT :
+                   strcmp(what, "ctrl") == 0 ? MOD_CTRL : 0;
         if (line[0] != 'r')
             liu_script_push_mouse_mods(EVENT_MOUSE_MOVE, 0, x, y, line[0] == 'm' ? mods : 0);
         if (line[0] == 'c' || line[0] == 'p') liu_script_push_mouse_mods(EVENT_MOUSE_DOWN, button, x, y, mods);
@@ -17277,8 +17591,10 @@ static bool liu_script_next(AppState *a, PlatformEvent *ev, PlatformWindow *pw, 
         return true;
     }
     if (!strcmp(line, "clipboard")) {
-#ifdef PLATFORM_MACOS
-        /* platform_macos routes a driven process to its private NSPasteboard. */
+#if defined(PLATFORM_MACOS) || defined(PLATFORM_LINUX)
+        /* platform_macos routes a driven process to its private NSPasteboard;
+         * on X11 it is the display's own CLIPBOARD, and a driven run is given
+         * a display of its own. */
         if (*arg) {
             u8 bytes[4096];
             usize len = liu_script_unescape(arg, bytes, sizeof bytes - 1);
@@ -17290,7 +17606,7 @@ static bool liu_script_next(AppState *a, PlatformEvent *ev, PlatformWindow *pw, 
             liu_script_kv("clipboard", platform_clipboard_get());
         }
 #else
-        liu_script_say("err %d private clipboard requires macOS\n", line_no);
+        liu_script_say("err %d no clipboard on this platform\n", line_no);
 #endif
         return false;
     }
@@ -17336,6 +17652,22 @@ static bool liu_script_next(AppState *a, PlatformEvent *ev, PlatformWindow *pw, 
         ev->drop.y = y;
         liu_script_say("ok %d\n", line_no);
         return true;
+    }
+    if (!strcmp(line, "fbtrash")) {
+        /* `fbtrash <folder>`: the explorer's deletes move into that folder
+         * instead of the Trash — a scripted run must not leave its fixtures in
+         * the user's. `fbtrash none`: a place with no Trash, so a delete asks
+         * first in the prompt. */
+        if (!arg[0]) { liu_script_say("err %d wants a folder or none\n", line_no); return false; }
+        if (!strcmp(arg, "none")) {
+            a->fb_no_trash = true;
+        } else {
+            snprintf(s_fb_fake_trash, sizeof s_fb_fake_trash, "%s", arg);
+            mkdir(s_fb_fake_trash, 0700);
+            a->fb_no_trash = false;
+        }
+        liu_script_say("ok %d\n", line_no);
+        return false;
     }
     if (!strcmp(line, "fbnav")) {
         /* `fbnav <folder>`: the explorer is taken to a folder, as a click on
@@ -17417,6 +17749,21 @@ static bool liu_script_next(AppState *a, PlatformEvent *ev, PlatformWindow *pw, 
             if (k == NOTIFY_KIND_COUNT) { liu_script_say("err %d no such kind\n", line_no); return false; }
             app_show_toast_kind(a, k, text);
         }
+        liu_script_say("ok %d\n", line_no);
+        return liu_script_paint(ev, pw);
+    }
+    if (!strcmp(line, "fbstatus")) {
+        /* `fbstatus <info|ok|error> <text>`: the explorer's status card, as
+         * app_fb_status raises it (the card is drawn while the sidebar is). */
+        char *sp = strchr(arg, ' ');
+        if (!sp || !sp[1]) { liu_script_say("err %d wants a kind and a text\n", line_no); return false; }
+        *sp = '\0';
+        FbStatusKind k = !strcmp(arg, "ok") ? FB_STATUS_OK : !strcmp(arg, "error") ? FB_STATUS_ERROR : FB_STATUS_INFO;
+        if (strcmp(arg, "ok") && strcmp(arg, "error") && strcmp(arg, "info")) {
+            liu_script_say("err %d no such kind\n", line_no);
+            return false;
+        }
+        app_fb_status(a, k, "%s", sp + 1);
         liu_script_say("ok %d\n", line_no);
         return liu_script_paint(ev, pw);
     }
@@ -18843,6 +19190,10 @@ static bool liu_ctxmenu_demo_next(AppState *a, PlatformEvent *ev, PlatformWindow
     static bool up_owed = false;
     static i32 up_button = 0;
     static f32 up_x = 0, up_y = 0;
+    /* The pane Restart Shell was clicked on, as it was before the click. */
+    static u64 restart_id = 0;
+    static const void *restart_term = NULL;
+    static i32 restart_pane = -1;
     if (up_owed) {
         up_owed = false;
         return liu_fbmenu_demo_mouse(ev, pw, EVENT_MOUSE_UP, up_button, up_x, up_y);
@@ -19020,12 +19371,15 @@ static bool liu_ctxmenu_demo_next(AppState *a, PlatformEvent *ev, PlatformWindow
     case 19: {
         i32 n = app_term_menu_layout(a, &ml);
         i32 sr = liu_ctxmenu_demo_term_row(&ml, TERM_MENU_SPLIT_RIGHT);
-        snprintf(d, sizeof d, "active=%d rows=%d, Rename Tab first=%d with a hairline under it=%d, %.0fpt wide",
+        snprintf(d, sizeof d, "active=%d rows=%d, Rename Tab first=%d with a hairline under it=%d, "
+                 "Restart Shell last=%d under a hairline=%d, %.0fpt wide",
                  (int)a->term_ctx_menu_active, (int)n, (int)(n > 0 && ml.acts[0] == TERM_MENU_RENAME_TAB),
-                 (int)(n > 0 && ml.sep_after[0]), ml.w / a->dpi_scale);
-        liu_fbmenu_demo_report("a pane's menu: Rename Tab, a hairline, the four splits",
-                               a->term_ctx_menu_active && n == 5 && ml.acts[0] == TERM_MENU_RENAME_TAB &&
-                               ml.sep_after[0] && sr == 1, d, &fails);
+                 (int)(n > 0 && ml.sep_after[0]), (int)(n > 1 && ml.acts[n - 1] == TERM_MENU_RESTART_SHELL),
+                 (int)(n > 1 && ml.sep_after[n - 2]), ml.w / a->dpi_scale);
+        liu_fbmenu_demo_report("a pane's menu: Rename Tab, a hairline, the four splits, a hairline, Restart Shell",
+                               a->term_ctx_menu_active && n == 6 && ml.acts[0] == TERM_MENU_RENAME_TAB &&
+                               ml.sep_after[0] && sr == 1 && ml.acts[5] == TERM_MENU_RESTART_SHELL &&
+                               ml.sep_after[4], d, &fails);
         px = ml.x + ml.w - 5.0f * a->dpi_scale; py = ml.row_y[sr] + ml.row_h * 0.5f;
         CM_NEXT(20, 0.15);
         CM_MOVE(px, py);
@@ -19090,9 +19444,19 @@ static bool liu_ctxmenu_demo_next(AppState *a, PlatformEvent *ev, PlatformWindow
         i32 n = app_term_menu_layout(a, &ml);
         snprintf(d, sizeof d, "highlighted %d of %d rows, which is action %d", (int)a->term_ctx_menu_selected,
                  (int)n, n > 0 ? (int)ml.acts[n - 1] : -1);
-        liu_fbmenu_demo_report("Up from nothing lands on the last row",
+        liu_fbmenu_demo_report("Up from nothing lands on the last row, Restart Shell",
                                n > 0 && a->term_ctx_menu_selected == n - 1 &&
-                               ml.acts[n - 1] == TERM_MENU_SPLIT_UP, d, &fails);
+                               ml.acts[n - 1] == TERM_MENU_RESTART_SHELL, d, &fails);
+        CM_NEXT(43, 0.12);
+        return liu_fbmenu_demo_key(ev, pw, KEY_UP);
+    }
+    case 43: {
+        i32 n = app_term_menu_layout(a, &ml);
+        i32 sel = a->term_ctx_menu_selected;
+        snprintf(d, sizeof d, "highlighted %d of %d rows, which is action %d", (int)sel, (int)n,
+                 (sel >= 0 && sel < n) ? (int)ml.acts[sel] : -1);
+        liu_fbmenu_demo_report("Up again crosses the hairline to Split Up",
+                               sel >= 0 && sel < n && ml.acts[sel] == TERM_MENU_SPLIT_UP, d, &fails);
         CM_NEXT(30, 0.5);
         return liu_fbmenu_demo_key(ev, pw, KEY_ENTER);
     }
@@ -19102,6 +19466,52 @@ static bool liu_ctxmenu_demo_next(AppState *a, PlatformEvent *ev, PlatformWindow
                  t ? (int)t->split_pane_count : -1);
         liu_fbmenu_demo_report("Enter does what a click on that row does: Split Up",
                                !a->term_ctx_menu_active && t && t->split_pane_count == 3, d, &fails);
+        /* ---- Restart Shell, clicked on the pane just made ---- */
+        f32 rx = 0, ry = 0, rw = 0, rh = 0;
+        if (!t || !app_tab_pane_rect(a, t, t->active_pane, &rx, &ry, &rw, &rh)) {
+            liu_fbmenu_demo_report("the new pane can be found", false, "", &fails);
+            CM_NEXT(46, 0.1);
+            return false;
+        }
+        px = rx + rw * 0.5f; py = ry + rh * 0.5f;
+        CM_NEXT(44, 0.25);
+        CM_PRESS(1, px, py);
+    }
+    case 44: {
+        Tab *t = app_active_tab(a);
+        i32 n = app_term_menu_layout(a, &ml);
+        i32 ri = liu_ctxmenu_demo_term_row(&ml, TERM_MENU_RESTART_SHELL);
+        restart_pane = a->term_ctx_menu_pane;
+        Session *os = t ? app_pane_session(t, restart_pane) : NULL;
+        restart_id = os ? session_instance_id(os) : 0;
+        restart_term = t ? (const void *)app_pane_terminal(t, restart_pane) : NULL;
+        snprintf(d, sizeof d, "menu open=%d over pane %d (active %d), %d rows, Restart Shell is row %d",
+                 (int)a->term_ctx_menu_active, (int)restart_pane, t ? (int)t->active_pane : -1,
+                 (int)n, (int)ri);
+        liu_fbmenu_demo_report("a right-click on a pane offers Restart Shell",
+                               a->term_ctx_menu_active && ri >= 0 && restart_id != 0, d, &fails);
+        if (ri < 0 || restart_id == 0) { CM_NEXT(46, 0.1); return false; }
+        CM_NEXT(45, 0.8);
+        CM_PRESS(0, ml.x + ml.w * 0.5f, ml.row_y[ri] + ml.row_h * 0.5f);
+    }
+    case 45: {
+        Tab *t = app_active_tab(a);
+        Session *ns = t ? app_pane_session(t, restart_pane) : NULL;
+        const void *nt = t ? (const void *)app_pane_terminal(t, restart_pane) : NULL;
+        u64 nid = ns ? session_instance_id(ns) : 0;
+        snprintf(d, sizeof d, "menu open=%d, %d pane(s), pane %d: session %llu -> %llu, a new screen=%d, "
+                 "shell up=%d",
+                 (int)a->term_ctx_menu_active, t ? (int)t->split_pane_count : -1, (int)restart_pane,
+                 (unsigned long long)restart_id, (unsigned long long)nid,
+                 (int)(nt && nt != restart_term), (int)(ns && session_status(ns) == SESSION_CONNECTED));
+        liu_fbmenu_demo_report("a click on Restart Shell gives that pane a new shell, in its place",
+                               !a->term_ctx_menu_active && t && t->split_pane_count == 3 && nid != 0 &&
+                               nid != restart_id && nt && nt != restart_term &&
+                               session_status(ns) == SESSION_CONNECTED, d, &fails);
+        CM_NEXT(46, 0.1);
+        return liu_fbmenu_demo_paint(ev, pw, ".restart");
+    }
+    case 46: {
         if (!liu_ctxmenu_demo_strip_point(a, HIT_TAB, 0, &px, &py)) {
             liu_fbmenu_demo_report("the tab can be found on the strip", false, "", &fails);
             CM_NEXT(90, 0.1);
@@ -20672,10 +21082,42 @@ static bool liu_intro_tour_drop_real(const PlatformEvent *ev) {
  * bar, not an animation. */
 #define LIU_TRANSFER_CARD_DT 0.25
 
+/* The connect form, a server's prompt and the forward dialog change on the
+ * clock only at their caret's edges (ui_caret_alpha) and, on the form, when
+ * its error line runs out; the palette, between the arrival of its rows, only
+ * at its own caret's edges (pal_caret_on: half periods counted from the last
+ * key). They owe a frame at those moments, not at the panel's rate. Seconds
+ * to the next one, or -1 while none of them is open. */
+static f64 liu_field_caret_wake_in(const AppState *a, f64 now) {
+    if (!a) return -1.0;
+    f64 in = -1.0;
+    if (a->ssh_dialog_active || a->kbi_dialog_active || a->port_forward_dialog_active) {
+        in = UI_CARET_HALF_SEC - fmod(now, UI_CARET_HALF_SEC);
+        if (a->ssh_dialog_active && a->ssh_dialog_error[0] && a->ssh_dialog_error_until > now &&
+            a->ssh_dialog_error_until - now < in)
+            in = a->ssh_dialog_error_until - now;
+    }
+    if (a->palette_active) {
+        f64 since = now - a->pal_key_time;
+        if (since < 0.0) since = 0.0;
+        f64 pal = PAL_CARET_HALF_SEC - fmod(since, PAL_CARET_HALF_SEC);
+        if (in < 0.0 || pal < in) in = pal;
+    }
+    if (in < 0.0) return -1.0;
+    return in < 0.001 ? 0.001 : in;
+}
+
+/* The palette's rows arriving one after the other (pal_row_enter) are drawn
+ * from the clock with no Anim behind them: frames while they come in. Its
+ * open, close, pick and highlight glide are Anims and ask for their own. */
+static bool liu_palette_rows_entering(const AppState *a, f64 now) {
+    return a && a->palette_active && a->pal_enter_time > 0.0 &&
+           now - a->pal_enter_time < (f64)pal_enter_sec(a->pal_lay.rows);
+}
+
 static bool liu_continuous_visual(const AppState *a, f64 now) {
     if (!a) return false;
-    return a->palette_active || a->ssh_dialog_active ||
-           a->kbi_dialog_active || a->port_forward_dialog_active ||
+    return liu_palette_rows_entering(a, now) ||
            a->sites.active || a->cursor_animating ||
            app_voice_hud_animating() ||
            /* The lightbox's scrim covers the pane, so BOTH its curves have to
@@ -20685,11 +21127,14 @@ static bool liu_continuous_visual(const AppState *a, f64 now) {
             * this list is holding the loop awake for it. */
            (a->lightbox.open && !anim_done(&a->lightbox.open_anim)) ||
            !anim_done(&a->lightbox.close_anim) ||
+           diagram_viewer_animating(&a->dgv) ||
            (a->sketch.open && !anim_done(&a->sketch.open_anim)) ||
            !anim_done(&a->sketch.close_anim) ||
            /* Bounded by the windows their own draw code enforces (ui.c), so a
-            * window that stops painting cannot leave either latched on. */
-           app_toast_active(a, now) ||
+            * window that stops painting cannot leave either latched on. A
+            * notice that is only held up is a still picture: the wait ladder
+            * wakes for its leave (app_toast_wake_in). */
+           app_toast_moving(a, now) ||
            (a->bell_flash_time  > 0 && now - a->bell_flash_time  < 0.05) ||
            /* A markdown code block's "Copied" confirmation fades on the clock,
             * so it needs all three gates like every other timed visual. */
@@ -20951,6 +21396,14 @@ static void liu_term_menu_act(AppState *a, TermMenuAction act) {
                          ? SPLIT_H : SPLIT_V;
         bool sbefore = (act == TERM_MENU_SPLIT_LEFT || act == TERM_MENU_SPLIT_UP);
         app_split_tab_dir(a, sdir, sbefore);
+        break;
+    }
+    case TERM_MENU_RESTART_SHELL: {
+        /* The pane the menu was opened over, focused or not. */
+        Tab *rtab = app_active_tab(a);
+        i32 rp = a->term_ctx_menu_pane >= 0 ? a->term_ctx_menu_pane
+                                            : (rtab ? rtab->active_pane : -1);
+        if (rtab) liu_restart_pane(a, a->active_tab, rp);
         break;
     }
     }
@@ -22284,11 +22737,15 @@ int main(int argc, char **argv) {
              * (keystroke, click, scroll) still bypasses the grid entirely. */
             bool pointer_active = mouse_down_now ||
                                   (frame_now - pointer_motion_at) < POINTER_PACE_HOLD;
+            /* Not a soft animation (the working bar): it is drawn on its own
+             * cadence, FRAME_DT_SOFT_ANIM — about 30 frames a second, the
+             * panel's rate is not asked for it. */
+            curw->ls_link_clock = vsync_off_now || gif_active || agent_running ||
+                                  graph_animating || ui_anim_active ||
+                                  continuous_ui ||
+                                  pointer_active || app_soak_active();
             pace_presents = liu_pace_enabled() &&
-                            (vsync_off_now || gif_active || agent_running ||
-                             graph_animating || ui_anim_active ||
-                             ui_soft_anim_active || continuous_ui ||
-                             pointer_active || app_soak_active() ||
+                            (curw->ls_link_clock || ui_soft_anim_active ||
                              had_visible_session_data_last_frame);
             if (!pace_presents) next_present_t = 0.0;
             else if (next_present_t == 0.0) next_present_t = frame_now;
@@ -22373,9 +22830,17 @@ int main(int argc, char **argv) {
         } else if (anim_global_active()) {
             if (timeout > FRAME_DT_BURST) timeout = FRAME_DT_BURST;
         } else if (anim_soft_active()) {
-            /* Only a low-rate visual (agent accent) is running — wake at ~30 Hz
-             * instead of pinning the panel rate for a streaming agent. */
-            if (timeout > FRAME_DT_SOFT_ANIM) timeout = FRAME_DT_SOFT_ANIM;
+            /* Only a low-rate visual (agent accent) is running — wake when its
+             * next frame is owed, ~30 Hz, instead of pinning the panel rate for
+             * a streaming agent. */
+            f64 soft_wait = FRAME_DT_SOFT_ANIM;
+            for (i32 wi = 0; wi < g_liu_win_count && !liu_soft_anim_every_turn(); wi++) {
+                if (!g_liu_wins[wi].st || !anim_soft_active_for(g_liu_wins[wi].st)) continue;
+                f64 w = liu_soft_anim_wait(&g_liu_wins[wi], frame_now);
+                if (w < soft_wait) soft_wait = w;
+            }
+            if (soft_wait < 0.001) soft_wait = 0.001;
+            if (timeout > soft_wait) timeout = soft_wait;
         } else if (liu_continuous_visual(&app, frame_now)) {
             if (timeout > (interaction_boost ? FRAME_DT_ACTIVE : FRAME_DT_INTERACTIVE)) {
                 timeout = interaction_boost ? FRAME_DT_ACTIVE : FRAME_DT_INTERACTIVE;
@@ -22403,6 +22868,28 @@ int main(int argc, char **argv) {
         {
             f64 leave_in = app_fb_status_wake_in(&app, frame_now);
             if (leave_in > 0.0 && timeout > leave_in) timeout = leave_in;
+        }
+        /* The same for a floating notice held up on screen, in every window
+         * (a background window's notices expire too), and for an open
+         * field dialog's next caret edge. */
+        for (i32 wi = 0; wi < g_liu_win_count; wi++) {
+            /* A notice that finished leaving between two frames: the last one
+             * drew it still fading. It goes now, and a shown window paints
+             * once more without it. */
+            if (app_toast_retire_finished(g_liu_wins[wi].st, frame_now) && g_liu_wins[wi].visible) {
+                g_liu_wins[wi].needs_redraw = true;
+                timeout = 0.0;
+            }
+            f64 leave_in = app_toast_wake_in(g_liu_wins[wi].st, frame_now);
+            if (leave_in > 0.0 && timeout > leave_in) timeout = leave_in;
+            f64 caret_in = liu_field_caret_wake_in(g_liu_wins[wi].st, frame_now);
+            if (caret_in > 0.0 && timeout > caret_in) timeout = caret_in;
+        }
+        /* A still picture that changes by itself later (a scrollbar's hold
+         * running out, a tab preview's dwell): one wake then (anim_wake_at). */
+        {
+            f64 still_in = anim_wake_in(frame_now);
+            if (still_in > 0.0 && timeout > still_in) timeout = still_in;
         }
 
         /* A working job tab's haze draws a new picture on some of its
@@ -22590,6 +23077,18 @@ int main(int argc, char **argv) {
             f64 guard_left = g_launch_guard_healthy_at - platform_time_sec();
             if (guard_left < 0.001) guard_left = 0.001;
             if (timeout > guard_left) timeout = guard_left;
+        }
+
+        /* Which windows' next vblank is worth a turn: one that owes a frame
+         * (a paced-out paint waits for exactly that tick) or one drawn from
+         * the clock. The rest let the tick pass — a streaming pane's next
+         * bytes wake the loop on their own, and a tick that came while this
+         * turn ran is still seen (vsync_ticks moved, the wait above is 0). */
+        for (i32 wi = 0; wi < g_liu_win_count; wi++) {
+            LiuWindow *lw = &g_liu_wins[wi];
+            if (!lw->pw) continue;
+            bool owed = lw->visible && (needs_redraw || lw->needs_redraw);
+            platform_window_set_link_wake(lw->pw, owed || lw->ls_link_clock || liu_link_wake_always());
         }
 
         /* ---- Wait for events or timeout ---- */
@@ -23064,6 +23563,10 @@ int main(int argc, char **argv) {
             if (liu_editfocus_demo_on() && liu_editfocus_demo_drop_real(&event)) continue;
             if (liu_fbmenu_demo_on() && liu_fbmenu_demo_drop_real(&event)) continue;
             if (liu_script_on() && liu_script_drop_real(&event)) continue;
+            if (LIU_DEV_HOOKS_ON && event.type == EVENT_KEY_DOWN && !event.key.repeat) {
+                g_script_keys_seen++;
+                g_script_key_last = (KeyBinding){ .key = (KeyCode)event.key.key, .mods = event.key.mods };
+            }
             had_event = true;
             /* Route to the window the event came from. `app` is a macro over
              * `cur` (see the banner above main), so re-pointing these two
@@ -23926,6 +24429,13 @@ int main(int argc, char **argv) {
                                     (!lg_watched && agentctl_msg_state(app.agentctl_panel_snap.state) != AGC_MSG_ENDED);
                 bool lg_asking = !lg_composing && app.agentctl_panel_snap.asking[0] != '\0';
                 u32 lg_cp = event.type == EVENT_CHAR_INPUT ? event.char_input.codepoint : 0;
+#ifndef PLATFORM_MACOS
+                /* X11 types Ctrl+A..Z as its control byte (^C is 3); the
+                 * terminal keys below read the letter, as macOS sends it. */
+                if (event.type == EVENT_CHAR_INPUT && (event.char_input.mods & MOD_CTRL) &&
+                    lg_cp >= 1 && lg_cp <= 26)
+                    lg_cp = 'a' + lg_cp - 1;
+#endif
                 u32 job = app.agentctl_panel_job;
                 if (app.agentctl_find_on) {
                     /* find: the keys belong to the query */
@@ -23939,7 +24449,8 @@ int main(int argc, char **argv) {
                     } else if (event.type == EVENT_KEY_DOWN) {
                         u32 fk = event.key.key;
                         TextEdit fe = app_edit(&app, app.agentctl_find, &app.agentctl_find_len, (i32)sizeof app.agentctl_find);
-                        if (fk == KEY_ESCAPE || (fk == KEY_F && (event.key.mods & MOD_SUPER))) {
+                        if (fk == KEY_ESCAPE ||
+                            (fk == KEY_F && ((event.key.mods & MOD_SUPER) || keybind_pane_cmd(event.key.mods)))) {
                             app.agentctl_find_on = false;
                             app.agentctl_find_row = -1;
                         } else if (fk == KEY_ENTER) {
@@ -24007,7 +24518,16 @@ int main(int argc, char **argv) {
                     AgentctlPanelGeom lg;
                     app_agentctl_panel_layout(&app, &lg);
                     u32 lk = event.key.key;
+#ifdef PLATFORM_MACOS
                     bool cmd = (event.key.mods & MOD_SUPER) != 0;
+#else
+                    /* X11: the chat is a small terminal (Ctrl+C stops, Ctrl+D
+                     * ends the job), so its own chords are a terminal's,
+                     * Ctrl+Shift, and Ctrl+Enter continues; Super is the
+                     * desktop's. */
+                    bool cmd = (event.key.mods & MOD_CTRL) &&
+                               ((event.key.mods & MOD_SHIFT) || lk == KEY_ENTER);
+#endif
                     TextEdit me = app_edit(&app, app.agentctl_msg, &app.agentctl_msg_len, (i32)sizeof app.agentctl_msg);
                     if (lk == KEY_ESCAPE) {
                         if (app.agentctl_sel_a >= 0) app.agentctl_sel_a = app.agentctl_sel_b = -1;
@@ -24224,14 +24744,19 @@ int main(int argc, char **argv) {
                 }
                 if (cc_do_close) {
                     app.close_confirm_active = false;
+                    if (app.close_confirm_restart) {
+                        /* The flag stays: the question fades out as it was
+                         * asked. The next arm clears it. */
+                        i32 rp = liu_confirm_pane_now(&app);
+                        if (rp >= 0) (void)app_restart_pane(&app, app.close_confirm_tab, rp);
+                        continue;
+                    }
                     if (app.close_confirm_group >= 0) {
                         app_close_tab_group(&app, app.close_confirm_group);
                     } else if (app.close_confirm_pane >= 0) {
                         /* Pane close never empties the tab strip. */
-                        if (app.close_confirm_tab >= 0 &&
-                            app.close_confirm_tab < app.tab_count)
-                            app_close_split_pane(&app, app.close_confirm_tab,
-                                                 app.close_confirm_pane);
+                        i32 cp = liu_confirm_pane_now(&app);
+                        if (cp >= 0) app_close_split_pane(&app, app.close_confirm_tab, cp);
                         continue;
                     } else if (app.close_confirm_tab >= 0 &&
                                app.close_confirm_tab < app.tab_count) {
@@ -24443,17 +24968,68 @@ int main(int argc, char **argv) {
                 case EVENT_MOUSE_UP:
                     consumed = lightbox_mouse_up(&app);
                     break;
-                case EVENT_MOUSE_MOVE:
+                case EVENT_MOUSE_MOVE: {
                     app.hover_x = (f32)event.mouse.x;
                     app.hover_y = (f32)event.mouse.y;
-                    consumed = lightbox_mouse_move(&app, app.hover_x, app.hover_y);
+                    /* Swallowed either way; only a drag's pan changes what is drawn. */
+                    bool panned = app.lightbox.dragging;
+                    (void)lightbox_mouse_move(&app, app.hover_x, app.hover_y);
+                    if (!panned) continue;
+                    consumed = true;
                     break;
+                }
                 case EVENT_SCROLL:
                     consumed = lightbox_scroll(&app, (f32)event.scroll.dy,
                                                event.scroll.precise);
                     break;
                 default:
                     break;      /* RESIZE / CLOSE / focus fall through */
+                }
+                if (consumed) { needs_redraw = true; continue; }
+            }
+
+            /* The diagram viewer is modal over its window exactly like the
+             * lightbox above, for the same reason. */
+            if (app.dgv.open) {
+                bool consumed = false;
+                switch (event.type) {
+                case EVENT_KEY_DOWN:
+                    consumed = diagram_viewer_key(&app, event.key.key, event.key.mods);
+                    break;
+                case EVENT_CHAR_INPUT:
+                    consumed = diagram_viewer_char(&app, event.char_input.codepoint);
+                    break;
+                case EVENT_MENU_FONT_BIGGER:
+                case EVENT_MENU_FONT_SMALLER:
+                case EVENT_MENU_FONT_RESET:
+                    diagram_viewer_zoom(&app, event.type == EVENT_MENU_FONT_BIGGER ? 1
+                                            : event.type == EVENT_MENU_FONT_SMALLER ? -1 : 0);
+                    consumed = true;
+                    break;
+                case EVENT_MOUSE_DOWN:
+                    consumed = diagram_viewer_mouse_down(&app, (f32)event.mouse.x,
+                                                         (f32)event.mouse.y);
+                    break;
+                case EVENT_MOUSE_UP:
+                    consumed = diagram_viewer_mouse_up(&app);
+                    break;
+                case EVENT_MOUSE_MOVE: {
+                    app.hover_x = (f32)event.mouse.x;
+                    app.hover_y = (f32)event.mouse.y;
+                    /* Swallowed either way; only a drag's pan changes what is drawn. */
+                    bool panned = app.dgv.dragging;
+                    (void)diagram_viewer_mouse_move(&app, app.hover_x, app.hover_y);
+                    if (!panned) continue;
+                    consumed = true;
+                    break;
+                }
+                case EVENT_SCROLL:
+                    consumed = diagram_viewer_scroll(&app, (f32)event.scroll.dx,
+                                                     (f32)event.scroll.dy,
+                                                     event.scroll.precise, event.scroll.mods);
+                    break;
+                default:
+                    break;
                 }
                 if (consumed) { needs_redraw = true; continue; }
             }
@@ -24798,6 +25374,7 @@ int main(int argc, char **argv) {
                          * handled in the key handler below). */
                         if (cp == 's' || cp == 'S') fb_editor_save(efb_char);
                     } else if (!(last_key_mods & MOD_CTRL)) {
+                        efb_char->kbd_away = false;      /* typing takes the keyboard from a Code Editor tab's rail */
                         fb_editor_insert_char(efb_char, cp);
                         app_ac_update(&app, efb_char);   /* refresh wiki/tag autocomplete */
                     }
@@ -24821,6 +25398,11 @@ int main(int argc, char **argv) {
                  * sent (the line discipline suspends on it; the SIGTSTP path
                  * below is macOS's). */
                 if ((char_mods & MOD_CTRL) && cp >= 1 && cp <= 25) cp += 'a' - 1;
+                /* Ctrl+Shift+Z is Cmd+Z here (keybind_pane_cmd): the shell's
+                 * undo at a prompt, and elsewhere no SUB byte, which would
+                 * suspend the program in the pane. Ctrl+Z is the suspend key. */
+                if (cp == 0x1A && (char_mods & (MOD_CTRL | MOD_SHIFT | MOD_ALT | MOD_SUPER)) == (MOD_CTRL | MOD_SHIFT))
+                    break;
 #endif
                 /* Large enough for the longest escape terminal_char_input emits
                  * (e.g. CSI "\x1b[27;15;1114111~"). */
@@ -25150,7 +25732,18 @@ int main(int argc, char **argv) {
                          (rt->browser_pane >= 0 &&
                           rt->active_pane == rt->browser_pane)) &&
                         !browser_any_metal_overlay(&app);
-                    if (browser_focused && (mods & MOD_SUPER)) {
+                    /* The app's own modifier: Cmd on macOS, Ctrl on X11, where
+                     * Super+L is the desktop's screen lock and browsers take
+                     * Ctrl+L / Ctrl+R (a browser pane has no shell to take
+                     * them from). There Ctrl+Shift+[ / ] are the binding
+                     * table's pane keys, so they pass. */
+#ifdef PLATFORM_MACOS
+                    const bool pane_key = false;
+#else
+                    const bool pane_key = (mods & MOD_SHIFT) &&
+                        (key == KEY_LEFT_BRACKET || key == KEY_RIGHT_BRACKET);
+#endif
+                    if (browser_focused && (mods & MOD_APP) && !pane_key) {
                         BrowserTab *rb = rt->browser;
                         bool used = true;
                         if (key == KEY_R) {
@@ -25183,7 +25776,16 @@ int main(int argc, char **argv) {
                         } else {
                             used = false;
                         }
-                        if (used) { needs_redraw = true; break; }
+                        if (used) {
+#ifndef PLATFORM_MACOS
+                            /* X11 sends Ctrl+L's text (^L) with the key's
+                             * timestamp: dropped like a shortcut's, or it lands
+                             * in the address field. */
+                            app.shortcut_char_time = event.timestamp;
+#endif
+                            needs_redraw = true;
+                            break;
+                        }
                     }
                 }
 
@@ -25312,7 +25914,10 @@ int main(int argc, char **argv) {
                                 % app.agent_picker_row_count;
                     } else if (key == KEY_ENTER) {
                         app_agent_picker_execute(&app, app.agent_picker_selected);
-                    } else if (key == KEY_R && (mods & MOD_SUPER)) {
+                    } else if (key == KEY_R && ((mods & MOD_SUPER) || keybind_pane_cmd(mods))) {
+#ifndef PLATFORM_MACOS
+                        app.shortcut_char_time = event.timestamp;   /* X11's ^R twin stays out of the pane */
+#endif
                         u8 tool = app.agent_picker_session_tool;
                         char sid[96];
                         char sp[512];
@@ -25526,10 +26131,15 @@ int main(int argc, char **argv) {
                     /* Cmd+Option+C: match case. Cmd+Option+R: regex. The
                      * bar's "Aa" / ".*" toggles, from the keyboard. Neither
                      * chord is bound elsewhere (no keybind default, no menu
-                     * key equivalent, and textedit_key declines Cmd+Option). */
-                    if ((mods & MOD_SUPER) && (mods & MOD_ALT) &&
-                        !(mods & (MOD_CTRL | MOD_SHIFT)) &&
+                     * key equivalent, and textedit_key declines Cmd+Option).
+                     * X11 also takes Ctrl+Alt, the bar being a field (MOD_APP):
+                     * Ctrl+Alt+Shift+R is the desktops' screen recording. */
+                    u32 search_mods = mods & (MOD_SUPER | MOD_CTRL | MOD_ALT | MOD_SHIFT);
+                    if ((search_mods == (MOD_SUPER | MOD_ALT) || search_mods == (MOD_APP | MOD_ALT)) &&
                         (key == KEY_C || key == KEY_R)) {
+#ifndef PLATFORM_MACOS
+                        app.shortcut_char_time = event.timestamp;   /* X11's ^C / ^R twin is no query text */
+#endif
                         if (key == KEY_C)
                             app_search_set_mode(&app, !app.search_case, app.search_regex);
                         else
@@ -25746,6 +26356,44 @@ int main(int argc, char **argv) {
                     }
                 }
 
+                /* The same keys in the rail of a Code Editor tab, while the rail
+                 * has the keyboard (a click in it gave it: kbd_away of the
+                 * tab's browser). Delete and Cmd+Backspace take what is
+                 * selected to the Trash, or ask first — the explorer's own
+                 * delete, run with the rail as the acting browser. */
+                {
+                    Tab *rt = app_active_tab(&app);
+                    if (rt && rt->kind == TAB_FILEBROWSER && rt->fb && rt->fb_uid) {
+                        FbRailKeyIn rk = {
+                            .rail_has_keys  = rt->fb->kbd_away,
+                            .plain_list     = rt->fb->view_mode != FVIEW_GRAPH,
+                            .modal_open     = app.fb_ctx_menu_active || app.ssh_dialog_active ||
+                                              app.palette_active || app.search_active ||
+                                              app.create_theme_active || app.kbi_dialog_active ||
+                                              app.fb_prompt_active,
+                            .forward_delete = key == KEY_DELETE,
+                            .backspace      = key == KEY_BACKSPACE,
+                            .app_mod        = (mods & MOD_APP) != 0,
+                            .any_mod        = mods != 0,
+                        };
+                        if (fb_rail_key(&rk) == FB_RAIL_KEY_DELETE) {
+                            SftpActor was = app.fb_actor;
+                            app.fb_actor = (SftpActor){ FB_ACTOR_RAIL | rt->fb_uid, 0 };
+                            app_fb_delete_request(&app, rt->fb->selected);
+                            app.fb_actor = was;
+                            needs_redraw = true;
+#ifndef PLATFORM_MACOS
+                            /* The key's text comes with its timestamp: dropped
+                             * like a shortcut's, or the DEL it types lands in
+                             * the document once the rail gives the keyboard
+                             * back. */
+                            app.shortcut_char_time = event.timestamp;
+#endif
+                            break;
+                        }
+                    }
+                }
+
                 /* SSH dialog input handling */
                 if (app.ssh_dialog_active) {
                     char *field = app.ssh_field == 0 ? app.ssh_host :
@@ -25833,7 +26481,7 @@ int main(int argc, char **argv) {
                             app_ssh_port_edited(&app, port_was);
                         }
                     }
-                    else if (key == KEY_C && (mods & MOD_SUPER)) {
+                    else if (key == KEY_C && (mods & MOD_APP)) {
                         /* Cmd+C — copy current field value. Password field
                          * excluded so copy-paste doesn't leak it to the
                          * pasteboard unexpectedly. */
@@ -25841,7 +26489,7 @@ int main(int argc, char **argv) {
                             (void)app_clipboard_copy(&app, field, NULL);
                         }
                     }
-                    else if (key == KEY_X && (mods & MOD_SUPER)) {
+                    else if (key == KEY_X && (mods & MOD_APP)) {
                         /* Cmd+X — cut: copy then clear. Same password
                          * exclusion as Cmd+C. */
                         if (app.ssh_field != 3 && flen > 0) {
@@ -25957,23 +26605,31 @@ int main(int argc, char **argv) {
 
                 /* Option+Up → open command history popup — the shell's. A document
                  * being edited has the key for moving a line, and the branch below
-                 * leaves by `break`, so it must not run there. */
+                 * leaves by `break`, so it must not run there. A chord the binding
+                 * table names is the table's: on X11 Alt+Shift+Up is the pane
+                 * above, and a user may bind Option+Up to anything. */
                 if (key == KEY_UP && (mods & MOD_ALT) && !(mods & MOD_SUPER) && !(mods & MOD_CTRL) &&
-                    !app_editing_fb(&app)) {
+                    !app_editing_fb(&app) &&
+                    keybind_lookup(&app.keybinds, (KeyCode)key, mods) == ACT_NONE) {
                     Terminal *ht = app_focused_terminal(&app);
                     Session *hs = app_focused_session(&app);
                     const char *fg = hs ? session_fg_process(hs) : NULL;
-                    if (!ht || !hs || session_type(hs) != SESSION_LOCAL ||
-                        (ht->mode & MODE_ALT_SCREEN) || !fg ||
-                        (strcmp(fg, "zsh") && strcmp(fg, "bash") &&
-                         strcmp(fg, "fish") && strcmp(fg, "sh"))) break;
-                    app.cmd_history_target_term = ht;
-                    app.cmd_history_target_sess = hs;
-                    app_extract_cmd_history(&app);
-                    app.cmd_history_active = true;
-                    app.cmd_history_selected = 0;
-                    needs_redraw = true;
-                    break;
+                    /* Anywhere but a local shell's prompt the key is the
+                     * program's (an editor's, an agent's, a remote shell's):
+                     * it goes on to the pane. */
+                    bool at_shell = ht && hs && session_type(hs) == SESSION_LOCAL &&
+                                    !(ht->mode & MODE_ALT_SCREEN) && fg &&
+                                    (!strcmp(fg, "zsh") || !strcmp(fg, "bash") ||
+                                     !strcmp(fg, "fish") || !strcmp(fg, "sh"));
+                    if (at_shell) {
+                        app.cmd_history_target_term = ht;
+                        app.cmd_history_target_sess = hs;
+                        app_extract_cmd_history(&app);
+                        app.cmd_history_active = true;
+                        app.cmd_history_selected = 0;
+                        needs_redraw = true;
+                        break;
+                    }
                 }
 
                 /* Cmd+Ctrl+Arrow: window snap to screen halves / maximize */
@@ -25990,14 +26646,12 @@ int main(int argc, char **argv) {
                     if (key == KEY_UP)    { platform_window_snap(window, WIN_SNAP_TOP_HALF);     break; }
                     if (key == KEY_DOWN)  { platform_window_snap(window, WIN_SNAP_BOTTOM_HALF);  break; }
                 }
-                /* Split divider nudge in the active tab: Cmd+Ctrl+Alt+Arrow on
-                 * macOS, where Cmd+Alt+Arrow moves the keyboard between panes
-                 * (ACT_FOCUS_PANE_*); Super+Alt+Arrow elsewhere. */
-#ifdef PLATFORM_MACOS
+                /* Split divider nudge in the active tab: Cmd+Ctrl+Alt+Arrow
+                 * (Super on X11), since Cmd+Alt+Arrow moves the keyboard
+                 * between panes (ACT_FOCUS_PANE_*). Read as Ctrl+Shift it
+                 * would be Ctrl+Alt+Shift+Arrow, the desktops' "move the
+                 * window to a workspace", so X11 has the Super chord only. */
                 const u32 nudge_mods = MOD_SUPER | MOD_CTRL | MOD_ALT;
-#else
-                const u32 nudge_mods = MOD_SUPER | MOD_ALT;
-#endif
                 if ((mods & (MOD_SUPER | MOD_CTRL | MOD_ALT | MOD_SHIFT)) == nudge_mods) {
                     Tab *at = app_active_tab(&app);
                     if (at && at->split != SPLIT_NONE) {
@@ -26097,6 +26751,11 @@ int main(int argc, char **argv) {
                         case KEY_X: case KEY_Z: case KEY_D:
                             if (!(mods & MOD_APP)) fconsumed = false;
                             break;
+                        /* Select All is a text command too: it would select
+                         * the document under the bar, whose fields take none. */
+                        case KEY_A:
+                            if (!(mods & MOD_APP)) fconsumed = false;
+                            break;
                         case KEY_DELETE:
                             break;
                         default: fconsumed = false; break;
@@ -26111,6 +26770,14 @@ int main(int argc, char **argv) {
                 FileBrowser *efb_key = app_editing_fb(&app);
                 if (efb_key) {
                     bool consumed = true;
+
+                    /* A key the document takes gives it the keyboard back from
+                     * the rail of a Code Editor tab (never set on the docked
+                     * document: app_editing_fb is NULL while it is away). */
+                    if (efb_key->kbd_away && !app_translate_is_modifier_key(key)) {
+                        efb_key->kbd_away = false;
+                        needs_redraw = true;
+                    }
 
                     /* Autocomplete popup steals navigation/accept keys. */
                     if (efb_key->ac_active && !(mods & (MOD_SUPER | MOD_CTRL | MOD_ALT))) {
@@ -26145,9 +26812,25 @@ int main(int argc, char **argv) {
                                      key != KEY_LEFT && key != KEY_RIGHT &&
                                      key != KEY_UP && key != KEY_DOWN &&
                                      key != KEY_BACKSPACE && key != KEY_DELETE;
-                    if (app_chord && key == KEY_HOME) { fb_editor_goto_doc_start(efb_key); break; }
-                    if (app_chord && key == KEY_END)  { fb_editor_goto_doc_end(efb_key);   break; }
+                    if (app_chord && key == KEY_HOME) { fb_editor_motion(efb_key, FB_MOVE_DOC_START, (mods & MOD_SHIFT) != 0); break; }
+                    if (app_chord && key == KEY_END)  { fb_editor_motion(efb_key, FB_MOVE_DOC_END, (mods & MOD_SHIFT) != 0);   break; }
                     if (app_chord && key == KEY_Y)    { fb_editor_redo(efb_key);           break; }
+                    /* The desktop's other copy / cut / paste keys (CUA), which a
+                     * compositor also sends for its own copy and paste keys:
+                     * as Ctrl+C / X / V, before the binding table would hand
+                     * them to the terminal beside the document. */
+                    {
+                        u32 cua = mods & (MOD_CTRL | MOD_SHIFT | MOD_ALT | MOD_SUPER);
+                        if (key == KEY_INSERT && cua == MOD_CTRL) {
+                            if (!fb_editor_copy_selection(efb_key)) fb_editor_copy_line(efb_key);
+                            break;
+                        }
+                        if (key == KEY_INSERT && cua == MOD_SHIFT) { fb_editor_paste(efb_key); break; }
+                        if (key == KEY_DELETE && cua == MOD_SHIFT) {
+                            if (!fb_editor_cut_selection(efb_key)) fb_editor_cut_line(efb_key);
+                            break;
+                        }
+                    }
 #endif
                     /* Shift extends the selection on every motion key; the editor
                      * has one (FileBrowser.sel_*), and Cmd+A selects all of it. */
@@ -26319,7 +27002,7 @@ int main(int argc, char **argv) {
                 {
                     FileBrowser *rfb = app_keyboard_md_fb(&app);
                     if (rfb && rfb->view_mode == FVIEW_MARKDOWN && !rfb->md_raw_mode && rfb->md_doc && !rfb->find_active &&
-                        !(mods & (MOD_CTRL | MOD_ALT)) && app_md_read_key(&app, rfb, key, mods)) {
+                        !(mods & ((MOD_CTRL | MOD_ALT) & ~MOD_APP)) && app_md_read_key(&app, rfb, key, mods)) {
                         needs_redraw = true;
                         break;
                     }
@@ -26353,9 +27036,12 @@ int main(int argc, char **argv) {
                  *   - Sidebar Agents row → that row's tab (or pane)
                  *   - anything else → the focused pane, or the tab if unsplit
                  * The last rule yields to a user binding: when keybindings.json
-                 * maps Cmd+R to an action, only a pointer target overrides it. */
-                if (key == KEY_R &&
-                    (mods & (MOD_SUPER | MOD_SHIFT | MOD_CTRL | MOD_ALT)) == MOD_SUPER) {
+                 * maps Cmd+R to an action, only a pointer target overrides it.
+                 * X11 reads Cmd as the table does in a pane (keybind_pane_cmd). */
+                if (key == KEY_R && keybind_pane_cmd(mods)) {
+#ifndef PLATFORM_MACOS
+                    app.shortcut_char_time = event.timestamp;   /* X11's ^R twin stays out of the pane */
+#endif
                     HitResult htab = ui_hit_test(&app, app.hover_x, app.hover_y);
                     if ((htab.type == HIT_TAB || htab.type == HIT_TAB_CLOSE) &&
                         htab.index >= 0 && htab.index < app.tab_count) {
@@ -26639,6 +27325,11 @@ int main(int argc, char **argv) {
                         if (cs) { u8 ff = 0x0C; session_write(cs, &ff, 1); }
                         break;
                     }
+                    case ACT_RESTART_SHELL: {
+                        Tab *rt = app_active_tab(&app);
+                        if (rt) liu_restart_pane(&app, app.active_tab, rt->active_pane);
+                        break;
+                    }
                     case ACT_BROADCAST_TOGGLE:
                         if (app.broadcast_mode) app_disable_broadcast(&app);
                         else app_enable_broadcast(&app, true);
@@ -26837,9 +27528,12 @@ int main(int argc, char **argv) {
                  * at a shell: ^_ is not undo in an agent's text input, and an
                  * agent that turns on no TUI modes at all (Kimi) would
                  * otherwise be handed it as if it were a shell. */
-                if ((mods & (MOD_SUPER | MOD_SHIFT | MOD_CTRL | MOD_ALT)) == MOD_SUPER &&
+                if (keybind_pane_cmd(mods) &&
                     key == KEY_Z && app_cmdline_shell_edit_ok(ft2) &&
                     !app_pane_is_agent(&app, ft2, fs2)) {
+#ifndef PLATFORM_MACOS
+                    app.shortcut_char_time = event.timestamp;   /* and X11's SUB twin */
+#endif
                     app_send_input(&app, fs2, (const u8 *)"\x1f", 1);
                     app_mirror_clear_for(&app, ft2, fs2);
                     terminal_scroll_to_bottom(ft2);
@@ -27035,6 +27729,20 @@ int main(int argc, char **argv) {
                  * 1003/1006), so a badge that let the click through would be
                  * unclickable in exactly the sessions it exists for. Same
                  * precedence the inline thumbnail already has. */
+                /* A diagram card over an agent's Mermaid block: Liu's own
+                 * chrome over the pane, taken ahead of selection and mouse
+                 * forwarding for the image badge's reason below. */
+                if (!app.lightbox.open && !app.dgv.open) {
+                    i32 dh = agent_diagram_hit(&app, mx, my);
+                    if (dh >= 0) {
+                        (void)agent_diagram_click(&app, dh);
+                        mouse_selecting = false;
+                        mouse_selecting_pending = false;
+                        needs_redraw = true;
+                        break;
+                    }
+                }
+
                 if (!app.lightbox.open) {
                     i32 bi = app_img_badge_hit(&app, mx, my);
                     if (bi >= 0) {
@@ -27280,8 +27988,9 @@ int main(int argc, char **argv) {
                         break;
                     case SSHF_HIT_RECENT:
                         /* A recent row connects at once. Its password is not
-                         * kept, so a password host asks for it (the server's
-                         * prompt opens the keyboard-interactive dialog). */
+                         * kept, so a password host asks for it: the server's
+                         * own prompt, or Liu's password dialog where the
+                         * server takes passwords but asks nothing itself. */
                         app_ssh_dialog_pick_recent(&app, fh.index);
                         app_ssh_dialog_submit(&app);
                         break;
@@ -28642,6 +29351,7 @@ int main(int argc, char **argv) {
                      * (possibly new) cwd via app_refresh_fb_tab_title. */
                     Tab *atab = app_active_tab(&app);
                     if (!atab || atab->kind != TAB_FILEBROWSER || !atab->fb) break;
+                    atab->fb->kbd_away = true;          /* a click in the rail: it has the keyboard */
                     f32 cw_ui   = 8.0f * app.dpi_scale;
                     /* The header lives at x = ox..ox+list_w. Take list_w from
                      * fb_tab_split — the same helper the renderer and the
@@ -28687,6 +29397,12 @@ int main(int argc, char **argv) {
                     FileBrowser *fb = atab->fb;
                     i32 idx = hit.index;
                     if (idx < 0 || idx >= fb->entry_count) break;
+                    /* A click in the rail gives the rail the keyboard — Delete
+                     * is then the file list's, and the document draws no caret
+                     * (FileBrowser.kbd_away). Opening a file hands the keyboard
+                     * to its document (fb_open_file), so it is taken again
+                     * below. */
+                    fb->kbd_away = true;
                     /* Plain clicks expand folders or open files; modifiers select. */
                     u32 mods = event.mouse.mods;
                     if (mods & MOD_APP) {
@@ -28708,6 +29424,7 @@ int main(int argc, char **argv) {
                     bool was_graph = (fb->view_mode == FVIEW_GRAPH);
                     bool is_dir    = fb->entries[idx].is_dir;
                     bool opened = fb_open_file(fb, idx);
+                    fb->kbd_away = true;
                     if (was_graph && is_dir) {
                         /* Folder filter: entering a folder re-scopes the
                          * graph to it (recursively), so a codebase's many
@@ -28729,6 +29446,7 @@ int main(int argc, char **argv) {
                     if (!atab || atab->kind != TAB_FILEBROWSER || !atab->fb) break;
                     fb_sel_clear(atab->fb);
                     atab->fb->selected = -1;
+                    atab->fb->kbd_away = true;
                     break;
                 }
                 case HIT_FBTAB_DIVIDER:
@@ -28753,6 +29471,7 @@ int main(int argc, char **argv) {
                                      "%s", atab->fb->view_path);
                         }
                     } else if (atab && atab->kind == TAB_FILEBROWSER && atab->fb) {
+                        atab->fb->kbd_away = false;     /* a click in the document takes the keyboard back */
                         if (fb_graph_active(atab->fb)) {
                             if (fb_graph_panel_press(atab->fb, mx, my)) {
                                 needs_redraw = true; break;
@@ -29694,6 +30413,7 @@ int main(int argc, char **argv) {
                      * Liu's own chrome and is always clickable. */
                     if (!dialog_pointer &&
                         (app_img_badge_hit(&app, app.hover_x, app.hover_y) >= 0 ||
+                         agent_diagram_hit(&app, app.hover_x, app.hover_y) >= 0 ||
                          app_prompt_thumb_hit(&app, app.hover_x, app.hover_y) >= 0 ||
                          app_prompt_badge_hit(&app, app.hover_x, app.hover_y) >= 0)) {
                         platform_set_cursor(CURSOR_POINTER);
@@ -31736,6 +32456,10 @@ int main(int argc, char **argv) {
             }
         }
 
+#ifndef PLATFORM_MACOS
+        if (!mouse_down_now) app_editor_publish_primary(&app);
+#endif
+
         bool needs_session_poll = poll_needs_service(
             fd_fires, had_event, had_saturated_pane_last_frame,
             pty_reader_backlog(), any_write_pending);
@@ -32431,26 +33155,24 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Track SSH session connection results for history */
+        /* A connect attempt's result, on the Recent row it made
+         * (Tab.history_row) and on no other: two attempts to one host each
+         * keep their own. With it, how it got in when that was a password
+         * the person was asked for. A tab with no row (restored, reopened)
+         * records nothing. */
         if (app.vault) {
             for (i32 ti = 0; ti < app.tab_count; ti++) {
                 Tab *t = &app.tabs[ti];
-                if (!t->session || t->history_tracked) continue;
-                if (session_type(t->session) != SESSION_SSH) continue;
+                if (!t->session || t->history_tracked || t->history_row <= 0) continue;
+                SessionType sty = session_type(t->session);
+                if (sty != SESSION_SSH && sty != SESSION_MOSH) continue;
                 SessionStatus st = session_status(t->session);
                 if (st == SESSION_CONNECTED) {
-                    const SSHConfig *cfg = session_get_config(t->session);
-                    if (cfg) {
-                        vault_update_history_result(app.vault, cfg->hostname,
-                                                    cfg->port, cfg->username, true);
-                    }
+                    vault_set_history_result(app.vault, t->history_row, true,
+                                             session_auth_asked(t->session));
                     t->history_tracked = true;
                 } else if (st == SESSION_ERROR) {
-                    const SSHConfig *cfg = session_get_config(t->session);
-                    if (cfg) {
-                        vault_update_history_result(app.vault, cfg->hostname,
-                                                    cfg->port, cfg->username, false);
-                    }
+                    vault_set_history_result(app.vault, t->history_row, false, NULL);
                     t->history_tracked = true;
                 }
             }
@@ -32462,8 +33184,10 @@ int main(int argc, char **argv) {
             for (i32 i = 0; i < app.tab_count; i++) {
                 Session *panes[MAX_SPLIT_PANES];
                 i32 np = pane_sessions_collect(&app.tabs[i], panes);
-                for (i32 pi = 0; pi < np; pi++)
+                for (i32 pi = 0; pi < np; pi++) {
                     session_keepalive_check(panes[pi], tick_now);
+                    session_forward_tick(panes[pi]);
+                }
             }
         }
 
@@ -32538,13 +33262,24 @@ int main(int argc, char **argv) {
         }
         for (i32 wi = 0; wi < g_liu_win_count; wi++)
             if (app_agent_picker_tick(g_liu_wins[wi].st)) g_liu_wins[wi].needs_redraw = true;
-        for (i32 wi = 0; wi < g_liu_win_count; wi++) {
-            AppState *ws = g_liu_wins[wi].st;
-
-            bool a_now = ws && (anim_active_for(ws) || anim_soft_active_for(ws));
-            if (a_now || g_liu_wins[wi].anim_was_active)
-                g_liu_wins[wi].needs_redraw = true;
-            g_liu_wins[wi].anim_was_active = a_now;
+        {
+            f64 anim_now = platform_time_sec();
+            for (i32 wi = 0; wi < g_liu_win_count; wi++) {
+                AppState *ws = g_liu_wins[wi].st;
+                bool hard = ws && anim_active_for(ws);
+                bool soft = ws && anim_soft_active_for(ws);
+                bool a_now = hard || soft;
+                /* A soft animation (the working bar) is drawn about 30 times a
+                 * second: it owes a frame only in a FRAME_DT_SOFT_ANIM slot that
+                 * has had none (liu_soft_anim_wait), since a frame drawn for
+                 * output drew it too. Asked on every turn, it would paint at
+                 * the panel's rate whenever anything else woke the loop. */
+                bool soft_due = soft && (liu_soft_anim_every_turn() ||
+                                         liu_soft_anim_wait(&g_liu_wins[wi], anim_now) <= 0.0);
+                if (hard || soft_due || (!a_now && g_liu_wins[wi].anim_was_active))
+                    g_liu_wins[wi].needs_redraw = true;
+                g_liu_wins[wi].anim_was_active = a_now;
+            }
         }
 
         /* A file drag resting on a tab switches to it. PER WINDOW for the same
@@ -32605,7 +33340,15 @@ int main(int argc, char **argv) {
             }
             for (i32 wi = 0; wi < g_liu_win_count; wi++) {
                 AppState *ws = g_liu_wins[wi].st;
+                /* A field dialog's due moment is moved on whatever this
+                 * frame paints for: it is the NEXT edge after now. */
+                f64 field_in = liu_field_caret_wake_in(ws, now);
+                bool field_due = field_in >= 0.0 && g_liu_wins[wi].ls_field_due > 0.0 &&
+                                 now >= g_liu_wins[wi].ls_field_due;
+                g_liu_wins[wi].ls_field_due = field_in >= 0.0 ? now + field_in : 0.0;
+                bool still_due = ws && anim_wake_due_for(ws, now);
                 if (!ws || ws->visible_session_data_this_frame) continue;
+                if (field_due || still_due) g_liu_wins[wi].needs_redraw = true;
                 if (liu_continuous_visual(ws, now) || transfer_edge ||
                     (ws->agentctl_next_edge > 0.0 && now >= ws->agentctl_next_edge))
                     g_liu_wins[wi].needs_redraw = true;
@@ -32613,6 +33356,7 @@ int main(int argc, char **argv) {
                          ws->renderer.cursor_blink_in_frame)
                     g_liu_wins[wi].needs_redraw = true;
             }
+            anim_wake_settle(now);   /* every window has been asked */
         }
 
         /* No per-frame window-title work: the title bar is LIU_APP_TITLE
@@ -32649,6 +33393,9 @@ int main(int argc, char **argv) {
                 platform_ime_reset(g_liu_wins[wi].pw);
                 g_liu_wins[wi].needs_redraw = true;
             }
+            /* A field that is ASCII by construction takes no input method
+             * while it has the keyboard (ui_ime_field_off). */
+            platform_ime_allow(g_liu_wins[wi].pw, !(ws->ime_field_now && ws->ime_field_off));
         }
 #endif
         for (i32 wi = 0; wi < g_liu_win_count; wi++) {
@@ -32700,6 +33447,7 @@ int main(int argc, char **argv) {
                 app.kbi_session = target;
                 app.kbi_shown_at = platform_time_sec();
                 snprintf(app.kbi_peer, sizeof(app.kbi_peer), "%s", session_kbi_peer(target));
+                app.kbi_liu = session_kbi_is_liu(target);
                 i32 np = session_kbi_num_prompts(target);
                 app.kbi_num_prompts = np;
                 snprintf(app.kbi_name, sizeof(app.kbi_name), "%s", session_kbi_name(target));
@@ -32861,6 +33609,12 @@ int main(int argc, char **argv) {
                     f64 win_fence0   = g_liu_fprobe_fence;
 
                     fp_mark(FP_TICK);
+                    /* A working job tab's haze hands the steps between its key
+                     * frames to the compositor only while nothing else in this
+                     * window is drawn on the clock (that frame source would
+                     * paint them anyway) and its hover — whose caret pulses
+                     * on the haze's frames — is not up. */
+                    app.haze_handoff = !curw->ls_link_clock && !app.agentctl_tip_job;
                     /* An open Find bar follows the pane it searches: every
                      * frame, because output that reaches the grid without a
                      * poll (a resize, a demo feed) still moves the rows. */
@@ -32949,6 +33703,7 @@ int main(int argc, char **argv) {
                         last_present_t = present_now;
                     }
 #endif
+                    curw->ls_drawn_at = present_now;
                     next_present_t = frame_pacing_advance(
                         curw->ls_link_running, present_now,
                         next_present_t, present_period);

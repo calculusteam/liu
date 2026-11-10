@@ -45,6 +45,7 @@ typedef struct {
     i32        n;
     f64        last_tick;      /* the clock at the previous tick; 0 while empty */
     f32        dt;             /* the previous tick to this one, capped, for the slot follow */
+    bool       settling;       /* a notice was not yet in its slot at the last draw */
 } ToastStack;
 
 static inline f32 toast_ease_out(f32 t) {
@@ -151,6 +152,10 @@ static inline i32 toast_stack_push_about(ToastStack *s, u64 about, NotificationK
     memmove(&s->e[1], &s->e[0], (usize)s->n * sizeof s->e[0]);
     s->e[0] = fresh;
     s->n++;
+    /* The stack was still (nothing painted it); the slots start moving now,
+     * so the follow's first step is measured from here, not from the last
+     * frame drawn — which can be seconds ago. */
+    if (s->last_tick > 0.0) s->last_tick = now;
     /* A fourth notice sends the oldest one away; it does not wait its turn. */
     while (toast_stack_staying(s) > TOAST_MAX) {
         for (i32 i = s->n - 1; i >= 0; i--) {
@@ -212,6 +217,7 @@ static inline bool toast_stack_dismiss(ToastStack *s, i32 i, f64 now) {
     if (!s || i < 0 || i >= s->n || s->e[i].closing_at > 0.0) return false;
     s->e[i].closing_a = toast_entry_alpha(&s->e[i], now);
     s->e[i].closing_at = now;
+    if (s->last_tick > 0.0) s->last_tick = now;     /* see toast_stack_push_about */
     return true;
 }
 
@@ -234,11 +240,32 @@ static inline i32 toast_stack_hit(const ToastStack *s, f32 x, f32 y) {
     return -1;
 }
 
-/* Something is still on screen or on its way: the event loop stays awake. */
+/* Something is still on screen or on its way. */
 static inline bool toast_stack_active(const ToastStack *s, f64 now) {
     for (i32 i = 0; i < s->n; i++)
         if (!toast_entry_expired(&s->e[i], now)) return true;
     return false;
+}
+
+/* Seconds until the stack's picture changes by itself: 0 while something on
+ * it moves (a fade in or out, a slide, a clicked notice leaving, a slot still
+ * being settled into), the time to the next fade-out while every notice holds
+ * still, -1 when nothing is up. A held notice needs no frames: it changes
+ * only when it starts to leave, and the pointer resting on one comes with a
+ * frame of its own (the hover registry) that keeps it. */
+static inline f64 toast_stack_next_change(const ToastStack *s, f64 now) {
+    if (!s) return -1.0;
+    f64 next = -1.0;
+    for (i32 i = 0; i < s->n; i++) {
+        const ToastEntry *e = &s->e[i];
+        if (toast_entry_expired(e, now)) continue;
+        if (e->closing_at > 0.0 || s->settling) return 0.0;
+        f64 age = toast_entry_age(e, now);
+        f64 out_at = toast_entry_hold(e) - TOAST_FADE_OUT_S;
+        if (age < TOAST_FADE_IN_S || age >= out_at) return 0.0;
+        if (next < 0.0 || out_at - age < next) next = out_at - age;
+    }
+    return next;
 }
 
 /* The stack's height from its top edge — what a card hung below it clears. */

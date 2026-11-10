@@ -727,10 +727,6 @@ void notify_server_reload(void) {
     srv_wake();
 }
 
-bool notify_server_running(void) {
-    return g_srv_running;
-}
-
 int notify_daemon_main(void) {
     atomic_store_explicit(&g_thread_stop, false, memory_order_release);
     atomic_store_explicit(&g_thread_reload, false, memory_order_release);

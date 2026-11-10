@@ -418,9 +418,15 @@ static void lb_caption(const AppState *app, LbCaption *c) {
         snprintf(c->line, sizeof(c->line), "Loading %s…", lb->name);
     else
         snprintf(c->line, sizeof(c->line), "%s", lb->err[0] ? lb->err : lb->name);
+#ifdef PLATFORM_MACOS
+#define LB_COPY_HINT "⌘C copy path"
+#else
+#define LB_COPY_HINT UI_MOD_APP "+C copy path"
+#endif
     c->hint = (lb->zoom > 1.001f)
-        ? "Esc close  ·  drag to pan  ·  wheel to zoom out  ·  ⌘C copy path"
-        : "Esc close  ·  wheel to zoom in  ·  ⌘C copy path";
+        ? "Esc close  ·  drag to pan  ·  wheel to zoom out  ·  " LB_COPY_HINT
+        : "Esc close  ·  wheel to zoom in  ·  " LB_COPY_HINT;
+#undef LB_COPY_HINT
     c->n_line = (i32)utf8_len((const u8 *)c->line, strlen(c->line));
     c->n_hint = (i32)utf8_len((const u8 *)c->hint, strlen(c->hint));
 
@@ -562,11 +568,11 @@ bool lightbox_key(AppState *app, i32 key, u32 mods) {
     if (!app || !app->lightbox.open) return false;
     Lightbox *lb = &app->lightbox;
     if (key == KEY_ESCAPE) { lightbox_close(app); return true; }
-    if ((mods & MOD_APP) && (key == 'c' || key == 'C')) {
+    if ((mods & MOD_APP) && key == KEY_C) {
         (void)app_clipboard_copy(app, lb->path, "Path copied");
         return true;
     }
-    if (key == '0') { lb->zoom = 1.0f; lb->pan_x = lb->pan_y = 0.0f; return true; }
+    if (key == KEY_0) { lb->zoom = 1.0f; lb->pan_x = lb->pan_y = 0.0f; return true; }
     /* Everything else is swallowed while the overlay is up: it is modal, and
      * letting a keystroke through would type into the agent the user cannot
      * see. */

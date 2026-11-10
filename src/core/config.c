@@ -16,6 +16,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <pwd.h>
+#include <fcntl.h>
+#include <pthread.h>
 
 #ifdef PLATFORM_MACOS
     #include <mach-o/dyld.h>
@@ -1097,6 +1099,7 @@ AppConfig config_default(void) {
     c.agent_orchestration_notice_seen = false;
     c.agent_orchestration_guard = true;
     c.agent_subagent_tabs = true;
+    c.agent_diagrams = true;
     c.agent_jobs_fold = 0;
     c.agent_orchestration_ask_tools = true;
     c.agent_orchestration_keep = true;
@@ -1309,6 +1312,102 @@ const char *liu_executable_dir(void) {
     if (cached[0]) return cached;
     if (!resolve_executable_dir(cached, sizeof(cached))) cached[0] = '\0';
     return cached;
+}
+
+#ifdef __linux__
+/* `dst` made a copy of `src` unless it is one already: written beside it and
+ * renamed over it, so a copy is never seen half written. */
+static bool helper_copy(const char *src, const char *dst) {
+    int in = open(src, O_RDONLY | O_CLOEXEC);
+    if (in < 0) return false;
+    struct stat ss, ds;
+    bool same = false;
+    if (fstat(in, &ss) == 0 && lstat(dst, &ds) == 0 && S_ISREG(ds.st_mode) && ds.st_size == ss.st_size) {
+        int cur = open(dst, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (cur >= 0) {
+            same = true;
+            char a[65536], b[65536];
+            for (;;) {
+                ssize_t na = read(in, a, sizeof a), nb = read(cur, b, sizeof b);
+                if (na < 0 || nb < 0 || na != nb || memcmp(a, b, (usize)na)) { same = false; break; }
+                if (na == 0) break;
+            }
+            close(cur);
+        }
+    }
+    if (same) { close(in); return true; }
+    if (lseek(in, 0, SEEK_SET) != 0) { close(in); return false; }
+    /* A name of this process's own: two copies of Liu starting together each
+     * write and rename their own file. */
+    char tmp[1100];
+    if ((usize)snprintf(tmp, sizeof tmp, "%s.%ld.part", dst, (long)getpid()) >= sizeof tmp) { close(in); return false; }
+    unlink(tmp);
+    int out = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0700);
+    if (out < 0) { close(in); return false; }
+    bool ok = true;
+    char buf[65536];
+    for (;;) {
+        ssize_t n = read(in, buf, sizeof buf);
+        if (n == 0) break;
+        if (n < 0 || write(out, buf, (usize)n) != n) { ok = false; break; }
+    }
+    close(in);
+    if (close(out) != 0) ok = false;
+    if (ok && rename(tmp, dst) != 0) ok = false;
+    if (!ok) unlink(tmp);
+    return ok;
+}
+#endif
+
+static char g_helper_dir[1024];
+
+/* Resolved once per process, on whichever thread asks first: a local pane
+ * can be made on a worker. */
+static void helper_dir_resolve(void) {
+    char *cached = g_helper_dir;
+    usize cap = sizeof g_helper_dir;
+    const char *exe = liu_executable_dir();
+    snprintf(cached, cap, "%s", exe ? exe : "");
+#ifdef __linux__
+    /* An AppImage runs from a folder its runtime mounts for this process and
+     * names in APPDIR. */
+    const char *appdir = getenv("APPDIR");
+    usize an = appdir ? strlen(appdir) : 0;
+    if (!an || !exe || strncmp(exe, appdir, an) != 0 || (exe[an] != '/' && exe[an] != '\0')) return;
+    const char *home = getenv("HOME");
+    if (!home || home[0] != '/') {
+        struct passwd *pw = getpwuid(getuid());
+        home = pw ? pw->pw_dir : NULL;
+    }
+    if (!home || home[0] != '/') return;
+    char base[1024], dir[1024];
+    if ((usize)snprintf(base, sizeof base, "%s/.liu", home) >= sizeof base ||
+        (usize)snprintf(dir, sizeof dir, "%s/helpers", base) >= sizeof dir) return;
+    (void)mkdir(base, 0755);
+    (void)mkdir(dir, 0700);
+    /* Used only when both are this user's own directories, reached through
+     * no link, and nobody else can write the folder the copies are in. */
+    struct stat st;
+    if (lstat(base, &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != geteuid() ||
+        (st.st_mode & (S_IWGRP | S_IWOTH)) != 0) return;
+    if (lstat(dir, &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != geteuid() ||
+        (st.st_mode & (S_IRWXG | S_IRWXO)) != 0) return;
+    static const char *const names[] = { "liu-notify", "liu-history" };
+    for (usize i = 0; i < sizeof names / sizeof names[0]; i++) {
+        char src[1100], dst[1100];
+        snprintf(src, sizeof src, "%s/%s", exe, names[i]);
+        snprintf(dst, sizeof dst, "%s/%s", dir, names[i]);
+        if (access(src, X_OK) != 0) continue;
+        if (!helper_copy(src, dst)) return;
+    }
+    snprintf(cached, cap, "%s", dir);
+#endif
+}
+
+const char *liu_helper_exe_dir(void) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, helper_dir_resolve);
+    return g_helper_dir;
 }
 
 const char *font_user_dir(void) {
@@ -2032,6 +2131,7 @@ bool config_load(AppConfig *cfg, const char *filepath) {
             else if (strcmp(key, "agent_orchestration_ask_tools") == 0) cfg->agent_orchestration_ask_tools = strcmp(val, "true") == 0;
             else if (strcmp(key, "agent_orchestration_keep") == 0) cfg->agent_orchestration_keep = strcmp(val, "true") == 0;
             else if (strcmp(key, "agent_subagent_tabs") == 0) cfg->agent_subagent_tabs = strcmp(val, "true") == 0;
+            else if (strcmp(key, "agent_diagrams") == 0) cfg->agent_diagrams = strcmp(val, "true") == 0;
             else if (strcmp(key, "agent_jobs_fold") == 0) cfg->agent_jobs_fold = config_jobs_fold_parse(val);
             else if (strcmp(key, "agent_orchestration_max") == 0) {
                 i32 v = config_i32_or(val, cfg->agent_orchestration_max);
@@ -2340,6 +2440,7 @@ bool config_save(const AppConfig *cfg, const char *filepath) {
     fprintf(f, "  \"agent_orchestration_ask_tools\": %s,\n", cfg->agent_orchestration_ask_tools ? "true" : "false");
     fprintf(f, "  \"agent_orchestration_keep\": %s,\n", cfg->agent_orchestration_keep ? "true" : "false");
     fprintf(f, "  \"agent_subagent_tabs\": %s,\n", cfg->agent_subagent_tabs ? "true" : "false");
+    fprintf(f, "  \"agent_diagrams\": %s,\n", cfg->agent_diagrams ? "true" : "false");
     fprintf(f, "  \"agent_jobs_fold\": \"%s\",\n", config_jobs_fold_name(cfg->agent_jobs_fold));
     fprintf(f, "  \"bold_is_bright\": %s,\n", cfg->bold_is_bright ? "true" : "false");
     fprintf(f, "  \"show_scrollbar\": %s,\n", cfg->show_scrollbar ? "true" : "false");

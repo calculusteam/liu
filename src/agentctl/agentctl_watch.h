@@ -8,9 +8,12 @@
  * module only hands the changes over: per file, on one serial queue of its
  * own, about a tenth of a second after they happen.
  *
- * macOS: FSEvents, one stream a folder, per-file events. Elsewhere nothing is
- * watched (agentctl_watch_available() is false) and the team hears of the
- * files its members' tools and command lines name.
+ * macOS: FSEvents, one stream a folder, per-file events. Linux: inotify on
+ * every folder of the tree but the ones agentctl_watch_skip_name() names (a
+ * folder made later is watched as it appears, and what it already holds is
+ * handed over as made). Elsewhere nothing is watched
+ * (agentctl_watch_available() is false) and the team hears of the files its
+ * members' tools and command lines name.
  */
 #ifndef AGENTCTL_WATCH_H
 #define AGENTCTL_WATCH_H
@@ -18,6 +21,21 @@
 #include "core/types.h"
 
 #include <stdbool.h>
+#include <string.h>
+
+/* A path component no change is weighed under: version control, package
+ * and build caches, editor state. The watch does not descend into such a
+ * folder, and the server drops any change whose path names one. */
+static inline bool agentctl_watch_skip_name(const char *name, usize len) {
+    static const char *const names[] = {
+        ".git", "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".next",
+        ".turbo", ".parcel-cache", ".gradle", "DerivedData", ".venv", ".idea", ".DS_Store", "4913",
+        "Library", ".cache", ".Trash", "target", "venv", ".tox",
+    };
+    for (usize i = 0; i < sizeof names / sizeof names[0]; i++)
+        if (strlen(names[i]) == len && !strncmp(name, names[i], len)) return true;
+    return false;
+}
 
 #define AGENTCTL_WATCH_MAX 8                 /* folders watched at once */
 

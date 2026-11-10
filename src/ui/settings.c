@@ -4,6 +4,8 @@
 #include "ui/settings.h"
 #include "ui/model_delete.h"
 #include "ui/settings_layout.h"
+#include "ui/settings_space.h"
+#include "ui/settings_field.h"
 #include "ui/ui.h"      /* AppState + app_edit* (shared field editing) */
 #include "ui/anim.h"
 #include "ui/icon.h"
@@ -672,43 +674,6 @@ static bool notify_default_sound_path(const char *name, char *out, usize cap) {
     return true;
 }
 
-/* Resolve the absolute path of the liu-notify binary that ships next to
- * Liu. The Claude hook installer needs an absolute path so Claude can
- * spawn it regardless of the shell PATH it inherits. Falls back to the
- * bare name "liu-notify" if introspection fails — that still works when
- * the user has the binary on PATH. */
-static bool resolve_liu_notify_path(char *out, size_t cap) {
-    if (!out || cap < 4) return false;
-#if defined(__APPLE__)
-    char exe[1024]; uint32_t exe_sz = sizeof exe;
-    if (_NSGetExecutablePath(exe, &exe_sz) == 0) {
-        char *slash = strrchr(exe, '/');
-        if (slash) {
-            *slash = '\0';
-            int n = snprintf(out, cap, "%s/liu-notify", exe);
-            if (n > 0 && (usize)n < cap) return true;
-        }
-    }
-#elif defined(__linux__)
-    /* /proc/self/exe is the Linux _NSGetExecutablePath: the hook command
-     * written into ~/.claude/settings.json must be absolute, because the agent
-     * that runs it does not inherit the user's interactive shell PATH. */
-    char exe[1024];
-    ssize_t elen = readlink("/proc/self/exe", exe, sizeof exe - 1);
-    if (elen > 0) {
-        exe[elen] = '\0';
-        char *slash = strrchr(exe, '/');
-        if (slash) {
-            *slash = '\0';
-            int n = snprintf(out, cap, "%s/liu-notify", exe);
-            if (n > 0 && (usize)n < cap && access(out, X_OK) == 0) return true;
-        }
-    }
-#endif
-    int n = snprintf(out, cap, "liu-notify");
-    return n > 0 && (usize)n < cap;
-}
-
 /* Populate the freshly-loaded config with bundled defaults. Called from (a)
  * first-install (no notify.conf existed) and (b) "Reset to bundled defaults"
  * — both want a clean slate so the bundled (any, event) rules (rank 1 in the
@@ -1131,14 +1096,50 @@ static inline void s_icon(Renderer *r, IconKind kind, f32 x, f32 y, f32 size,
     icon_draw(r, kind, x, y, size, s_tint(color));
 }
 
+/* Which kind of field `buf` is (ui/settings_field.h). The panel's buffers are
+ * a field's identity everywhere else (app_edit, the draw), so its policy is
+ * found the same way; NONE for anything that is not one of them. */
+static SettingsFieldKind settings_field_of(const SettingsPanel *sp, const char *buf) {
+    if (!sp || !buf) return SETTINGS_FIELD_NONE;
+    if (buf == sp->browser_rule_buf) return SETTINGS_FIELD_BROWSER_RULE;
+    if (buf == sp->model_menu_filter) return SETTINGS_FIELD_MODEL_FILTER;
+    if (buf == sp->api_key_buf) return SETTINGS_FIELD_API_KEY;
+    if (buf == sp->api_url_buf) return SETTINGS_FIELD_API_URL;
+    if (buf == sp->api_model_buf) return SETTINGS_FIELD_API_MODEL;
+    if (buf == sp->vault_old_pw || buf == sp->vault_new_pw || buf == sp->vault_new_pw2)
+        return SETTINGS_FIELD_VAULT_PASSWORD;
+    return SETTINGS_FIELD_NONE;
+}
+
+/* A field the frame drew, for the script driver's state dump. */
+static void settings_probe_field(SettingsPanel *sp, SettingsFieldKind kind, f32 x, f32 y, f32 w, f32 h) {
+    if (!sp || sp->field_probe_n >= (i32)(sizeof sp->field_probe / sizeof sp->field_probe[0])) return;
+    i32 at = sp->field_probe_n++;
+    sp->field_probe[at].kind = (i32)kind;
+    sp->field_probe[at].x = x; sp->field_probe[at].y = y;
+    sp->field_probe[at].w = w; sp->field_probe[at].h = h;
+}
+
+static void settings_probe_stepper(SettingsPanel *sp, f32 x, f32 y, f32 w, f32 h) {
+    if (!sp || sp->stepper_probe_n >= (i32)(sizeof sp->stepper_probe / sizeof sp->stepper_probe[0])) return;
+    i32 at = sp->stepper_probe_n++;
+    sp->stepper_probe[at].x = x; sp->stepper_probe[at].y = y;
+    sp->stepper_probe[at].w = w; sp->stepper_probe[at].h = h;
+}
+
 static inline f32 s_edit_field(Renderer *r, struct AppState *app,
                                const char *buf, i32 len,
                                f32 x, f32 y, f32 cw, f32 ch, i32 max_cells,
                                Color fg, Color caret_c, Color sel_c,
                                bool mask, bool show_caret) {
-    return ui_draw_edit_field(r, app, buf, len, x, y, cw, ch, max_cells,
-                              s_tint(fg), s_tint(caret_c), s_tint(sel_c),
-                              mask, show_caret);
+    /* A value that is ASCII by construction takes no input method: no
+     * composition is drawn in it and the window's input context stands down. */
+    SettingsFieldKind kind = settings_field_of(s_render_panel, buf);
+    bool ime_off = !settings_field_takes_ime(kind);
+    settings_probe_field(s_render_panel, kind, x, y, (f32)max_cells * cw, ch);
+    return ui_draw_edit_field_ex(r, app, buf, len, x, y, cw, ch, max_cells,
+                                 s_tint(fg), s_tint(caret_c), s_tint(sel_c),
+                                 mask, show_caret, ime_off);
 }
 
 /* An agent's logo before its name in a list: on the tile every other agent
@@ -1850,6 +1851,7 @@ static const KeysRow g_keys_rows[] = {
     { ACT_NEXT_PANE,        NULL, NULL },
     { ACT_PREV_PANE,        NULL, NULL },
     { ACT_TOGGLE_PANE_ZOOM, NULL, NULL },
+    { ACT_RESTART_SHELL,    NULL, NULL },
     { ACT_BROADCAST_TOGGLE, NULL, NULL },
     { ACT_SAVE_FILE,        NULL, NULL },
 
@@ -1876,7 +1878,7 @@ static const KeysRow g_keys_rows[] = {
     { ACT_NONE, "Word left / right",              "Alt+Left / Right" },
     { ACT_NONE, "Delete to line start / end",     UI_MOD_PRIMARY "+Backspace / Delete" },
     { ACT_NONE, "Delete word left / right",       "Alt+Backspace / Delete" },
-    { ACT_NONE, "Undo line edit",                 UI_MOD_PRIMARY "+Z" },
+    { ACT_NONE, "Undo line edit",                 UI_MOD_PANE "+Z" },
     { ACT_NONE, "Scroll to top / bottom",         UI_MOD_PRIMARY "+Up / Down" },
 
     { ACT_NONE, "Window & system  ·  not rebindable", NULL },
@@ -1884,14 +1886,10 @@ static const KeysRow g_keys_rows[] = {
      * pressed: "Cmd" is wrong wherever MOD_SUPER is the Super key. */
     { ACT_NONE, "Snap window half / maximize",  "Ctrl+" UI_MOD_PRIMARY "+Arrows" },
     { ACT_NONE, "Snap window quadrant",         "Ctrl+" UI_MOD_PRIMARY "+Shift+Arrows" },
-#ifdef PLATFORM_MACOS
     /* Cmd+Alt+Arrows is the keyboard's way between panes (ACT_FOCUS_PANE_*). */
     { ACT_NONE, "Resize split divider",         "Ctrl+Alt+" UI_MOD_PRIMARY "+Arrows" },
-#else
-    { ACT_NONE, "Resize split divider",         UI_MOD_PRIMARY "+Alt+Arrows" },
-#endif
     { ACT_NONE, "Command history",              "Alt+Up" },
-    { ACT_NONE, "Close item under cursor",      UI_MOD_PRIMARY "+R" },
+    { ACT_NONE, "Close item under cursor",      UI_MOD_PANE "+R" },
 #ifdef PLATFORM_LINUX
     /* X11 has no native fullscreen menu; the F11 binding added for Linux is
      * the one that works here. */
@@ -2905,7 +2903,8 @@ static bool settings_model_menu_key(SettingsPanel *sp, struct AppState *app, u32
         char before[sizeof sp->model_menu_filter];
         snprintf(before, sizeof before, "%s", sp->model_menu_filter);
         i32 len = (i32)strlen(sp->model_menu_filter);
-        TextEdit e = app_edit(app, sp->model_menu_filter, &len, (i32)sizeof sp->model_menu_filter);
+        TextEdit e = app_edit_ex(app, sp->model_menu_filter, &len, (i32)sizeof sp->model_menu_filter,
+                                 settings_field_edit_flags(SETTINGS_FIELD_MODEL_FILTER));
         if (textedit_key(&e, &app->te_undo, (i32)key, mods)) {
             app_edit_done(app, (i32)strlen(sp->model_menu_filter));
             if (strcmp(before, sp->model_menu_filter) != 0) settings_model_menu_refilter(sp);
@@ -2977,6 +2976,8 @@ void settings_render(SettingsPanel *sp, struct AppState *app, Renderer *r,
      * push their rectangles as they're laid out. settings_point_clickable
      * walks this list to drive the pointing-hand cursor in main.c. */
     sp->hover_area_count = 0;
+    sp->field_probe_n = 0;
+    sp->stepper_probe_n = 0;
     /* So are the popover and the chip it hangs from: a frame that does not
      * draw them leaves nothing of theirs to click. */
     sp->overlay_w = 0.0f;
@@ -3213,6 +3214,7 @@ void settings_render(SettingsPanel *sp, struct AppState *app, Renderer *r,
         renderer_flush_rrects(r);
         i32 field_cells = (i32)((g.input.w - 24 * dpi) / cw);
         if (field_cells < 1) field_cells = 1;
+        settings_probe_field(sp, SETTINGS_FIELD_BROWSER_RULE, g.input.x, g.input.y, g.input.w, g.input.h);
         f32 field_y = g.input.y + (g.input.h - ch) * 0.5f;
         if (sp->browser_rule_editing) {
             Color caret = value_fg; caret.a *= ui_caret_alpha();
@@ -3279,7 +3281,7 @@ void settings_render(SettingsPanel *sp, struct AppState *app, Renderer *r,
     if (sp->active_tab == SETTINGS_TAB_APPEARANCE) {
         f32 y = content_y;
         f32 col2 = content_x + 14 * cw; /* value column */
-        f32 item_h = ch + 10;
+        f32 item_h = settings_item_h(ch, dpi);
         i32 font_cols = content_w >= 420.0f * dpi ? 3 :
                         content_w >= 260.0f * dpi ? 2 : 1;
         f32 font_row_h = ch + 16.0f * dpi;   /* same card height as themes */
@@ -3382,7 +3384,7 @@ void settings_render(SettingsPanel *sp, struct AppState *app, Renderer *r,
         y += ((g_font_count + font_cols - 1) / font_cols) *
              (font_row_h + font_gap) + 16.0f * dpi;
 
-        y += 10;
+        y += SETTINGS_BLOCK_GAP_PT * dpi;
 
         /* Size / Line Height — segmented steppers. The - and + glyphs sit
          * at col2 + 7cw / 9cw, the x positions settings_handle_click's
@@ -3396,6 +3398,7 @@ void settings_render(SettingsPanel *sp, struct AppState *app, Renderer *r,
             f32 _sw = 6.0f * cw;       /* two roomy halves */                    \
             f32 _sy = y - 3.0f * dpi;                                           \
             f32 _sh = ch + 6.0f * dpi;                                          \
+            settings_probe_stepper(sp, _sx, _sy, _sw, _sh);                     \
             Color _seg_bg = cp.surface_sunken; _seg_bg.a = 1.0f;                \
             f32 _srad = fminf(_sh * 0.5f, 6.0f * dpi);                         \
             s_rrect_bordered(r, _sx, _sy, _sw, _sh, _seg_bg,                    \
@@ -3446,7 +3449,7 @@ void settings_render(SettingsPanel *sp, struct AppState *app, Renderer *r,
         #undef APPEAR_STEPPER
         (void)buf;
 
-        y += 10;
+        y += SETTINGS_BLOCK_GAP_PT * dpi;
 
         /* Theme — compact grid. User themes (index >= THEME_COUNT) get a
          * trailing close-icon button that deletes the on-disk JSON.
@@ -3454,9 +3457,9 @@ void settings_render(SettingsPanel *sp, struct AppState *app, Renderer *r,
          * const storage and theme_delete_user refuses to touch names
          * not in the user-themes cache. */
         draw_label(r, "Theme", content_x, y, label_fg);
-        y += ch + 8.0f;
+        y += ch + SETTINGS_THEME_HEAD_PT * dpi;
         settings_section_rule(r, content_x, y, content_w, cp.divider_subtle, dpi);
-        y += 8.0f;
+        y += SETTINGS_THEME_HEAD_PT * dpi;
 
         i32 theme_count;
         const char **theme_names = theme_list_names(&theme_count);
@@ -3822,7 +3825,7 @@ void settings_render(SettingsPanel *sp, struct AppState *app, Renderer *r,
 
             y2 = y;
         }
-        content_end_y = y2 + ch + 16;
+        content_end_y = y2 + ch + SETTINGS_TAIL_PT * dpi;
 
     } else if (sp->active_tab == SETTINGS_TAB_TERMINAL) {
         f32 y = content_y;
@@ -4179,6 +4182,18 @@ void settings_render(SettingsPanel *sp, struct AppState *app, Renderer *r,
                    value_x, y, dim_fg);
         y += row_h;
 
+        /* A Mermaid block an agent prints, drawn as its diagram over the rows
+         * it took (ui/agent_diagram.h). */
+        draw_label_limited(r, "Diagrams:", content_x, y, label_fg, (i32)(fmaxf(0, value_off - 8 * dpi) / cw));
+        settings_draw_switch(r, value_x, y - 2.0f * dpi,
+                             sp->config->agent_diagrams, control_active,
+                             control_bg, control_border,
+                             value_fg, label_fg, cw, ch, dpi);
+        y += row_h;
+        draw_label(r, "Draws a Mermaid block an agent prints as the diagram.",
+                   value_x, y, dim_fg);
+        y += row_h;
+
         /* Agents that start agents (agentctl): the switch, how many may work
          * at once, and the most a request may ask for. Same row order as the
          * click handler below. */
@@ -4300,7 +4315,7 @@ void settings_render(SettingsPanel *sp, struct AppState *app, Renderer *r,
                    value_x, y, dim_fg);
         y += row_h;
 
-        content_end_y = y + ch + 16;
+        content_end_y = y + ch + SETTINGS_TAIL_PT * dpi;
 
     } else if (sp->active_tab == SETTINGS_TAB_TRANSLATE) {
         TranslateConfig *tc = &sp->config->translate;
@@ -4887,7 +4902,7 @@ void settings_render(SettingsPanel *sp, struct AppState *app, Renderer *r,
         y += row_h;
         draw_label(r, "Changes are saved automatically.",
                    content_x, y, dim_fg);
-        content_end_y = y + ch + 16;
+        content_end_y = y + ch + SETTINGS_TAIL_PT * dpi;
 
     } else if (sp->active_tab == SETTINGS_TAB_VOICE) {
         VoiceConfig *vc = &sp->config->voice;
@@ -5442,7 +5457,7 @@ void settings_render(SettingsPanel *sp, struct AppState *app, Renderer *r,
                 y += row_h;
             }
         }
-        content_end_y = y + ch + 16;
+        content_end_y = y + ch + SETTINGS_TAIL_PT * dpi;
 
     } else if (sp->active_tab == SETTINGS_TAB_NOTIFY) {
         settings_notify_ensure_loaded(sp);
@@ -5809,18 +5824,18 @@ void settings_render(SettingsPanel *sp, struct AppState *app, Renderer *r,
         y += row_h_notify;
         draw_label(r, "Changes are saved automatically.",
                    content_x, y, dim_fg);
-        content_end_y = y + ch + 16;
+        content_end_y = y + ch + SETTINGS_TAIL_PT * dpi;
 
     } else if (sp->active_tab == SETTINGS_TAB_KEYS) {
         f32 y = content_y;
         if (sp->rebinding) {
             Color warn_clr = theme ? theme->ansi[3] : (Color){1.0f, 0.8f, 0.3f, 1.0f}; /* yellow */
             draw_label(r, "Press new key combo...", content_x, y, warn_clr);
-            y += ch + 4;
+            y += ch + SETTINGS_LINE_GAP_PT * dpi;
             draw_label(r, action_name((Action)sp->rebind_action), content_x, y, value_fg);
-            y += ch + 12;
+            y += ch + SETTINGS_LINE_GAP_WIDE_PT * dpi;
             draw_label(r, "Escape cancels · Delete removes the binding", content_x, y, dim_fg);
-            content_end_y = y + ch + 16;
+            content_end_y = y + ch + SETTINGS_TAIL_PT * dpi;
         } else {
             draw_label(r, "CUSTOM SHORTCUTS · click a binding to change it",
                        content_x, y, dim_fg);
@@ -6132,9 +6147,9 @@ void settings_render(SettingsPanel *sp, struct AppState *app, Renderer *r,
             Color sc = (strncmp(sp->vault_status, "Error", 5) == 0)
                 ? cp.btn_destructive_fg : value_fg;
             draw_label(r, sp->vault_status, content_x, y, sc);
-            y += ch + 4;
+            y += ch + SETTINGS_LINE_GAP_PT * dpi;
         }
-        content_end_y = y + ch + 16;
+        content_end_y = y + ch + SETTINGS_TAIL_PT * dpi;
 
     } else if (sp->active_tab == SETTINGS_TAB_DIAGNOSTICS) {
         /* Problems first, healthy checks collapsed into one line.
@@ -6665,12 +6680,12 @@ void settings_render(SettingsPanel *sp, struct AppState *app, Renderer *r,
             y += ch;
         }
 
-        content_end_y = y + 16;
+        content_end_y = y + SETTINGS_TAIL_PT * dpi;
     }
 
     /* Recompute max_scroll from actual content height vs visible area */
     f32 actual_h    = content_end_y - content_y;
-    f32 available_h = (clip_bottom - clip_top) - 16.0f;
+    f32 available_h = (clip_bottom - clip_top) - SETTINGS_BODY_SLACK_PT * dpi;
     {
         i32 new_max = actual_h > available_h
             ? (i32)((actual_h - available_h) / (ch * 0.5f)) + 1
@@ -7008,7 +7023,7 @@ static bool settings_handle_click_impl(SettingsPanel *sp, f32 x, f32 y, f32 sw, 
     }
 
     if (sp->active_tab == SETTINGS_TAB_APPEARANCE) {
-        f32 item_h = ch + 10;
+        f32 item_h = settings_item_h(ch, dpi);
         f32 col2 = content_x + 14 * cw;
         f32 panel_w2 = content_w;
         i32 font_cols = content_w >= 420.0f * dpi ? 3 :
@@ -7059,7 +7074,7 @@ static bool settings_handle_click_impl(SettingsPanel *sp, f32 x, f32 y, f32 sw, 
             }
         }
         ry += ((g_font_count + font_cols - 1) / font_cols) *
-              (font_row_h + font_gap) + 16.0f * dpi + 10;
+              (font_row_h + font_gap) + 16.0f * dpi + SETTINGS_BLOCK_GAP_PT * dpi;
 
         /* Size row — segmented stepper: each half of the box is a target.
          * Geometry mirrors APPEAR_STEPPER in settings_render exactly. */
@@ -7116,12 +7131,12 @@ static bool settings_handle_click_impl(SettingsPanel *sp, f32 x, f32 y, f32 sw, 
                 if (settings_weight_step(slots[k], dir)) sp->text_weight_dirty = true;
                 return true;
             }
-            ry = wb.end + 10;
+            ry = wb.end + SETTINGS_BLOCK_GAP_PT * dpi;
         }
 
         /* Theme grid. Hit zones must stay aligned with the
          * renderer above; if you change one, change both. */
-        ry += ch + 16;
+        ry += ch + 2.0f * SETTINGS_THEME_HEAD_PT * dpi;
         i32 theme_count;
         const char **theme_names = theme_list_names(&theme_count);
         for (i32 i = 0; i < theme_count; i++) {
@@ -7596,6 +7611,16 @@ static bool settings_handle_click_impl(SettingsPanel *sp, f32 x, f32 y, f32 sw, 
                 return true;
             }
             return false;   /* empty space beside the control is inert */
+        }
+        ry += row_h;
+        /* Caption row (no-op) */
+        ry += row_h;
+
+        /* Diagrams */
+        if (y >= ry && y < ry + row_h &&
+            x >= value_x && x < value_x + settings_switch_w(cw, dpi)) {
+            sp->config->agent_diagrams = !sp->config->agent_diagrams;
+            return true;
         }
         ry += row_h;
         /* Caption row (no-op) */
@@ -8435,7 +8460,7 @@ static bool settings_handle_click_impl(SettingsPanel *sp, f32 x, f32 y, f32 sw, 
                          * build is cleaned or the app moves, which is what
                          * the shim exists for (agent_hooks.h). */
                         char nbin[1024];
-                        resolve_liu_notify_path(nbin, sizeof nbin);
+                        if (!diag_notify_bin(nbin, sizeof nbin)) nbin[0] = '\0';
                         res = agent_hook_install_shimmed(id, nbin);
                         if (res.ok)
                             snprintf(sp->notify_hook_installed,
@@ -8780,13 +8805,15 @@ bool settings_handle_click(SettingsPanel *sp, f32 x, f32 y, f32 sw, f32 sh,
 bool settings_handle_char(SettingsPanel *sp, struct AppState *app, u32 codepoint) {
     if (!sp->open) return false;
 
+    /* What each field takes is its policy's (ui/settings_field.h): the edit
+     * refuses a character the field does not accept, whether it was typed or
+     * committed by an input method. */
     if (sp->active_tab == SETTINGS_TAB_BROWSER && sp->browser_rule_editing) {
-        if (codepoint >= 32 && codepoint < 127) {
-            i32 len = (i32)strlen(sp->browser_rule_buf);
-            TextEdit e = app_edit(app, sp->browser_rule_buf, &len, sizeof sp->browser_rule_buf);
-            textedit_insert_cp(&e, app ? &app->te_undo : NULL, codepoint);
-            app_edit_done(app, len);
-        }
+        i32 len = (i32)strlen(sp->browser_rule_buf);
+        TextEdit e = app_edit_ex(app, sp->browser_rule_buf, &len, sizeof sp->browser_rule_buf,
+                                 settings_field_edit_flags(SETTINGS_FIELD_BROWSER_RULE));
+        textedit_insert_cp(&e, app ? &app->te_undo : NULL, codepoint);
+        app_edit_done(app, len);
         return true;
     }
 
@@ -8796,9 +8823,10 @@ bool settings_handle_char(SettingsPanel *sp, struct AppState *app, u32 codepoint
     if (sp->active_tab == SETTINGS_TAB_TRANSLATE && sp->translate_model_picker_open) {
         SettingsModelRows rows;
         settings_translate_model_rows(sp, &rows);
-        if (rows.searchable && app && codepoint >= 32 && codepoint < 127) {
+        if (rows.searchable && app) {
             i32 len = (i32)strlen(sp->model_menu_filter);
-            TextEdit e = app_edit(app, sp->model_menu_filter, &len, (i32)sizeof sp->model_menu_filter);
+            TextEdit e = app_edit_ex(app, sp->model_menu_filter, &len, (i32)sizeof sp->model_menu_filter,
+                                     settings_field_edit_flags(SETTINGS_FIELD_MODEL_FILTER));
             textedit_insert_cp(&e, &app->te_undo, codepoint);
             app_edit_done(app, (i32)strlen(sp->model_menu_filter));
             settings_model_menu_refilter(sp);
@@ -8806,40 +8834,36 @@ bool settings_handle_char(SettingsPanel *sp, struct AppState *app, u32 codepoint
         return true;
     }
 
-    /* API key / base URL / model inline editors accept ASCII printable (keys,
-     * URLs and model ids are ASCII by construction). Shared by the Translate
-     * and the Voice tab — settings_api_editing() is what decides whether one
-     * is really open, and on which tab. */
+    /* API key / base URL / model inline editors take ASCII (keys, URLs and
+     * model ids are ASCII by construction), and no '"' or '\\': both would
+     * break the curl-config quoting at spawn. Shared by the Translate and the
+     * Voice tab — settings_api_editing() is what decides whether one is really
+     * open, and on which tab. */
     if (settings_api_editing(sp)) {
         char *buf; usize cap;
         if (sp->editing_api_key)        { buf = sp->api_key_buf;   cap = sizeof(sp->api_key_buf); }
         else if (sp->editing_api_url)   { buf = sp->api_url_buf;   cap = sizeof(sp->api_url_buf); }
         else                            { buf = sp->api_model_buf; cap = sizeof(sp->api_model_buf); }
-        /* '"' and '\\' are excluded: config.json is written with a raw
-         * fprintf("%s") (no JSON escaping) and they'd also break the
-         * curl-config quoting at spawn. Neither is valid in a key/URL/id. */
-        if (codepoint >= 32 && codepoint < 127 &&
-            codepoint != '"' && codepoint != '\\') {
-            i32 flen = (i32)strlen(buf);
-            TextEdit e = app_edit_ex(app, buf, &flen, (i32)cap,
-                                     sp->editing_api_key ? TEXTEDIT_SECRET : 0);
-            textedit_insert_cp(&e, sp->editing_api_key || !app ? NULL : &app->te_undo,
-                               codepoint);
-            app_edit_done(app, flen);
-        }
+        i32 flen = (i32)strlen(buf);
+        TextEdit e = app_edit_ex(app, buf, &flen, (i32)cap,
+                                 settings_field_edit_flags(settings_field_of(sp, buf)));
+        textedit_insert_cp(&e, sp->editing_api_key || !app ? NULL : &app->te_undo,
+                           codepoint);
+        app_edit_done(app, flen);
         return true;   /* swallow everything while editing */
     }
 
-    /* Vault — password fields accept ASCII printable. */
+    /* Vault — a password is any text: the unlock dialog next to it takes every
+     * character, so these fields do too (a control byte is ignored). */
     if (sp->active_tab == SETTINGS_TAB_VAULT) {
         char *buf = sp->vault_editing_old_pw ? sp->vault_old_pw
                   : sp->vault_editing_new_pw ? sp->vault_new_pw
                   : sp->vault_editing_new_pw2 ? sp->vault_new_pw2 : NULL;
-        if (buf && codepoint >= 32 && codepoint < 127) {
+        if (buf) {
             i32 flen = (i32)strlen(buf);
             TextEdit e = app_edit_ex(app, buf, &flen,
                                      (i32)sizeof sp->vault_old_pw,
-                                     TEXTEDIT_SECRET);
+                                     settings_field_edit_flags(SETTINGS_FIELD_VAULT_PASSWORD));
             textedit_insert_cp(&e, NULL, codepoint);
             app_edit_done(app, flen);
             return true;
@@ -8863,7 +8887,8 @@ bool settings_handle_key(SettingsPanel *sp, struct AppState *app, u32 key, u32 m
             return true;
         }
         i32 len = (i32)strlen(sp->browser_rule_buf);
-        TextEdit e = app_edit(app, sp->browser_rule_buf, &len, sizeof sp->browser_rule_buf);
+        TextEdit e = app_edit_ex(app, sp->browser_rule_buf, &len, sizeof sp->browser_rule_buf,
+                                 settings_field_edit_flags(SETTINGS_FIELD_BROWSER_RULE));
         textedit_key(&e, app ? &app->te_undo : NULL, key, mods);
         app_edit_done(app, len);
         return true;
@@ -8907,17 +8932,12 @@ bool settings_handle_key(SettingsPanel *sp, struct AppState *app, u32 key, u32 m
              * refused. Paste still lands — keys are unpleasant to type. */
             i32 flen = (i32)strlen(buf);
             TextEdit e = app_edit_ex(app, buf, &flen, (i32)bcap,
-                                     sp->editing_api_key ? TEXTEDIT_SECRET : 0);
+                                     settings_field_edit_flags(settings_field_of(sp, buf)));
             if (textedit_key(&e, sp->editing_api_key || !app ? NULL : &app->te_undo,
                              (i32)key, mods)) {
-                /* config.json is written with a raw fprintf("%s") and the
-                 * value is also spliced into a curl config, so a pasted '"'
-                 * or '\\' would break both. Strip them after the edit rather
-                 * than teaching textedit about this field's grammar. */
-                char *w = buf;
-                for (char *rp = buf; *rp; rp++)
-                    if (*rp != '"' && *rp != '\\') *w++ = *rp;
-                *w = '\0';
+                /* A paste is held to the field's policy as it goes in (ASCII,
+                 * and no '"' or '\\', which would break the curl config the
+                 * value is spliced into). */
                 app_edit_done(app, (i32)strlen(buf));
                 return true;
             }
@@ -8975,7 +8995,8 @@ bool settings_handle_key(SettingsPanel *sp, struct AppState *app, u32 key, u32 m
             }
             if (key == KEY_ENTER) { settings_vault_submit(sp); return true; }
             i32 len = (i32)strlen(buf);
-            TextEdit e = app_edit_ex(app, buf, &len, sizeof sp->vault_old_pw, TEXTEDIT_SECRET);
+            TextEdit e = app_edit_ex(app, buf, &len, sizeof sp->vault_old_pw,
+                                     settings_field_edit_flags(SETTINGS_FIELD_VAULT_PASSWORD));
             if (textedit_key(&e, NULL, key, mods)) {
                 app_edit_done(app, len);
                 return true;

@@ -584,26 +584,6 @@ bool known_hosts_forget(LIBSSH2_SESSION *session, const char *hostname, i32 port
  * Remove (by active session key)
  * ========================================================================= */
 
-bool known_hosts_remove(LIBSSH2_SESSION *session, const char *hostname, i32 port) {
-    if (!session || !hostname || !hostname[0] || strnlen(hostname, 256) >= 256 ||
-        port <= 0 || port > 65535) return false;
-
-    char path[4096];
-    if (!get_known_hosts_path(path, sizeof(path))) return false;
-    if (!known_hosts_path_safe(path, false)) return false;
-
-    size_t key_len;
-    int key_type;
-    const char *key = libssh2_session_hostkey(session, &key_len, &key_type);
-    if (!key) return false;
-
-    char name[320];
-    known_hosts_entry_name(hostname, port, name, sizeof name);
-    i32 dropped = 0;
-    return known_hosts_rewrite(session, path, name, key, key_len, KH_DROP_THIS_KEY, NULL, &dropped) &&
-           dropped > 0;
-}
-
 /* =========================================================================
  * Fingerprint
  * ========================================================================= */

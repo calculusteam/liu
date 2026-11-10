@@ -36,7 +36,7 @@ static inline SplitSourceKind split_source_kind(SessionType type, bool has_confi
 }
 
 /* Turn `cfg` — a deep copy of the source pane's config — into the sibling's:
- * no port forward, remote forward or Unix-socket forward (they stay with the
+ * no port forward, SOCKS proxy, remote forward or Unix-socket forward (they stay with the
  * connection that owns them), and the shell starts in `start_dir` when that is
  * a folder the remote shell reported and one ssh_start_dir_ok() accepts, in
  * the account's home otherwise. Everything else — host, user, credentials,
@@ -55,6 +55,10 @@ static inline void split_sibling_config(SSHConfig *cfg, const char *start_dir) {
     cfg->stream_forwards = NULL;
     cfg->stream_forward_count = 0;
     cfg->stream_forward_cap = 0;
+    free(cfg->socks_forwards);
+    cfg->socks_forwards = NULL;
+    cfg->socks_forward_count = 0;
+    cfg->socks_forward_cap = 0;
 
     cfg->start_dir[0] = '\0';
     if (ssh_start_dir_ok(start_dir))

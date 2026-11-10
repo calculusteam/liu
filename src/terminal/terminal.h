@@ -165,7 +165,7 @@ struct TermLineCompressed_s;
  * Readers that need a Cell pointer (renderer scrollback rendering, sleep
  * snapshot serializer) materialize the cold form into a per-Terminal scratch
  * buffer; readers that only need codepoints (search regex match, selection
- * text) call termline_codepoints and skip materialization entirely. */
+ * text) read the line's codepoint array and skip materialization entirely. */
 typedef struct {
     Cell                          *cells;    /* hot path: row cells (NULL when cold) */
     i32                            len;
@@ -192,7 +192,7 @@ typedef struct {
  *   Cold syntax-highlighted  : 200*4 + 25 + 12*16≈ 1017 B   (12 runs)
  *
  * The helpers in buffer.c are termline_compress / termline_materialize /
- * termline_codepoints / termline_compressed_destroy. */
+ * termline_compressed_destroy. */
 typedef struct {
     CellAttr attr;        /* attribute applied to `length` consecutive cells */
     u16      length;      /* run length in cells */
@@ -214,6 +214,11 @@ typedef struct TermLineCompressed_s {
      * that may not (an empty line, a line too long to keep). Sits in the
      * padding before wide_bits. */
     u8       slab_class;
+    /* What a resize found this block to be (terminal.c, resize_cold_verdict):
+     * 0 until it is first asked, then kept, since a stored block's cells and
+     * runs do not change. Zeroed with the header, so a recycled block starts
+     * unasked. Also in that padding. */
+    u8       reflow_verdict;
 
     /* Wide-char trailer bitmap: bit i set => codepoints[i] is the spacer
      * (right half) of a wide character. Size = ceil(len/64) u64 words —
@@ -237,11 +242,7 @@ typedef struct TermLineCompressed_s {
  *
  * `termline_materialize` expands a compressed line back into a Cell array
  * provided by the caller (renderer scratch buffer, bidi/search staging, etc).
- * Writes at most `out_cap` cells and returns the number written.
- *
- * `termline_codepoints` returns the raw codepoint array — useful for callers
- * that only need text (selection text, search regex matching) and don't
- * touch attributes; avoids the materialize allocation. */
+ * Writes at most `out_cap` cells and returns the number written. */
 bool   termline_compress(const Cell *cells, i32 len, bool wrapped,
                           TermLineCompressed **out_ptr);
 i32    termline_materialize(const TermLineCompressed *line,
@@ -249,7 +250,6 @@ i32    termline_materialize(const TermLineCompressed *line,
 /* Length after trimming ordinary trailing spaces, as on materialized cells.
  * Wide/dummy cells stay significant; no temporary Cell array is needed. */
 i32    termline_content_length(const TermLineCompressed *line);
-const u32 *termline_codepoints(const TermLineCompressed *line, i32 *out_len);
 void   termline_compressed_destroy(TermLineCompressed *line);
 usize  termline_compressed_bytes(const TermLineCompressed *line);
 
@@ -458,6 +458,10 @@ struct Terminal {
     Cell    *cells;           /* rows * cols grid */
     i32      cols;
     i32      rows;
+    /* This terminal's own number, never given to another while the process
+     * runs: what keys per-pane state where the address alone could be a
+     * destroyed pane's, reused by the allocator. */
+    u32      uid;
 
     /* Scroll-without-copying window.
      *
@@ -479,6 +483,13 @@ struct Terminal {
     Cell    *grid_base;       /* allocation base when grid_slack > 0 */
     i32      grid_slide;      /* rows `cells` has advanced from grid_base */
     i32      grid_slack;      /* spare rows in the allocation past `rows` */
+    /* Scrolls so far, and what terminal_grid_slack_tick saw of them: a live
+     * grid that has not scrolled for a while gives its slack back, and so
+     * does the parked one (it cannot scroll) once it has been parked as long. */
+    u32      scroll_gen;
+    u32      slack_seen_gen;
+    u32      slack_quiet_ticks;
+    u32      parked_slack_ticks;
 
     /* Alternate screen buffer. alt_cells is a WINDOW, exactly like `cells`:
      * whichever grid is parked here keeps the slide state it had, so freeing it
@@ -908,6 +919,10 @@ void      termline_cache_free(Terminal *t);
 /* Called on a steady cadence: after `quiet_limit` calls in a row with no line
  * evicted from the history, the cache is given back (a flood is over). */
 void      termline_cache_tick(Terminal *t, u32 quiet_limit);
+/* Called on the same cadence: after `quiet_limit` calls in a row with no
+ * scroll, the live grid's slack is given back (the allocation shrinks to the
+ * screen; the next scroll that wants a slide grows it again). */
+void      terminal_grid_slack_tick(Terminal *t, u32 quiet_limit);
 usize     terminal_grid_bytes(const Terminal *t);
 
 /* Return the grid window to its allocation base. Must be called before any
@@ -1002,7 +1017,6 @@ void      terminal_scroll_to_bottom(Terminal *t);
 /* Selection */
 void      terminal_select_start(Terminal *t, i32 col, i32 row);
 void      terminal_select_update(Terminal *t, i32 col, i32 row);
-char     *terminal_select_text(Terminal *t);
 void      terminal_select_clear(Terminal *t);
 
 /* Generate response bytes for key input → send to PTY/SSH */
@@ -1080,13 +1094,13 @@ bool  terminal_search_set_current_at(Terminal *t, i64 abs_line, i32 col);
 void  terminal_clear_images(Terminal *t);
 void  terminal_delete_image(Terminal *t, u32 image_id);
 i32   terminal_add_image(Terminal *t, u8 *pixels, i32 w, i32 h,
+
                          i32 col, i32 row, i32 cols, i32 rows,
                           u32 image_id, u32 placement_id);
 bool  terminal_image_async_pump(Terminal *t);
 bool  terminal_image_async_pending(const Terminal *t);
 bool  terminal_image_async_completion_ready(const Terminal *t);
 void  terminal_image_async_shutdown(Terminal *t);
-
 
 /* Mouse reporting (in mouse.c) */
 i32   terminal_mouse_encode(Terminal *t, i32 button, i32 col, i32 row,

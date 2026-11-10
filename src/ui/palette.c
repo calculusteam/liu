@@ -366,6 +366,7 @@ static const char *g_commands_static[] = {
     "Next Pane",              /* the panes in reading order, wrapping */
     "Previous Pane",
     "Toggle Pane Zoom",       /* the focused pane fills the tab, or the layout comes back */
+    "Restart Shell",          /* a new shell in the focused pane, on a fresh screen */
     "Toggle Sidebar",
     "Customize Sidebar",     /* the sidebar's own settings popover */
     "Toggle File Browser",
@@ -592,6 +593,11 @@ void palette_open(Vault *v, const AppConfig *cfg, const void *owner) {
         VaultHistoryEntry history[10];
         i32 nh = vault_get_history(v, history, 10);
         for (i32 i = 0; i < nh && g_palette.item_count < MAX_PALETTE_ITEMS; i++) {
+            /* A row with no host connects to nothing (older builds stored
+             * some); the connect form's Recent skips them too. */
+            const char *hn = history[i].hostname;
+            while (*hn == ' ' || *hn == '\t') hn++;
+            if (!*hn) continue;
             /* Deduplicate: skip if same host+port+user already added */
             bool dup = false;
             for (i32 j = 0; j < g_palette.item_count; j++) {
@@ -794,42 +800,6 @@ void palette_set_query(const char *query) {
     g_palette.selected = 0;
 }
 
-void palette_input_char(u32 codepoint) {
-    if (!palette_owns()) return;
-    if (g_palette.query_len < 127) {
-        g_palette.query[g_palette.query_len++] = (char)codepoint;
-        g_palette.query[g_palette.query_len] = '\0';
-        palette_set_query(g_palette.query);
-    }
-}
-
-void palette_backspace(void) {
-    if (!palette_owns()) return;
-    if (g_palette.query_len > 0) {
-        g_palette.query[--g_palette.query_len] = '\0';
-        palette_set_query(g_palette.query);
-    }
-}
-
-void palette_move_up(void) {
-    if (!palette_owns()) return;
-    if (g_palette.selected > 0) g_palette.selected--;
-}
-
-void palette_move_down(void) {
-    if (!palette_owns()) return;
-    if (g_palette.selected < g_palette.filtered_count - 1) g_palette.selected++;
-}
-
-/* The one that decides what Enter acts on. A non-owner reading this would
- * resume a session from the OTHER window's history scan. */
-PaletteItem *palette_get_selected(void) {
-    if (!palette_owns()) return NULL;
-    if (g_palette.selected < 0 || g_palette.selected >= g_palette.filtered_count)
-        return NULL;
-    return &g_palette.filtered[g_palette.selected];
-}
-
 i32 palette_filtered_count(void) {
     return palette_owns() ? g_palette.filtered_count : 0;
 }
@@ -838,10 +808,6 @@ PaletteItem *palette_get_item(i32 index) {
     if (!palette_owns()) return NULL;
     if (index < 0 || index >= g_palette.filtered_count) return NULL;
     return &g_palette.filtered[index];
-}
-
-i32 palette_selected_index(void) {
-    return palette_owns() ? g_palette.selected : 0;
 }
 
 const char *palette_query(void) {
@@ -1574,7 +1540,6 @@ void palette_enter_history_mode(const char *cwd_filter) {
            (usize)g_palette.item_count * sizeof(PaletteItem));
 }
 
-
 bool palette_sites_restart_mode(void) {
     return palette_owns() && g_sites_restart_mode;
 }
@@ -1615,6 +1580,7 @@ void palette_enter_sites_mode(const struct SiteManager *m) {
             default:            dot = "\xe2\x97\x8b"; status = "Stopped";  break; /* ○ */
         }
         i32 port = site_effective_port(st);
+
         /* Command capped short: detail renders right-aligned on a single
          * row, so an unbounded npm script line would crowd out the name. */
         if (port > 0) {
