@@ -12011,6 +12011,19 @@ static void draw_tab_accent_ex(Renderer *r, Tab *tab, f32 x, f32 y, f32 w, f32 h
         return true;
     }
 
+    /* A chip's count, at the chip's own cell. The strip and the sidebar row
+     * draw their titles at a scale of their own, so the one in force is given
+     * back afterwards: a reset would hand every title drawn after the chip the
+     * terminal font's size. */
+    static void job_chip_text(Renderer *r, const char *m, f32 x, f32 y, Color fg, f32 cw, f32 ch) {
+        f32 keep_cw = r->ui_cell_w, keep_ch = r->ui_cell_h;
+        renderer_set_ui_scale(r, cw, ch);
+        draw_text_ex(r, m, x, y, fg, 8, cw);
+        renderer_flush_glyphs(r);
+        if (keep_cw > 0.0f && keep_ch > 0.0f) renderer_set_ui_scale(r, keep_cw, keep_ch);
+        else                                  renderer_reset_ui_scale(r);
+    }
+
     /* Tab `ti`'s job tabs, from `x0` (its pill's right edge) rightward, each
      * `job_w` wide: joined to the pill with no gap. The open tab's fill and
      * outline stop at the joint, so a job tab looks the same whether its tab
@@ -12121,10 +12134,7 @@ static void draw_tab_accent_ex(Renderer *r, Tab *tab, f32 x, f32 y, f32 w, f32 h
                 }
                 Color fg = t->tab_active_fg;
                 fg.a *= alpha;
-                renderer_set_ui_scale(r, cw, ch);
-                draw_text_ex(r, m, cp.text_x, floorf(jp->pill_y + (jp->pill_h - ch) * 0.5f), fg, 8, cw);
-                renderer_flush_glyphs(r);
-                renderer_reset_ui_scale(r);
+                job_chip_text(r, m, cp.text_x, floorf(jp->pill_y + (jp->pill_h - ch) * 0.5f), fg, cw, ch);
             } else if (more) {
                 char m[8];
                 snprintf(m, sizeof m, "+%u", (unsigned)app->tab_jobs_more[ti]);
@@ -12132,11 +12142,8 @@ static void draw_tab_accent_ex(Renderer *r, Tab *tab, f32 x, f32 y, f32 w, f32 h
                 f32 tw = (f32)strlen(m) * cw;
                 Color fg = t->tab_active_fg;
                 fg.a *= alpha;
-                renderer_set_ui_scale(r, cw, ch);
-                draw_text_ex(r, m, floorf(x + (w - tw) * 0.5f),
-                             floorf(jp->pill_y + (jp->pill_h - ch) * 0.5f), fg, 8, cw);
-                renderer_flush_glyphs(r);
-                renderer_reset_ui_scale(r);
+                job_chip_text(r, m, floorf(x + (w - tw) * 0.5f),
+                              floorf(jp->pill_y + (jp->pill_h - ch) * 0.5f), fg, cw, ch);
             } else {
                 ChatTool tool = agentctl_chat_tool(tj->agent);
                 f32 ix = floorf(x + (w - isz) * 0.5f);
