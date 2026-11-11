@@ -63,6 +63,10 @@ Bir bölmedeki ajan işi Liu üzerinden başka bir ajana devredebilir: `liu-agen
 
 Bir ajan kendi alt ajanlarını başlattığında (Claude Code'un Agent aracı, Codex, OpenCode, Copilot CLI, Cursor, Qwen Code, Droid, Crush ve diğerleri), her biri ajanın sekmesinin yanında bir iş sekmesi olur ve ajanın kendi kayıtlarından canlı okunur. Beş alt ajan, beş sekme; her birinin pusu kendine ait bir görüntü. Birinin üzerinde durun, en yeni satırlarını görün; tıklayın, tüm kaydını açın. Bittiğinde her biri tamamlandı ya da başarısız olarak görünür ve bir sonraki isteminizde temizlenir.
 
+### Ajan Çıktısında Diyagramlar
+
+Bir ajan diyagram bastığında Liu onu çizer. Mermaid (akış, sıra, sınıf, durum, ER, Gantt, pasta, zihin haritası, zaman çizelgesi, yolculuk, gitGraph, dörtlü ve XY grafikleri), Graphviz DOT, PlantUML, LaTeX formülleri ve SVG, kaynağın kapladığı satırların üstünde bir karta dönüşür; kart, yazısı okunur kalacak biçimde yerleştirilir. Büyük açmak için tıklayın; yakınlaştırın, kaydırın ya da kaynağı kopyalayın. Tek bir düğme ajanın metnini geri getirir.
+
 ### Sesli Komut
 
 **⌘⇧M**'ye basın ve konuşun. Whisper large-v3-turbo bu Mac'te çalışır (ağ yok, hesap yok, hiçbir şey yüklenmez) ve kelimeler hangi bölme odaktaysa oraya yazılır; yani Claude Code'da da, düz bir kabukta da, bir REPL'de de çalışır. Canlı dalga formu mikrofonun gerçekte ne duyduğunu gösterir; durduğunuzda iz donar ve ses yazıya dökülürken üzerinden bir tarama geçer. Mikrofonu seçin, Whisper'ın bildiği 100 dilden birini seçin ya da bunun yerine bulut tabanlı bir konuşma API'sine yönlendirin.

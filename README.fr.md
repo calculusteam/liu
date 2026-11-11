@@ -63,6 +63,10 @@ Un agent dans un volet peut confier du travail à un autre via Liu : `liu-agent 
 
 Quand un agent lance ses propres sous-agents (l'outil Agent de Claude Code, Codex, OpenCode, Copilot CLI, Cursor, Qwen Code, Droid, Crush et d'autres), chacun devient un onglet de tâche à côté de l'onglet de l'agent, lu en direct dans les propres enregistrements de l'agent. Cinq sous-agents, cinq onglets, chaque brume une image à part. Posez le pointeur sur l'un pour voir ses dernières lignes, cliquez pour son journal complet ; à la fin, chacun indique terminé ou échoué et disparaît à votre prochain prompt.
 
+### Diagrammes dans la sortie de l'agent
+
+Quand un agent affiche un diagramme, Liu le dessine. Mermaid (organigrammes, séquences, classes, états, ER, Gantt, camemberts, cartes mentales, frises, parcours, gitGraph, quadrants et graphiques XY), Graphviz DOT, PlantUML, formules LaTeX et SVG deviennent une carte posée sur les lignes qu'occupait la source, mise en page pour que son texte reste lisible. Un clic l'ouvre en grand : zoomez, déplacez ou copiez la source. Un bouton rend le texte de l'agent.
+
 ### Prompt vocal
 
 Appuyez sur **⌘⇧M** et parlez. Whisper large-v3-turbo tourne sur ce Mac (pas de réseau, pas de compte, rien d'envoyé) et les mots sont tapés dans le volet qui a le focus : dans Claude Code, dans un shell simple, dans un REPL. Une forme d'onde en direct montre ce que le micro entend vraiment ; quand vous arrêtez, la trace se fige et un balayage la parcourt pendant la transcription. Choisissez le micro, choisissez parmi les 100 langues que connaît Whisper, ou pointez-le vers une API vocale hébergée.

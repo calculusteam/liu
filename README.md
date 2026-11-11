@@ -63,6 +63,10 @@ An agent in a pane can hand work to another through Liu: `liu-agent start codex 
 
 When an agent starts subagents of its own (Claude Code's Agent tool, Codex, OpenCode, Copilot CLI, Cursor, Qwen Code, Droid, Crush and more), each becomes a job tab beside the agent's tab, read live from the agent's own records. Five subagents, five tabs, each haze a picture of its own. Rest on one for its newest lines, click it for its whole log; each reads done or failed when it ends, and they clear at your next prompt.
 
+### Diagrams in Agent Output
+
+When an agent prints a diagram, Liu draws it. Mermaid (flowchart, sequence, class, state, ER, Gantt, pie, mindmap, timeline, journey, gitGraph, quadrant and XY charts), Graphviz DOT, PlantUML, LaTeX formulas and SVG become a card over the rows the source took, laid out for the card so its text stays readable. Click it to open it large, then zoom, pan or copy the source. One button gives the agent's text back.
+
 ### Voice Prompt
 
 Press **⌘⇧M** and talk. Whisper large-v3-turbo runs on this Mac (no network, no account, nothing uploaded) and the words are typed into whichever pane has focus, so it works in Claude Code, in a plain shell, in a REPL. A live waveform shows what the microphone is actually hearing; when you stop, the trace freezes and a scan runs across it while the audio is transcribed. Pick the microphone, pick from all 100 languages Whisper knows, or point it at a hosted speech API instead.
