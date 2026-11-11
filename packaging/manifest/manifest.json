@@ -1,0 +1,101 @@
+{
+  "version": "0.3.0",
+  "artifacts": [
+    {
+      "kind": "dmg",
+      "arch": "arm64",
+      "filename": "Liu-v0.3.0-arm64.dmg",
+      "url": "https://github.com/calculusteam/liu/releases/download/v0.3.0/Liu-v0.3.0-arm64.dmg",
+      "sha256": "a99d51bf695ce1d4b3866b56db84b1852909e5931375b70a2c06704b6dc03c37",
+      "size": 47042547
+    },
+    {
+      "kind": "zip",
+      "arch": "arm64",
+      "filename": "Liu-v0.3.0-arm64.zip",
+      "url": "https://github.com/calculusteam/liu/releases/download/v0.3.0/Liu-v0.3.0-arm64.zip",
+      "sha256": "cd3eee0e75c457476e488e52fc73794963e3cb6f69c08e4c9ac9d2450afe0358",
+      "size": 43500483
+    },
+    {
+      "kind": "dmg",
+      "arch": "x86_64",
+      "filename": "Liu-v0.3.0-x86_64.dmg",
+      "url": "https://github.com/calculusteam/liu/releases/download/v0.3.0/Liu-v0.3.0-x86_64.dmg",
+      "sha256": "1d8b15e61b29fe30ed9677358bb94b6ebb4c297a080df442aba60bf546c52e21",
+      "size": 47222155
+    },
+    {
+      "kind": "zip",
+      "arch": "x86_64",
+      "filename": "Liu-v0.3.0-x86_64.zip",
+      "url": "https://github.com/calculusteam/liu/releases/download/v0.3.0/Liu-v0.3.0-x86_64.zip",
+      "sha256": "ae8699c735c4986ef0072b4238f52de758d637a8a6bc6e987938920b65d4288e",
+      "size": 43585578
+    },
+    {
+      "kind": "tarball",
+      "arch": "linux-arm64",
+      "filename": "liu-0.3.0-linux-arm64.tar.gz",
+      "url": "https://github.com/calculusteam/liu/releases/download/v0.3.0/liu-0.3.0-linux-arm64.tar.gz",
+      "sha256": "6e2133bfb430ccb9125121623a16f3771115255e0bfaa1b8de1fb4f6032ca2cf",
+      "size": 39357599
+    },
+    {
+      "kind": "tarball",
+      "arch": "linux-x86_64",
+      "filename": "liu-0.3.0-linux-x86_64.tar.gz",
+      "url": "https://github.com/calculusteam/liu/releases/download/v0.3.0/liu-0.3.0-linux-x86_64.tar.gz",
+      "sha256": "0c0c6507cb62168dd9fa4916cbc88a6f60a0a26b655045a9f3653f8631e049b2",
+      "size": 39505959
+    },
+    {
+      "kind": "deb",
+      "arch": "linux-arm64",
+      "filename": "liu_0.3.0_arm64.deb",
+      "url": "https://github.com/calculusteam/liu/releases/download/v0.3.0/liu_0.3.0_arm64.deb",
+      "sha256": "cf08a36e8e78df873037547df531fa14f51fcd44ca1817d2a80ab33fd3a2363a",
+      "size": 24513484
+    },
+    {
+      "kind": "deb",
+      "arch": "linux-x86_64",
+      "filename": "liu_0.3.0_amd64.deb",
+      "url": "https://github.com/calculusteam/liu/releases/download/v0.3.0/liu_0.3.0_amd64.deb",
+      "sha256": "dc19d04df30a065cfa7b13fef04741b5eac2fb31064f1103d6416e71751748fd",
+      "size": 24938660
+    },
+    {
+      "kind": "rpm",
+      "arch": "linux-arm64",
+      "filename": "liu-0.3.0-1.aarch64.rpm",
+      "url": "https://github.com/calculusteam/liu/releases/download/v0.3.0/liu-0.3.0-1.aarch64.rpm",
+      "sha256": "9f4a846a6904e4a8222035ce715341a0e24b1bbe9dc882e4a67c4e9b42b3ee51",
+      "size": 24333565
+    },
+    {
+      "kind": "rpm",
+      "arch": "linux-x86_64",
+      "filename": "liu-0.3.0-1.x86_64.rpm",
+      "url": "https://github.com/calculusteam/liu/releases/download/v0.3.0/liu-0.3.0-1.x86_64.rpm",
+      "sha256": "3f9c1803688a4982779b697ab28bcc1d2ebbb43dab75f52f95665e9ed90b519f",
+      "size": 24759269
+    },
+    {
+      "kind": "appimage",
+      "arch": "linux-arm64",
+      "filename": "Liu-0.3.0-aarch64.AppImage",
+      "url": "https://github.com/calculusteam/liu/releases/download/v0.3.0/Liu-0.3.0-aarch64.AppImage",
+      "sha256": "d251964dec125063c7e0c27d0f55ad483582ce337e8d430ab02cc6cb3ffca09f",
+      "size": 38664712
+    },
+    {
+      "kind": "appimage",
+      "arch": "linux-x86_64",
+      "filename": "Liu-0.3.0-x86_64.AppImage",
+      "url": "https://github.com/calculusteam/liu/releases/download/v0.3.0/Liu-0.3.0-x86_64.AppImage",
+      "sha256": "a86ad87ed58eb0479c377580560193e178f097b0483aba90cf81d830c3d948cc",
+      "size": 38849016
+    }
+  ]
+}
